@@ -3,10 +3,11 @@
 #pragma once
 
 #include "conf-parser.h"
-#include "networkd-link.h"
-#include "networkd-network.h"
 #include "networkd-util.h"
-#include "tc.h"
+
+typedef struct Link Link;
+typedef struct Manager Manager;
+typedef struct Network Network;
 
 typedef enum TClassKind {
         TCLASS_KIND_DRR,
@@ -17,15 +18,19 @@ typedef enum TClassKind {
 } TClassKind;
 
 typedef struct TClass {
-        TrafficControl meta;
-
-        NetworkConfigSection *section;
+        Link *link;
         Network *network;
+        ConfigSection *section;
+        NetworkConfigSource source;
+        NetworkConfigState state;
+
+        unsigned n_ref;
 
         uint32_t classid;
         uint32_t parent;
 
         TClassKind kind;
+        char *tca_kind;
 } TClass;
 
 typedef struct TClassVTable {
@@ -50,18 +55,25 @@ extern const TClassVTable * const tclass_vtable[_TCLASS_KIND_MAX];
                 return (MixedCase*) t;                                    \
         }
 
-/* For casting the various tclass kinds into a tclass */
-#define TCLASS(t) (&(t)->meta)
+DEFINE_NETWORK_CONFIG_STATE_FUNCTIONS(TClass, tclass);
 
-TClass* tclass_free(TClass *tclass);
+TClass* tclass_ref(TClass *tclass);
+TClass* tclass_unref(TClass *tclass);
 int tclass_new_static(TClassKind kind, Network *network, const char *filename, unsigned section_line, TClass **ret);
 
-int tclass_configure(Link *link, TClass *tclass);
-int tclass_section_verify(TClass *tclass);
+void tclass_mark_recursive(TClass *tclass);
+void link_tclass_drop_marked(Link *link);
 
-DEFINE_NETWORK_SECTION_FUNCTIONS(TClass, tclass_free);
+int link_find_tclass(Link *link, uint32_t classid, TClass **ret);
 
-DEFINE_TC_CAST(TCLASS, TClass);
+int link_request_tclass(Link *link, const TClass *tclass);
+
+void network_drop_invalid_tclass(Network *network);
+
+int manager_rtnl_process_tclass(sd_netlink *rtnl, sd_netlink_message *message, Manager *m);
+int link_enumerate_tclass(Link *link, uint32_t parent);
+
+DEFINE_SECTION_CLEANUP_FUNCTIONS(TClass, tclass_unref);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_tclass_parent);
 CONFIG_PARSER_PROTOTYPE(config_parse_tclass_classid);

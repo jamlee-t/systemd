@@ -9,6 +9,7 @@
 #include "sd-id128.h"
 
 #include "io-util.h"
+#include "iovec-wrapper.h"
 #include "time-util.h"
 
 /* Make sure not to make this smaller than the maximum coredump size.
@@ -23,7 +24,7 @@
 #define LINE_CHUNK 8*1024u
 
 /* The maximum number of fields in an entry */
-#define ENTRY_FIELD_COUNT_MAX 1024
+#define ENTRY_FIELD_COUNT_MAX 1024u
 
 typedef struct JournalImporter {
         int fd;

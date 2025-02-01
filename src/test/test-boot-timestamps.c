@@ -6,9 +6,9 @@
 #include "acpi-fpdt.h"
 #include "boot-timestamps.h"
 #include "efi-loader.h"
+#include "errno-util.h"
 #include "log.h"
 #include "tests.h"
-#include "util.h"
 
 static int test_acpi_fpdt(void) {
         usec_t loader_start, loader_exit;
@@ -16,7 +16,7 @@ static int test_acpi_fpdt(void) {
 
         r = acpi_get_boot_usec(&loader_start, &loader_exit);
         if (r < 0) {
-                bool ok = r == -ENOENT || r == -EACCES || r == -ENODATA;
+                bool ok = IN_SET(r, -ENOENT, -ENODATA, -ERANGE) || ERRNO_IS_PRIVILEGE(r);
 
                 log_full_errno(ok ? LOG_DEBUG : LOG_ERR, r, "Failed to read ACPI FPDT: %m");
                 return ok ? 0 : r;
@@ -35,7 +35,7 @@ static int test_efi_loader(void) {
 
         r = efi_loader_get_boot_usec(&loader_start, &loader_exit);
         if (r < 0) {
-                bool ok = r == -ENOENT || r == -EACCES || r == -EOPNOTSUPP;
+                bool ok = IN_SET(r, -ENOENT, -EOPNOTSUPP) || ERRNO_IS_PRIVILEGE(r);
 
                 log_full_errno(ok ? LOG_DEBUG : LOG_ERR, r, "Failed to read EFI loader data: %m");
                 return ok ? 0 : r;
@@ -56,7 +56,7 @@ static int test_boot_timestamps(void) {
 
         r = boot_timestamps(NULL, &fw, &l);
         if (r < 0) {
-                bool ok = r == -ENOENT || r == -EACCES || r == -EOPNOTSUPP;
+                bool ok = IN_SET(r, -ENOENT, -EOPNOTSUPP) || ERRNO_IS_PRIVILEGE(r);
 
                 log_full_errno(ok ? LOG_DEBUG : LOG_ERR, r, "Failed to read variables: %m");
                 return ok ? 0 : r;
@@ -76,11 +76,11 @@ int main(int argc, char* argv[]) {
         test_setup_logging(LOG_DEBUG);
 
         p = test_acpi_fpdt();
-        assert_se(p >= 0);
+        ASSERT_OK(p);
         q = test_efi_loader();
-        assert_se(q >= 0);
+        ASSERT_OK(q);
         r = test_boot_timestamps();
-        assert_se(r >= 0);
+        ASSERT_OK(r);
 
         if (p == 0 && q == 0 && r == 0)
                 return log_tests_skipped("access to firmware variables not possible");

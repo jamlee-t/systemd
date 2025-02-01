@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-from __future__ import print_function
 import collections
-import sys
+import glob
 import pprint
-from os.path import basename
+import sys
+from pathlib import Path
+
 from xml_helper import xml_parse
 
+
 def man(page, number):
-    return '{}.{}'.format(page, number)
+    return f'{page}.{number}'
 
 def add_rules(rules, name):
     xml = xml_parse(name)
@@ -56,9 +58,10 @@ manpages = ['''
 
 MESON_FOOTER = '''\
 ]
-# Really, do not edit.'''
+# Really, do not edit.
+'''
 
-def make_mesonfile(rules, dist_files):
+def make_mesonfile(rules, _dist_files):
     # reformat rules as
     # grouped = [ [name, section, [alias...], condition], ...]
     #
@@ -75,14 +78,25 @@ def make_mesonfile(rules, dist_files):
               for p, aliases in sorted(grouped.items()) ]
     return '\n'.join((MESON_HEADER, pprint.pformat(lines)[1:-1], MESON_FOOTER))
 
-if __name__ == '__main__':
-    pages = sys.argv[1:]
+def main():
+    source_glob = sys.argv[1]
+    target = Path(sys.argv[2])
+
+    pages = glob.glob(source_glob)
     pages = (p for p in pages
-             if basename(p) not in {
+             if Path(p).name not in {
+                     'standard-conf.xml',
                      'systemd.directives.xml',
                      'systemd.index.xml',
                      'directives-template.xml'})
 
     rules = create_rules(pages)
-    dist_files = (basename(p) for p in pages)
-    print(make_mesonfile(rules, dist_files))
+    dist_files = (Path(p).name for p in pages)
+    text = make_mesonfile(rules, dist_files)
+
+    tmp = target.with_suffix('.tmp')
+    tmp.write_text(text)
+    tmp.rename(target)
+
+if __name__ == '__main__':
+    main()

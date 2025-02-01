@@ -5,14 +5,30 @@
 
 #include "netif-util.h"
 #include "networkd-address.h"
+#include "networkd-ipv4acd.h"
 #include "networkd-ipv4ll.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
 #include "networkd-queue.h"
 #include "parse-util.h"
 
+bool link_ipv4ll_enabled(Link *link) {
+        assert(link);
+
+        if (!link_ipv4acd_supported(link))
+                return false;
+
+        if (!link->network)
+                return false;
+
+        if (link->network->bond)
+                return false;
+
+        return link->network->link_local & ADDRESS_FAMILY_IPV4;
+}
+
 static int address_new_from_ipv4ll(Link *link, Address **ret) {
-        _cleanup_(address_freep) Address *address = NULL;
+        _cleanup_(address_unrefp) Address *address = NULL;
         struct in_addr addr;
         int r;
 
@@ -34,15 +50,13 @@ static int address_new_from_ipv4ll(Link *link, Address **ret) {
         address->prefixlen = 16;
         address->scope = RT_SCOPE_LINK;
         address->route_metric = IPV4LL_ROUTE_METRIC;
-        address_set_broadcast(address);
 
         *ret = TAKE_PTR(address);
         return 0;
 }
 
 static int ipv4ll_address_lost(Link *link) {
-        _cleanup_(address_freep) Address *address = NULL;
-        Address *existing;
+        _cleanup_(address_unrefp) Address *address = NULL;
         int r;
 
         assert(link);
@@ -55,22 +69,13 @@ static int ipv4ll_address_lost(Link *link) {
         if (r < 0)
                 return r;
 
-        if (address_get(link, address, &existing) < 0)
-                return 0;
-
-        if (existing->source != NETWORK_CONFIG_SOURCE_IPV4LL)
-                return 0;
-
-        if (!address_exists(existing))
-                return 0;
-
         log_link_debug(link, "IPv4 link-local release "IPV4_ADDRESS_FMT_STR,
                        IPV4_ADDRESS_FMT_VAL(address->in_addr.in));
 
-        return address_remove(existing);
+        return address_remove_and_cancel(address, link);
 }
 
-static int ipv4ll_address_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *link) {
+static int ipv4ll_address_handler(sd_netlink *rtnl, sd_netlink_message *m, Request *req, Link *link, Address *address) {
         int r;
 
         assert(link);
@@ -87,7 +92,7 @@ static int ipv4ll_address_handler(sd_netlink *rtnl, sd_netlink_message *m, Link 
 }
 
 static int ipv4ll_address_claimed(sd_ipv4ll *ll, Link *link) {
-        _cleanup_(address_freep) Address *address = NULL;
+        _cleanup_(address_unrefp) Address *address = NULL;
         int r;
 
         assert(ll);
@@ -104,20 +109,23 @@ static int ipv4ll_address_claimed(sd_ipv4ll *ll, Link *link) {
         log_link_debug(link, "IPv4 link-local claim "IPV4_ADDRESS_FMT_STR,
                        IPV4_ADDRESS_FMT_VAL(address->in_addr.in));
 
-        return link_request_address(link, TAKE_PTR(address), true, NULL, ipv4ll_address_handler, NULL);
+        r = link_request_stacked_netdevs(link, NETDEV_LOCAL_ADDRESS_IPV4LL);
+        if (r < 0)
+                return r;
+
+        return link_request_address(link, address, NULL, ipv4ll_address_handler, NULL);
 }
 
 static void ipv4ll_handler(sd_ipv4ll *ll, int event, void *userdata) {
-        Link *link = userdata;
+        Link *link = ASSERT_PTR(userdata);
         int r;
 
-        assert(link);
         assert(link->network);
 
         if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
                 return;
 
-        switch(event) {
+        switch (event) {
                 case SD_IPV4LL_EVENT_STOP:
                         r = ipv4ll_address_lost(link);
                         if (r < 0) {
@@ -153,10 +161,9 @@ static void ipv4ll_handler(sd_ipv4ll *ll, int event, void *userdata) {
 }
 
 static int ipv4ll_check_mac(sd_ipv4ll *ll, const struct ether_addr *mac, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         struct hw_addr_data hw_addr;
 
-        assert(m);
         assert(mac);
 
         hw_addr = (struct hw_addr_data) {
@@ -165,6 +172,51 @@ static int ipv4ll_check_mac(sd_ipv4ll *ll, const struct ether_addr *mac, void *u
         };
 
         return link_get_by_hw_addr(m, &hw_addr, NULL) >= 0;
+}
+
+static int ipv4ll_set_address(Link *link) {
+        int r;
+
+        assert(link);
+        assert(link->network);
+        assert(link->ipv4ll);
+
+        /* 1. Use already assigned address. */
+        Address *a;
+        SET_FOREACH(a, link->addresses) {
+                if (a->source != NETWORK_CONFIG_SOURCE_IPV4LL)
+                        continue;
+
+                assert(a->family == AF_INET);
+                return sd_ipv4ll_set_address(link->ipv4ll, &a->in_addr.in);
+        }
+
+        /* 2. If no address is assigned yet, use explicitly configured address. */
+        if (in4_addr_is_set(&link->network->ipv4ll_start_address))
+                return sd_ipv4ll_set_address(link->ipv4ll, &link->network->ipv4ll_start_address);
+
+        /* 3. If KeepConfiguration=dynamic, use a foreign IPv4LL address. */
+        if (!FLAGS_SET(link->network->keep_configuration, KEEP_CONFIGURATION_DYNAMIC))
+                return 0;
+
+        SET_FOREACH(a, link->addresses) {
+                if (a->source != NETWORK_CONFIG_SOURCE_FOREIGN)
+                        continue;
+                if (a->family != AF_INET)
+                        continue;
+                if (!in4_addr_is_link_local_dynamic(&a->in_addr.in))
+                        continue;
+
+                r = sd_ipv4ll_set_address(link->ipv4ll, &a->in_addr.in);
+                if (r < 0)
+                        return r;
+
+                /* Make sure the address is not removed by link_drop_unmanaged_addresses(). */
+                a->source = NETWORK_CONFIG_SOURCE_IPV4LL;
+                return 0;
+        }
+
+        return 0;
 }
 
 int ipv4ll_configure(Link *link) {
@@ -177,7 +229,7 @@ int ipv4ll_configure(Link *link) {
                 return 0;
 
         if (link->ipv4ll)
-                return -EBUSY;
+                return 0;
 
         r = sd_ipv4ll_new(&link->ipv4ll);
         if (r < 0)
@@ -187,12 +239,16 @@ int ipv4ll_configure(Link *link) {
         if (r < 0)
                 return r;
 
-        if (link->sd_device &&
-            net_get_unique_predictable_data(link->sd_device, true, &seed) >= 0) {
+        if (link->dev &&
+            net_get_unique_predictable_data(link->dev, true, &seed) >= 0) {
                 r = sd_ipv4ll_set_address_seed(link->ipv4ll, seed);
                 if (r < 0)
                         return r;
         }
+
+        r = ipv4ll_set_address(link);
+        if (r < 0)
+                return r;
 
         r = sd_ipv4ll_set_mac(link->ipv4ll, &link->hw_addr.ether);
         if (r < 0)
@@ -207,6 +263,35 @@ int ipv4ll_configure(Link *link) {
                 return r;
 
         return sd_ipv4ll_set_check_mac_callback(link->ipv4ll, ipv4ll_check_mac, link->manager);
+}
+
+int link_drop_ipv4ll_config(Link *link, Network *network) {
+        int ret = 0;
+
+        assert(link);
+        assert(link->network);
+
+        if (link->network == network)
+                return 0; /* .network file is unchanged. It is not necessary to reconfigure the client. */
+
+        if (!link_ipv4ll_enabled(link)) {
+                /* The client is disabled. Stop if it is running, and drop the address. */
+                ret = sd_ipv4ll_stop(link->ipv4ll);
+
+                /* Also, explicitly drop the address for the case that this is called on start up.
+                 * See also comments in link_drop_dhcp4_config(). */
+                Address *a;
+                SET_FOREACH(a, link->addresses) {
+                        if (a->source != NETWORK_CONFIG_SOURCE_IPV4LL)
+                                continue;
+
+                        assert(a->family == AF_INET);
+                        RET_GATHER(ret, address_remove_and_cancel(a, link));
+                }
+        }
+
+        link->ipv4ll = sd_ipv4ll_unref(link->ipv4ll);
+        return ret;
 }
 
 int ipv4ll_update_mac(Link *link) {
@@ -234,13 +319,12 @@ int config_parse_ipv4ll(
                 void *data,
                 void *userdata) {
 
-        AddressFamily *link_local = data;
+        AddressFamily *link_local = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         /* Note that this is mostly like
          * config_parse_address_family(), except that it
@@ -261,5 +345,47 @@ int config_parse_ipv4ll(
                    "%s=%s is deprecated, please use LinkLocalAddressing=%s instead.",
                    lvalue, rvalue, address_family_to_string(*link_local));
 
+        return 0;
+}
+
+int config_parse_ipv4ll_address(
+                const char* unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        union in_addr_union a;
+        struct in_addr *ipv4ll_address = ASSERT_PTR(data);
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                *ipv4ll_address = (struct in_addr) {};
+                return 0;
+        }
+
+        r = in_addr_from_string(AF_INET, rvalue, &a);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse %s=, ignoring assignment: %s", lvalue, rvalue);
+                return 0;
+        }
+        if (!in4_addr_is_link_local_dynamic(&a.in)) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
+                           "Specified address cannot be used as an IPv4 link local address, ignoring assignment: %s",
+                           rvalue);
+                return 0;
+        }
+
+        *ipv4ll_address = a.in;
         return 0;
 }

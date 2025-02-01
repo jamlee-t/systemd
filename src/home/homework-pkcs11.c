@@ -15,12 +15,11 @@ int pkcs11_callback(
                 void *userdata) {
 
         _cleanup_(erase_and_freep) void *decrypted_key = NULL;
-        struct pkcs11_callback_data *data = userdata;
+        struct pkcs11_callback_data *data = ASSERT_PTR(userdata);
         _cleanup_free_ char *token_label = NULL;
         CK_TOKEN_INFO updated_token_info;
         size_t decrypted_key_size;
         CK_OBJECT_HANDLE object;
-        char **i;
         CK_RV rv;
         int r;
 
@@ -28,7 +27,6 @@ int pkcs11_callback(
         assert(slot_info);
         assert(token_info);
         assert(uri);
-        assert(data);
 
         /* Special return values:
          *
@@ -51,7 +49,7 @@ int pkcs11_callback(
 
                 rv = m->C_Login(session, CKU_USER, NULL, 0);
                 if (rv != CKR_OK)
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to log into security token '%s': %s", token_label, p11_kit_strerror(rv));
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to log into security token '%s': %s", token_label, sym_p11_kit_strerror(rv));
 
                 log_info("Successfully logged into security token '%s' via protected authentication path.", token_label);
                 goto decrypt;
@@ -74,12 +72,12 @@ int pkcs11_callback(
                 if (rv == CKR_PIN_LOCKED)
                         return log_error_errno(SYNTHETIC_ERRNO(EOWNERDEAD), "PIN of security token is blocked. Please unblock it first.");
                 if (!IN_SET(rv, CKR_PIN_INCORRECT, CKR_PIN_LEN_RANGE))
-                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to log into security token '%s': %s", token_label, p11_kit_strerror(rv));
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to log into security token '%s': %s", token_label, sym_p11_kit_strerror(rv));
         }
 
         rv = m->C_GetTokenInfo(slot_id, &updated_token_info);
         if (rv != CKR_OK)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to acquire updated security token information for slot %lu: %s", slot_id, p11_kit_strerror(rv));
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to acquire updated security token information for slot %lu: %s", slot_id, sym_p11_kit_strerror(rv));
 
         if (FLAGS_SET(updated_token_info.flags, CKF_USER_PIN_FINAL_TRY))
                 return log_error_errno(SYNTHETIC_ERRNO(EUCLEAN), "PIN of security token incorrect, only a single try left.");

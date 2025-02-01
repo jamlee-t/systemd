@@ -25,6 +25,19 @@ void manager_llmnr_stop(Manager *m) {
         m->llmnr_ipv6_tcp_fd = safe_close(m->llmnr_ipv6_tcp_fd);
 }
 
+void manager_llmnr_maybe_stop(Manager *m) {
+        assert(m);
+
+        /* This stops LLMNR only when no interface enables LLMNR. */
+
+        Link *l;
+        HASHMAP_FOREACH(l, m->links)
+                if (link_get_llmnr_support(l) != RESOLVE_SUPPORT_NO)
+                        return;
+
+        manager_llmnr_stop(m);
+}
+
 int manager_llmnr_start(Manager *m) {
         int r;
 
@@ -45,7 +58,7 @@ int manager_llmnr_start(Manager *m) {
         if (r < 0)
                 return r;
 
-        if (socket_ipv6_is_supported()) {
+        if (socket_ipv6_is_enabled()) {
                 r = manager_llmnr_ipv6_udp_fd(m);
                 if (r == -EADDRINUSE)
                         goto eaddrinuse;
@@ -72,13 +85,12 @@ eaddrinuse:
 static int on_llmnr_packet(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
         _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
         DnsTransaction *t = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         DnsScope *scope;
         int r;
 
         assert(s);
         assert(fd >= 0);
-        assert(m);
 
         r = manager_recv(m, fd, DNS_PROTOCOL_LLMNR, &p);
         if (r <= 0)
@@ -142,7 +154,7 @@ int manager_llmnr_ipv4_udp_fd(Manager *m) {
                 .in.sin_family = AF_INET,
                 .in.sin_port = htobe16(LLMNR_PORT),
         };
-        _cleanup_close_ int s = -1;
+        _cleanup_close_ int s = -EBADF;
         int r;
 
         assert(m);
@@ -212,7 +224,7 @@ int manager_llmnr_ipv6_udp_fd(Manager *m) {
                 .in6.sin6_family = AF_INET6,
                 .in6.sin6_port = htobe16(LLMNR_PORT),
         };
-        _cleanup_close_ int s = -1;
+        _cleanup_close_ int s = -EBADF;
         int r;
 
         assert(m);
@@ -277,13 +289,11 @@ int manager_llmnr_ipv6_udp_fd(Manager *m) {
         return m->llmnr_ipv6_udp_fd = TAKE_FD(s);
 }
 
-static int on_llmnr_stream_packet(DnsStream *s) {
-        _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
+static int on_llmnr_stream_packet(DnsStream *s, DnsPacket *p) {
         DnsScope *scope;
 
         assert(s);
-
-        p = dns_stream_take_read_packet(s);
+        assert(s->manager);
         assert(p);
 
         scope = manager_find_scope(s->manager, p);
@@ -296,7 +306,6 @@ static int on_llmnr_stream_packet(DnsStream *s) {
         } else
                 log_debug("Invalid LLMNR TCP packet, ignoring.");
 
-        dns_stream_unref(s);
         return 0;
 }
 
@@ -313,15 +322,14 @@ static int on_llmnr_stream(sd_event_source *s, int fd, uint32_t revents, void *u
                 return -errno;
         }
 
-        r = dns_stream_new(m, &stream, DNS_STREAM_LLMNR_RECV, DNS_PROTOCOL_LLMNR, cfd, NULL);
+        /* We don't configure a "complete" handler here, we rely on the default handler, thus freeing it */
+        r = dns_stream_new(m, &stream, DNS_STREAM_LLMNR_RECV, DNS_PROTOCOL_LLMNR, cfd, NULL,
+                           on_llmnr_stream_packet, NULL, DNS_STREAM_DEFAULT_TIMEOUT_USEC);
         if (r < 0) {
                 safe_close(cfd);
                 return r;
         }
 
-        stream->on_packet = on_llmnr_stream_packet;
-        /* We don't configure a "complete" handler here, we rely on the default handler than simply drops the
-         * reference to the stream, thus freeing it */
         return 0;
 }
 
@@ -349,7 +357,7 @@ int manager_llmnr_ipv4_tcp_fd(Manager *m) {
                 .in.sin_family = AF_INET,
                 .in.sin_port = htobe16(LLMNR_PORT),
         };
-        _cleanup_close_ int s = -1;
+        _cleanup_close_ int s = -EBADF;
         int r;
 
         assert(m);
@@ -397,7 +405,7 @@ int manager_llmnr_ipv4_tcp_fd(Manager *m) {
                         return log_error_errno(r, "LLMNR-IPv4(TCP): Failed to set SO_REUSEADDR: %m");
         }
 
-        r = listen(s, SOMAXCONN);
+        r = listen(s, SOMAXCONN_DELUXE);
         if (r < 0)
                 return log_error_errno(errno, "LLMNR-IPv4(TCP): Failed to listen the stream: %m");
 
@@ -415,7 +423,7 @@ int manager_llmnr_ipv6_tcp_fd(Manager *m) {
                 .in6.sin6_family = AF_INET6,
                 .in6.sin6_port = htobe16(LLMNR_PORT),
         };
-        _cleanup_close_ int s = -1;
+        _cleanup_close_ int s = -EBADF;
         int r;
 
         assert(m);
@@ -462,7 +470,7 @@ int manager_llmnr_ipv6_tcp_fd(Manager *m) {
                         return log_error_errno(r, "LLMNR-IPv6(TCP): Failed to set SO_REUSEADDR: %m");
         }
 
-        r = listen(s, SOMAXCONN);
+        r = listen(s, SOMAXCONN_DELUXE);
         if (r < 0)
                 return log_error_errno(errno, "LLMNR-IPv6(TCP): Failed to listen the stream: %m");
 

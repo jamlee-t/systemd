@@ -5,6 +5,10 @@
 #include "user-record.h"
 
 typedef struct PasswordCache {
+        /* The volume key from the kernel keyring */
+        void *volume_key;
+        size_t volume_key_size;
+
         /* Decoding passwords from security tokens is expensive and typically requires user interaction,
          * hence cache any we already figured out. */
         char **pkcs11_passwords;
@@ -17,5 +21,12 @@ static inline bool password_cache_contains(const PasswordCache *cache, const cha
         if (!cache)
                 return false;
 
-        return strv_contains(cache->pkcs11_passwords, p) || strv_contains(cache->fido2_passwords, p);
+        /* Used to decide whether or not to set a minimal PBKDF, under the assumption that if
+         * the cache contains a password then the password came from a hardware token of some kind
+         * and is thus naturally high-entropy. */
+
+        return strv_contains(cache->pkcs11_passwords, p) ||
+                strv_contains(cache->fido2_passwords, p);
 }
+
+void password_cache_load_keyring(UserRecord *h, PasswordCache *cache);

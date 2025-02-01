@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 set -eux
@@ -6,11 +6,13 @@ set -o pipefail
 
 # default to Debian testing
 DISTRO="${DISTRO:-debian}"
-RELEASE="${RELEASE:-bullseye}"
-BRANCH="${BRANCH:-upstream-ci}"
+RELEASE="${RELEASE:-bookworm}"
+SALSA_URL="${SALSA_URL:-https://salsa.debian.org/systemd-team/systemd.git}"
+BRANCH="${BRANCH:-debian/master}"
 ARCH="${ARCH:-amd64}"
 CONTAINER="${RELEASE}-${ARCH}"
-CACHE_DIR="${SEMAPHORE_CACHE_DIR:-/tmp}"
+CACHE_DIR=/var/tmp
+TMPDIR=/var/tmp
 AUTOPKGTEST_DIR="${CACHE_DIR}/autopkgtest"
 # semaphore cannot expose these, but useful for interactive/local runs
 ARTIFACTS_DIR=/tmp/artifacts
@@ -19,14 +21,7 @@ PHASES=(${@:-SETUP RUN})
 UBUNTU_RELEASE="$(lsb_release -cs)"
 
 create_container() {
-    # Create autopkgtest LXC image; this sometimes fails with "Unable to fetch
-    # GPG key from keyserver", so retry a few times with different keyservers.
-    for keyserver in "" "keys.gnupg.net" "keys.openpgp.org" "keyserver.ubuntu.com"; do
-        for retry in {1..5}; do
-            sudo lxc-create -n "$CONTAINER" -t download -- -d "$DISTRO" -r "$RELEASE" -a "$ARCH" ${keyserver:+--keyserver "$keyserver"} && break 2
-            sleep $((retry*retry))
-        done
-    done
+    sudo lxc-create -n "$CONTAINER" -t download -- -d "$DISTRO" -r "$RELEASE" -a "$ARCH"
 
     # unconfine the container, otherwise some tests fail
     echo 'lxc.apparmor.profile = unconfined' | sudo tee -a "/var/lib/lxc/$CONTAINER/config"
@@ -35,14 +30,25 @@ create_container() {
 
     # enable source repositories so that apt-get build-dep works
     sudo lxc-attach -n "$CONTAINER" -- sh -ex <<EOF
-sed 's/^deb/deb-src/' /etc/apt/sources.list >> /etc/apt/sources.list.d/sources.list
-# wait until online
-while [ -z "\$(ip route list 0/0)" ]; do sleep 1; done
+sed 's/^deb/deb-src/' /etc/apt/sources.list >>/etc/apt/sources.list.d/sources.list
+echo "deb http://deb.debian.org/debian $RELEASE-backports main" >/etc/apt/sources.list.d/backports.list
+# We might attach the console too soon
+until systemctl --quiet --wait is-system-running; do sleep 1; done
+# Manpages database trigger takes a lot of time and is not useful in a CI
+echo 'man-db man-db/auto-update boolean false' | debconf-set-selections
+# Speed up dpkg, image is thrown away after the test
+mkdir -p /etc/dpkg/dpkg.cfg.d/
+echo 'force-unsafe-io' >/etc/dpkg/dpkg.cfg.d/unsafe_io
+# For some reason, it is necessary to run this manually or the interface won't be configured
+# Note that we avoid networkd, as some of the tests will break it later on
+dhclient
 apt-get -q --allow-releaseinfo-change update
 apt-get -y dist-upgrade
 apt-get install -y eatmydata
 # The following four are needed as long as these deps are not covered by Debian's own packaging
-apt-get install -y fdisk tree libfdisk-dev libp11-kit-dev libssl-dev libpwquality-dev
+apt-get install -y tree libpwquality-dev rpm libcurl4-openssl-dev libarchive-dev
+# autopkgtest doesn't consider backports
+apt-get install -y -t $RELEASE-backports debhelper
 apt-get purge --auto-remove -y unattended-upgrades
 systemctl unmask systemd-networkd
 systemctl enable systemd-networkd
@@ -54,7 +60,7 @@ for phase in "${PHASES[@]}"; do
     case "$phase" in
         SETUP)
             # remove semaphore repos, some of them don't work and cause error messages
-            sudo rm -f /etc/apt/sources.list.d/*
+            sudo rm -rf /etc/apt/sources.list.d/*
 
             # enable backports for latest LXC
             echo "deb http://archive.ubuntu.com/ubuntu $UBUNTU_RELEASE-backports main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/backports.list
@@ -68,12 +74,12 @@ for phase in "${PHASES[@]}"; do
         ;;
         RUN)
             # add current debian/ packaging
-            git fetch --depth=1 https://salsa.debian.org/systemd-team/systemd.git "$BRANCH"
+            git fetch --depth=1 "$SALSA_URL" "$BRANCH"
             git checkout FETCH_HEAD debian
 
             # craft changelog
             UPSTREAM_VER="$(git describe | sed 's/^v//;s/-/./g')"
-            cat << EOF > debian/changelog.new
+            cat <<EOF >debian/changelog.new
 systemd (${UPSTREAM_VER}.0) UNRELEASED; urgency=low
 
   * Automatic build for upstream test
@@ -89,9 +95,9 @@ EOF
             # disable autopkgtests which are not for upstream
             sed -i '/# NOUPSTREAM/ q' debian/tests/control
             # enable more unit tests
-            sed -i '/^CONFFLAGS =/ s/=/= --werror -Dtests=unsafe -Dsplit-usr=true -Dslow-tests=true -Dfuzz-tests=true -Dman=true /' debian/rules
+            sed -i '/^CONFFLAGS =/ s/=/= --werror /' debian/rules
             # no orig tarball
-            echo '1.0' > debian/source/format
+            echo '1.0' >debian/source/format
 
             # build source package
             dpkg-buildpackage -S -I -I"$(basename "$CACHE_DIR")" -d -us -uc -nc
@@ -99,10 +105,13 @@ EOF
             # now build the package and run the tests
             rm -rf "$ARTIFACTS_DIR"
             # autopkgtest exits with 2 for "some tests skipped", accept that
-            "$AUTOPKGTEST_DIR/runner/autopkgtest" --env DEB_BUILD_OPTIONS=noudeb \
-                                                  --env TEST_UPSTREAM=1 ../systemd_*.dsc \
-                                                  -o "$ARTIFACTS_DIR" \
-                                                  -- lxc -s "$CONTAINER" \
+            sudo TMPDIR=/var/tmp "$AUTOPKGTEST_DIR/runner/autopkgtest" --env DEB_BUILD_OPTIONS="noudeb nostrip nodoc optimize=-lto" \
+                                                       --env DPKG_DEB_COMPRESSOR_TYPE="none" \
+                                                       --env DEB_BUILD_PROFILES="pkg.systemd.upstream noudeb nodoc" \
+                                                       --env TEST_UPSTREAM=1 \
+                                                       ../systemd_*.dsc \
+                                                       -o "$ARTIFACTS_DIR" \
+                                                       -- lxc -s "$CONTAINER" \
                 || [ $? -eq 2 ]
         ;;
         *)

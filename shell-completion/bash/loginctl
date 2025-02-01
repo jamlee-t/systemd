@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # loginctl(1) completion                                  -*- shell-script -*-
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
@@ -16,7 +17,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word () {
     local w word=$1; shift
@@ -31,8 +32,9 @@ __get_all_seats    () { loginctl --no-legend list-seats    | { while read -r a b
 
 __get_machines() {
     local a b
-    machinectl list --full --no-legend --no-pager 2>/dev/null |
-        { while read a b; do echo " $a"; done; };
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } | \
+	{ while read a b; do echo " $a"; done; } | \
+        sort -u
 }
 
 _loginctl () {
@@ -41,9 +43,9 @@ _loginctl () {
 
     local -A OPTS=(
         [STANDALONE]='--all -a --help -h --no-pager --version
-                      --no-legend --no-ask-password -l --full --value'
-        [ARG]='--host -H --kill-who --property -p --signal -s -M --machine
-                      -n --lines -o --output -P'
+                      --no-legend --no-ask-password -l --full --value -j'
+        [ARG]='--host -H --kill-whom --property -p --signal -s -M --machine
+                      -n --lines -o --output -P --json'
     )
 
     if __contains_word "$prev" ${OPTS[ARG]}; then
@@ -52,7 +54,7 @@ _loginctl () {
                 _signals
                 return
                 ;;
-            --kill-who)
+            --kill-whom|--kill-who)
                 comps='all leader'
                 ;;
             --host|-H)
@@ -66,6 +68,9 @@ _loginctl () {
                 ;;
             --output|-o)
                 comps=$( loginctl --output=help 2>/dev/null )
+                ;;
+            --json)
+                comps=$( loginctl --json=help 2>/dev/null )
                 ;;
         esac
         COMPREPLY=( $(compgen -W '$comps' -- "$cur") )
