@@ -8,6 +8,7 @@
 #include "sd-network.h"
 #include "sd-resolve.h"
 
+#include "hashmap.h"
 #include "list.h"
 #include "ratelimit.h"
 #include "time-util.h"
@@ -31,9 +32,6 @@ typedef struct Manager Manager;
 
 #define DEFAULT_SAVE_TIME_INTERVAL_USEC (60 * USEC_PER_SEC)
 
-#define STATE_DIR   "/var/lib/systemd/timesync"
-#define CLOCK_FILE  STATE_DIR "/clock"
-
 struct Manager {
         sd_bus *bus;
         sd_event *event;
@@ -41,12 +39,12 @@ struct Manager {
 
         LIST_HEAD(ServerName, system_servers);
         LIST_HEAD(ServerName, link_servers);
+        LIST_HEAD(ServerName, runtime_servers);
         LIST_HEAD(ServerName, fallback_servers);
-
-        bool have_fallbacks:1;
 
         RateLimit ratelimit;
         bool exhausted_servers;
+        bool have_fallbacks;
 
         /* network */
         sd_event_source *network_event_source;
@@ -61,11 +59,15 @@ struct Manager {
         int missed_replies;
         uint64_t packet_count;
         sd_event_source *event_timeout;
-        bool good;
+        bool talking;
+
+        /* PolicyKit */
+        Hashmap *polkit_registry;
 
         /* last sent packet */
         struct timespec trans_time_mon;
         struct timespec trans_time;
+        struct ntp_ts request_nonce;
         usec_t retry_interval;
         usec_t connection_retry_usec;
         bool pending;
@@ -92,7 +94,6 @@ struct Manager {
 
         /* watch for time changes */
         sd_event_source *event_clock_watch;
-        int clock_watch_fd;
 
         /* Retry connections */
         sd_event_source *event_retry;
@@ -105,10 +106,17 @@ struct Manager {
         struct timespec origin_time, dest_time;
         bool spike;
 
+        /* Indicates whether we ever managed to set the local clock from NTP */
+        bool synchronized;
+
         /* save time event */
         sd_event_source *event_save_time;
         usec_t save_time_interval_usec;
         bool save_on_exit;
+
+        /* Used to coalesce bus PropertiesChanged events */
+        sd_event_source *deferred_ntp_server_event_source;
+        unsigned ntp_server_change_mask;
 };
 
 int manager_new(Manager **ret);
@@ -119,8 +127,11 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 void manager_set_server_name(Manager *m, ServerName *n);
 void manager_set_server_address(Manager *m, ServerAddress *a);
 void manager_flush_server_names(Manager *m, ServerType t);
+void manager_flush_runtime_servers(Manager *m);
 
 int manager_connect(Manager *m);
 void manager_disconnect(Manager *m);
 
 int manager_setup_save_time_event(Manager *m);
+
+int bus_manager_emit_ntp_server_changed(Manager *m);

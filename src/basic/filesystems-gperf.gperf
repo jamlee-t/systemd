@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 %{
+#if __GNUC__ >= 15
+_Pragma("GCC diagnostic ignored \"-Wzero-as-null-pointer-constant\"")
+#endif
 #include <linux/magic.h>
 
 #include "filesystems.h"
@@ -28,6 +31,7 @@ afs,             {AFS_FS_MAGIC, AFS_SUPER_MAGIC}
 anon_inodefs,    {ANON_INODE_FS_MAGIC}
 autofs,          {AUTOFS_SUPER_MAGIC}
 balloon-kvm,     {BALLOON_KVM_MAGIC}
+bcachefs,        {BCACHEFS_SUPER_MAGIC}
 bdev,            {BDEVFS_MAGIC}
 binder,          {BINDERFS_SUPER_MAGIC}
 binfmt_misc,     {BINFMTFS_MAGIC}
@@ -40,7 +44,7 @@ ceph,            {CEPH_SUPER_MAGIC}
 cgroup2,         {CGROUP2_SUPER_MAGIC}
 # note that the cgroupfs magic got reassigned from cpuset
 cgroup,          {CGROUP_SUPER_MAGIC}
-cifs,            {CIFS_MAGIC_NUMBER}
+cifs,            {CIFS_SUPER_MAGIC, SMB2_SUPER_MAGIC}
 coda,            {CODA_SUPER_MAGIC}
 configfs,        {CONFIGFS_MAGIC}
 cramfs,          {CRAMFS_MAGIC}
@@ -77,7 +81,7 @@ minix,           {MINIX_SUPER_MAGIC, MINIX_SUPER_MAGIC2, MINIX2_SUPER_MAGIC, MIN
 mqueue,          {MQUEUE_MAGIC}
 # msdos is an older legacy version of vfat, shares the magic
 msdos,           {MSDOS_SUPER_MAGIC}
-# ncp/ncpfs have been removed from the kernel, but ncpfs was the offical name
+# ncp/ncpfs have been removed from the kernel, but ncpfs was the official name
 ncp,             {NCP_SUPER_MAGIC}
 ncpfs,           {NCP_SUPER_MAGIC}
 # nfs is the old version of nfs4, and they share the same magic
@@ -91,6 +95,7 @@ ocfs2,           {OCFS2_SUPER_MAGIC}
 openpromfs,      {OPENPROM_SUPER_MAGIC}
 orangefs,        {ORANGEFS_DEVREQ_MAGIC}
 overlay,         {OVERLAYFS_SUPER_MAGIC}
+pidfs,           {PID_FS_MAGIC}
 pipefs,          {PIPEFS_MAGIC}
 ppc-cmm,         {PPC_CMM_MAGIC}
 proc,            {PROC_SUPER_MAGIC}
@@ -109,7 +114,7 @@ selinuxfs,       {SELINUX_MAGIC}
 shiftfs,         {SHIFTFS_MAGIC}
 smackfs,         {SMACK_MAGIC}
 # smb3 is an alias for cifs
-smb3,            {CIFS_MAGIC_NUMBER}
+smb3,            {CIFS_SUPER_MAGIC}
 # smbfs was removed from the kernel in 2010, the magic remains
 smbfs,           {SMB_SUPER_MAGIC}
 sockfs,          {SOCKFS_MAGIC}

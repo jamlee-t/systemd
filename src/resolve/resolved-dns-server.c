@@ -1,14 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <net/if_arp.h>
+
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "errno-util.h"
+#include "fd-util.h"
+#include "json-util.h"
 #include "resolved-bus.h"
 #include "resolved-dns-server.h"
 #include "resolved-dns-stub.h"
 #include "resolved-manager.h"
 #include "resolved-resolv-conf.h"
 #include "siphash24.h"
+#include "socket-util.h"
 #include "string-table.h"
 #include "string-util.h"
 
@@ -28,7 +34,8 @@ int dns_server_new(
                 const union in_addr_union *in_addr,
                 uint16_t port,
                 int ifindex,
-                const char *server_name) {
+                const char *server_name,
+                ResolveConfigSource config_source) {
 
         _cleanup_free_ char *name = NULL;
         DnsServer *s;
@@ -67,6 +74,8 @@ int dns_server_new(
                 .port = port,
                 .ifindex = ifindex,
                 .server_name = TAKE_PTR(name),
+                .config_source = config_source,
+                .accessible = -1,
         };
 
         dns_server_reset_features(s);
@@ -98,9 +107,7 @@ int dns_server_new(
         /* A new DNS server that isn't fallback is added and the one
          * we used so far was a fallback one? Then let's try to pick
          * the new one */
-        if (type != DNS_SERVER_FALLBACK &&
-            m->current_dns_server &&
-            m->current_dns_server->type == DNS_SERVER_FALLBACK)
+        if (type != DNS_SERVER_FALLBACK && dns_server_is_fallback(m->current_dns_server))
                 manager_set_dns_server(m, NULL);
 
         if (ret)
@@ -195,19 +202,19 @@ void dns_server_move_back_and_unmark(DnsServer *s) {
 
         case DNS_SERVER_LINK:
                 assert(s->link);
-                LIST_FIND_TAIL(servers, s, tail);
+                tail = LIST_FIND_TAIL(servers, s);
                 LIST_REMOVE(servers, s->link->dns_servers, s);
                 LIST_INSERT_AFTER(servers, s->link->dns_servers, tail, s);
                 break;
 
         case DNS_SERVER_SYSTEM:
-                LIST_FIND_TAIL(servers, s, tail);
+                tail = LIST_FIND_TAIL(servers, s);
                 LIST_REMOVE(servers, s->manager->dns_servers, s);
                 LIST_INSERT_AFTER(servers, s->manager->dns_servers, tail, s);
                 break;
 
         case DNS_SERVER_FALLBACK:
-                LIST_FIND_TAIL(servers, s, tail);
+                tail = LIST_FIND_TAIL(servers, s);
                 LIST_REMOVE(servers, s->manager->fallback_dns_servers, s);
                 LIST_INSERT_AFTER(servers, s->manager->fallback_dns_servers, tail, s);
                 break;
@@ -230,7 +237,7 @@ static void dns_server_verified(DnsServer *s, DnsServerFeatureLevel level) {
                 s->verified_feature_level = level;
         }
 
-        assert_se(sd_event_now(s->manager->event, clock_boottime_or_monotonic(), &s->verified_usec) >= 0);
+        assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &s->verified_usec) >= 0);
 }
 
 static void dns_server_reset_counters(DnsServer *s) {
@@ -281,11 +288,6 @@ void dns_server_packet_received(DnsServer *s, int protocol, DnsServerFeatureLeve
         /* If the OPT RR got lost, then we can only validate UDP at max */
         if (s->packet_bad_opt && level >= DNS_SERVER_FEATURE_LEVEL_EDNS0)
                 level = DNS_SERVER_FEATURE_LEVEL_EDNS0 - 1;
-
-        /* Even if we successfully receive a reply to a request announcing support for large packets, that
-         * does not mean we can necessarily receive large packets. */
-        if (level == DNS_SERVER_FEATURE_LEVEL_LARGE)
-                level = DNS_SERVER_FEATURE_LEVEL_LARGE - 1;
 
         dns_server_verified(s, level);
 
@@ -410,7 +412,7 @@ static bool dns_server_grace_period_expired(DnsServer *s) {
         if (s->verified_usec == 0)
                 return false;
 
-        assert_se(sd_event_now(s->manager->event, clock_boottime_or_monotonic(), &ts) >= 0);
+        assert_se(sd_event_now(s->manager->event, CLOCK_BOOTTIME, &ts) >= 0);
 
         if (s->verified_usec + s->features_grace_period_usec > ts)
                 return false;
@@ -429,7 +431,7 @@ DnsServerFeatureLevel dns_server_possible_feature_level(DnsServer *s) {
          * better than EDNS0, hence don't even try. */
         if (dns_server_get_dnssec_mode(s) != DNSSEC_NO)
                 best = dns_server_get_dns_over_tls_mode(s) == DNS_OVER_TLS_NO ?
-                        DNS_SERVER_FEATURE_LEVEL_LARGE :
+                        DNS_SERVER_FEATURE_LEVEL_DO :
                         DNS_SERVER_FEATURE_LEVEL_TLS_DO;
         else
                 best = dns_server_get_dns_over_tls_mode(s) == DNS_OVER_TLS_NO ?
@@ -547,7 +549,7 @@ DnsServerFeatureLevel dns_server_possible_feature_level(DnsServer *s) {
                            DNS_SERVER_FEATURE_LEVEL_IS_UDP(s->possible_feature_level) &&
                            ((s->possible_feature_level != DNS_SERVER_FEATURE_LEVEL_DO) || dns_server_get_dnssec_mode(s) != DNSSEC_YES)) {
 
-                        /* We lost too many UDP packets in a row, and are on an UDP feature level. If the
+                        /* We lost too many UDP packets in a row, and are on a UDP feature level. If the
                          * packets are lost, maybe the server cannot parse them, hence downgrading sounds
                          * like a good idea. We might downgrade all the way down to TCP this way.
                          *
@@ -597,7 +599,7 @@ DnsServerFeatureLevel dns_server_possible_feature_level(DnsServer *s) {
 }
 
 int dns_server_adjust_opt(DnsServer *server, DnsPacket *packet, DnsServerFeatureLevel level) {
-        size_t packet_size;
+        size_t packet_size, udp_size;
         bool edns_do;
         int r;
 
@@ -616,40 +618,29 @@ int dns_server_adjust_opt(DnsServer *server, DnsPacket *packet, DnsServerFeature
 
         edns_do = level >= DNS_SERVER_FEATURE_LEVEL_DO;
 
-        if (level == DNS_SERVER_FEATURE_LEVEL_LARGE) {
-                size_t udp_size;
+        udp_size = udp_header_size(server->family);
 
-                /* In large mode, advertise the local MTU, in order to avoid fragmentation (for security
-                 * reasons) – except if we are talking to localhost (where the security considerations don't
-                 * matter). If we see fragmentation, lower the reported size to the largest fragment, to
-                 * avoid it. */
+        if (in_addr_is_localhost(server->family, &server->address) > 0)
+                packet_size = 65536 - udp_size; /* force linux loopback MTU if localhost address */
+        else {
+                /* Use the MTU pointing to the server, subtract the IP/UDP header size */
+                packet_size = LESS_BY(dns_server_get_mtu(server), udp_size);
 
-                udp_size = udp_header_size(server->family);
+                /* On the Internet we want to avoid fragmentation for security reasons. If we saw
+                 * fragmented packets, the above was too large, let's clamp it to the largest
+                 * fragment we saw */
+                if (server->packet_fragmented)
+                        packet_size = MIN(server->received_udp_fragment_max, packet_size);
 
-                if (in_addr_is_localhost(server->family, &server->address) > 0)
-                        packet_size = 65536 - udp_size; /* force linux loopback MTU if localhost address */
-                else {
-                        /* Use the MTU pointing to the server, subtract the IP/UDP header size */
-                        packet_size = LESS_BY(dns_server_get_mtu(server), udp_size);
+                /* Let's not pick ridiculously large sizes, i.e. not more than 4K. No one appears
+                 * to ever use such large sized on the Internet IRL, hence let's not either. */
+                packet_size = MIN(packet_size, 4096U);
+        }
 
-                        /* On the Internet we want to avoid fragmentation for security reasons. If we saw
-                         * fragmented packets, the above was too large, let's clamp it to the largest
-                         * fragment we saw */
-                        if (server->packet_fragmented)
-                                packet_size = MIN(server->received_udp_fragment_max, packet_size);
-
-                        /* Let's not pick ridiculously large sizes, i.e. not more than 4K. No one appears
-                         * to ever use such large sized on the Internet IRL, hence let's not either. */
-                        packet_size = MIN(packet_size, 4096U);
-                }
-
-                /* Strictly speaking we quite possibly can receive larger datagrams than the MTU (since the
-                 * MTU is for egress, not for ingress), but more often than not the value is symmetric, and
-                 * we want something that does the right thing in the majority of cases, and not just in the
-                 * theoretical edge case. */
-        } else
-                /* In non-large mode, let's advertise the size of the largest fragment we ever managed to accept. */
-                packet_size = server->received_udp_fragment_max;
+        /* Strictly speaking we quite possibly can receive larger datagrams than the MTU (since the
+         * MTU is for egress, not for ingress), but more often than not the value is symmetric, and
+         * we want something that does the right thing in the majority of cases, and not just in the
+         * theoretical edge case. */
 
         /* Safety clamp, never advertise less than 512 or more than 65535 */
         packet_size = CLAMP(packet_size,
@@ -663,6 +654,11 @@ int dns_server_adjust_opt(DnsServer *server, DnsPacket *packet, DnsServerFeature
 
 int dns_server_ifindex(const DnsServer *s) {
         assert(s);
+
+        /* For loopback addresses, go via the loopback interface, regardless which interface this is linked
+         * to. */
+        if (in_addr_is_localhost(s->family, &s->address))
+                return LOOPBACK_IFINDEX;
 
         /* The link ifindex always takes precedence */
         if (s->link)
@@ -683,7 +679,7 @@ uint16_t dns_server_port(const DnsServer *s) {
         return 53;
 }
 
-const char *dns_server_string(DnsServer *server) {
+const char* dns_server_string(DnsServer *server) {
         assert(server);
 
         if (!server->server_string)
@@ -692,7 +688,7 @@ const char *dns_server_string(DnsServer *server) {
         return server->server_string;
 }
 
-const char *dns_server_string_full(DnsServer *server) {
+const char* dns_server_string_full(DnsServer *server) {
         assert(server);
 
         if (!server->server_string_full)
@@ -714,9 +710,6 @@ bool dns_server_dnssec_supported(DnsServer *server) {
 
         if (dns_server_get_dnssec_mode(server) == DNSSEC_YES) /* If strict DNSSEC mode is enabled, always assume DNSSEC mode is supported. */
                 return true;
-
-        if (!DNS_SERVER_FEATURE_LEVEL_IS_DNSSEC(server->possible_feature_level))
-                return false;
 
         if (server->packet_bad_opt)
                 return false;
@@ -742,7 +735,8 @@ void dns_server_warn_downgrade(DnsServer *server) {
 
         log_struct(LOG_NOTICE,
                    "MESSAGE_ID=" SD_MESSAGE_DNSSEC_DOWNGRADE_STR,
-                   LOG_MESSAGE("Server %s does not support DNSSEC, downgrading to non-DNSSEC mode.", strna(dns_server_string_full(server))),
+                   LOG_MESSAGE("Server %s does not support DNSSEC, downgrading to non-DNSSEC mode.",
+                               strna(dns_server_string_full(server))),
                    "DNS_SERVER=%s", strna(dns_server_string_full(server)),
                    "DNS_SERVER_FEATURE_LEVEL=%s", dns_server_feature_level_to_string(server->possible_feature_level));
 
@@ -761,10 +755,10 @@ size_t dns_server_get_mtu(DnsServer *s) {
 static void dns_server_hash_func(const DnsServer *s, struct siphash *state) {
         assert(s);
 
-        siphash24_compress(&s->family, sizeof(s->family), state);
-        siphash24_compress(&s->address, FAMILY_ADDRESS_SIZE(s->family), state);
-        siphash24_compress(&s->port, sizeof(s->port), state);
-        siphash24_compress(&s->ifindex, sizeof(s->ifindex), state);
+        siphash24_compress_typesafe(s->family, state);
+        in_addr_hash_func(&s->address, s->family, state);
+        siphash24_compress_typesafe(s->port, state);
+        siphash24_compress_typesafe(s->ifindex, state);
         siphash24_compress_string(s->server_name, state);
 }
 
@@ -804,6 +798,17 @@ void dns_server_unlink_all(DnsServer *first) {
         dns_server_unlink_all(next);
 }
 
+void dns_server_unlink_on_reload(DnsServer *server) {
+        while (server) {
+                DnsServer *next = server->servers_next;
+
+                if (server->config_source == RESOLVE_CONFIG_SOURCE_FILE)
+                        dns_server_unlink(server);
+
+                server = next;
+        }
+}
+
 bool dns_server_unlink_marked(DnsServer *server) {
         bool changed = false;
 
@@ -831,8 +836,6 @@ void dns_server_mark_all(DnsServer *server) {
 }
 
 DnsServer *dns_server_find(DnsServer *first, int family, const union in_addr_union *in_addr, uint16_t port, int ifindex, const char *name) {
-        DnsServer *s;
-
         LIST_FOREACH(servers, s, first)
                 if (s->family == family &&
                     in_addr_equal(family, &s->address, in_addr) > 0 &&
@@ -879,6 +882,7 @@ DnsServer *manager_set_dns_server(Manager *m, DnsServer *s) {
                 dns_cache_flush(&m->unicast_scope->cache);
 
         (void) manager_send_changed(m, "CurrentDNSServer");
+        (void) manager_send_dns_configuration_changed(m, NULL, /* reset= */ false);
 
         return s;
 }
@@ -891,8 +895,17 @@ DnsServer *manager_get_dns_server(Manager *m) {
         manager_read_resolv_conf(m);
 
         /* If no DNS server was chosen so far, pick the first one */
-        if (!m->current_dns_server)
+        if (!m->current_dns_server ||
+            /* In case m->current_dns_server != m->dns_servers */
+            manager_server_is_stub(m, m->current_dns_server))
                 manager_set_dns_server(m, m->dns_servers);
+
+        while (m->current_dns_server &&
+               manager_server_is_stub(m, m->current_dns_server)) {
+                manager_next_dns_server(m, NULL);
+                if (m->current_dns_server == m->dns_servers)
+                        manager_set_dns_server(m, NULL);
+        }
 
         if (!m->current_dns_server) {
                 bool found = false;
@@ -902,7 +915,7 @@ DnsServer *manager_get_dns_server(Manager *m) {
                  * servers */
 
                 HASHMAP_FOREACH(l, m->links)
-                        if (l->dns_servers) {
+                        if (l->dns_servers && l->default_route) {
                                 found = true;
                                 break;
                         }
@@ -999,8 +1012,6 @@ void dns_server_reset_features(DnsServer *s) {
 }
 
 void dns_server_reset_features_all(DnsServer *s) {
-        DnsServer *i;
-
         LIST_FOREACH(servers, i, s)
                 dns_server_reset_features(i);
 }
@@ -1097,7 +1108,102 @@ static const char* const dns_server_feature_level_table[_DNS_SERVER_FEATURE_LEVE
         [DNS_SERVER_FEATURE_LEVEL_EDNS0]     = "UDP+EDNS0",
         [DNS_SERVER_FEATURE_LEVEL_TLS_PLAIN] = "TLS+EDNS0",
         [DNS_SERVER_FEATURE_LEVEL_DO]        = "UDP+EDNS0+DO",
-        [DNS_SERVER_FEATURE_LEVEL_LARGE]     = "UDP+EDNS0+DO+LARGE",
-        [DNS_SERVER_FEATURE_LEVEL_TLS_DO]    = "TLS+EDNS0+D0",
+        [DNS_SERVER_FEATURE_LEVEL_TLS_DO]    = "TLS+EDNS0+DO",
 };
 DEFINE_STRING_TABLE_LOOKUP(dns_server_feature_level, DnsServerFeatureLevel);
+
+int dns_server_dump_state_to_json(DnsServer *server, sd_json_variant **ret) {
+
+        assert(server);
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("Server", strna(dns_server_string_full(server))),
+                        SD_JSON_BUILD_PAIR_STRING("Type", strna(dns_server_type_to_string(server->type))),
+                        SD_JSON_BUILD_PAIR_CONDITION(server->type == DNS_SERVER_LINK, "Interface", SD_JSON_BUILD_STRING(server->link ? server->link->ifname : NULL)),
+                        SD_JSON_BUILD_PAIR_CONDITION(server->type == DNS_SERVER_LINK, "InterfaceIndex", SD_JSON_BUILD_UNSIGNED(server->link ? server->link->ifindex : 0)),
+                        SD_JSON_BUILD_PAIR_STRING("VerifiedFeatureLevel", strna(dns_server_feature_level_to_string(server->verified_feature_level))),
+                        SD_JSON_BUILD_PAIR_STRING("PossibleFeatureLevel", strna(dns_server_feature_level_to_string(server->possible_feature_level))),
+                        SD_JSON_BUILD_PAIR_STRING("DNSSECMode", strna(dnssec_mode_to_string(dns_server_get_dnssec_mode(server)))),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("DNSSECSupported", dns_server_dnssec_supported(server)),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("ReceivedUDPFragmentMax", server->received_udp_fragment_max),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("FailedUDPAttempts", server->n_failed_udp),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("FailedTCPAttempts", server->n_failed_tcp),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("PacketTruncated", server->packet_truncated),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("PacketBadOpt", server->packet_bad_opt),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("PacketRRSIGMissing", server->packet_rrsig_missing),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("PacketInvalid", server->packet_invalid),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("PacketDoOff", server->packet_do_off));
+}
+
+int dns_server_is_accessible(DnsServer *s) {
+        _cleanup_close_ int fd = -EBADF;
+        union sockaddr_union sa;
+        int r;
+
+        assert(s);
+
+        if (s->accessible >= 0)
+                return s->accessible;
+
+        r = sockaddr_set_in_addr(&sa, s->family, &s->address, dns_server_port(s));
+        if (r < 0)
+                return r;
+
+        fd = socket(s->family, SOCK_DGRAM|SOCK_CLOEXEC, 0);
+        if (fd < 0)
+                return -errno;
+
+        if (s->family == AF_INET6 && in_addr_is_link_local(AF_INET6, &s->address)) {
+                /* Connecting to ipv6 link-local requires binding to an interface. */
+                r = socket_bind_to_ifindex(fd, dns_server_ifindex(s));
+                if (r < 0)
+                        return r;
+        }
+
+        r = RET_NERRNO(connect(fd, &sa.sa, SOCKADDR_LEN(sa)));
+        if (!IN_SET(r,
+                    0,
+                    -ENETUNREACH,
+                    -EHOSTDOWN,
+                    -EHOSTUNREACH,
+                    -ENETDOWN,
+                    -ENETRESET,
+                    -ENONET))
+                /* If we did not receive one of the expected return values,
+                 * then leave the accessible flag untouched. */
+                return r;
+
+        return (s->accessible = r >= 0);
+}
+
+void dns_server_reset_accessible_all(DnsServer *first) {
+        LIST_FOREACH(servers, s, first)
+                dns_server_reset_accessible(s);
+}
+
+int dns_server_dump_configuration_to_json(DnsServer *server, sd_json_variant **ret) {
+        bool accessible = false;
+        int ifindex, r;
+
+        assert(server);
+        assert(ret);
+
+        ifindex = dns_server_ifindex(server);
+
+        r = dns_server_is_accessible(server);
+        if (r < 0)
+                log_debug_errno(r, "Failed to check if %s is accessible, assume not: %m", dns_server_string_full(server));
+        else
+                accessible = r;
+
+        return sd_json_buildo(
+                        ret,
+                        JSON_BUILD_PAIR_IN_ADDR("address", &server->address, server->family),
+                        SD_JSON_BUILD_PAIR_INTEGER("family", server->family),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("port", dns_server_port(server)),
+                        SD_JSON_BUILD_PAIR_CONDITION(ifindex > 0, "ifindex", SD_JSON_BUILD_UNSIGNED(ifindex)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("name", server->server_name),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("accessible", accessible));
+}

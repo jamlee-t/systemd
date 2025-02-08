@@ -133,8 +133,6 @@ static int bpf_foreign_test_to_string(enum bpf_attach_type attach_type, const ch
 }
 
 static char **unlink_paths_and_free(char **paths) {
-        char **i;
-
         STRV_FOREACH(i, paths)
                 (void) unlink(*i);
 
@@ -162,7 +160,7 @@ static int pin_programs(Unit *u, CGroupContext *cc, const Test *test_suite, size
                 if (r < 0)
                         return log_error_errno(r, "Failed to convert program to string");
 
-                r = bpf_program_new(test_suite[i].prog_type, &prog);
+                r = bpf_program_new(test_suite[i].prog_type, "sd_trivial", &prog);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create program '%s'", str);
 
@@ -248,14 +246,14 @@ static int test_bpf_cgroup_programs(Manager *m, const char *unit_name, const Tes
         SERVICE(u)->type = SERVICE_ONESHOT;
         u->load_state = UNIT_LOADED;
 
-        r = unit_start(u);
+        r = unit_start(u, NULL);
         if (r < 0)
                 return log_error_errno(r, "Unit start failed %m");
 
         while (!IN_SET(SERVICE(u)->state, SERVICE_DEAD, SERVICE_FAILED)) {
                 r = sd_event_run(m->event, UINT64_MAX);
                 if (r < 0)
-                        return log_error_errno(errno, "Event run failed %m");
+                        return log_error_errno(r, "Event run failed %m");
         }
 
         cld_code = SERVICE(u)->exec_command[SERVICE_EXEC_START]->exec_status.code;
@@ -284,49 +282,49 @@ int main(int argc, char *argv[]) {
         if (getuid() != 0)
                 return log_tests_skipped("not running as root");
 
-        assert_se(getrlimit(RLIMIT_MEMLOCK, &rl) >= 0);
+        ASSERT_OK(getrlimit(RLIMIT_MEMLOCK, &rl));
         rl.rlim_cur = rl.rlim_max = MAX(rl.rlim_max, CAN_MEMLOCK_SIZE);
         (void) setrlimit_closest(RLIMIT_MEMLOCK, &rl);
 
         if (!can_memlock())
-                return log_tests_skipped("Can't use mlock(), skipping.");
+                return log_tests_skipped("Can't use mlock()");
 
         r = cg_all_unified();
         if (r <= 0)
-                return log_tests_skipped("Unified hierarchy is required, skipping.");
+                return log_tests_skipped("Unified hierarchy is required");
 
         r = enter_cgroup_subroot(NULL);
         if (r == -ENOMEDIUM)
                 return log_tests_skipped("cgroupfs not available");
 
-        assert_se(get_testdata_dir("units", &unit_dir) >= 0);
-        assert_se(set_unit_path(unit_dir) >= 0);
+        ASSERT_OK(get_testdata_dir("units", &unit_dir));
+        ASSERT_OK(setenv_unit_path(unit_dir));
         assert_se(runtime_dir = setup_fake_runtime_dir());
 
-        assert_se(manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_BASIC, &m) >= 0);
-        assert_se(manager_startup(m, NULL, NULL, NULL) >= 0);
+        ASSERT_OK(manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &m));
+        ASSERT_OK(manager_startup(m, NULL, NULL, NULL));
 
-        assert_se(test_bpf_cgroup_programs(m,
-                                "single_prog.service", single_prog, ELEMENTSOF(single_prog)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+        ASSERT_OK(test_bpf_cgroup_programs(m,
+                                "single_prog.service", single_prog, ELEMENTSOF(single_prog)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "multi_prog_same_hook.service",
-                                multi_prog_same_hook, ELEMENTSOF(multi_prog_same_hook)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                multi_prog_same_hook, ELEMENTSOF(multi_prog_same_hook)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "same_prog_multi_hook.service",
-                                same_prog_multi_hook, ELEMENTSOF(same_prog_multi_hook)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                same_prog_multi_hook, ELEMENTSOF(same_prog_multi_hook)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "same_prog_multi_option_0.service",
-                                same_prog_multi_option_0, ELEMENTSOF(same_prog_multi_option_0)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                same_prog_multi_option_0, ELEMENTSOF(same_prog_multi_option_0)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "same_prog_multi_option_1.service",
-                                same_prog_multi_option_1, ELEMENTSOF(same_prog_multi_option_1)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                same_prog_multi_option_1, ELEMENTSOF(same_prog_multi_option_1)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "same_prog_same_hook.service",
                                 same_prog_same_hook,
-                                ELEMENTSOF(same_prog_same_hook)) >= 0);
-        assert_se(test_bpf_cgroup_programs(m,
+                                ELEMENTSOF(same_prog_same_hook)));
+        ASSERT_OK(test_bpf_cgroup_programs(m,
                                 "path_split_test.service",
                                 path_split_test,
-                                ELEMENTSOF(path_split_test)) >= 0);
+                                ELEMENTSOF(path_split_test)));
         return 0;
 }

@@ -151,7 +151,7 @@ int sd_ipv4acd_new(sd_ipv4acd **ret) {
                 .n_ref = 1,
                 .state = IPV4ACD_STATE_INIT,
                 .ifindex = -1,
-                .fd = -1,
+                .fd = -EBADF,
         };
 
         *ret = TAKE_PTR(acd);
@@ -200,20 +200,18 @@ static int ipv4acd_set_next_wakeup(sd_ipv4acd *acd, usec_t usec, usec_t random_u
         if (random_usec > 0)
                 next_timeout += (usec_t) random_u64() % random_usec;
 
-        assert_se(sd_event_now(acd->event, clock_boottime_or_monotonic(), &time_now) >= 0);
+        assert_se(sd_event_now(acd->event, CLOCK_BOOTTIME, &time_now) >= 0);
 
         return event_reset_time(acd->event, &acd->timer_event_source,
-                                clock_boottime_or_monotonic(),
+                                CLOCK_BOOTTIME,
                                 time_now + next_timeout, 0,
                                 ipv4acd_on_timeout, acd,
                                 acd->event_priority, "ipv4acd-timer", true);
 }
 
 static int ipv4acd_on_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
-        sd_ipv4acd *acd = userdata;
+        sd_ipv4acd *acd = ASSERT_PTR(userdata);
         int r = 0;
-
-        assert(acd);
 
         switch (acd->state) {
 
@@ -329,7 +327,7 @@ static bool ipv4acd_arp_conflict(sd_ipv4acd *acd, const struct ether_arp *arp, b
         if (acd->check_mac_callback &&
             acd->check_mac_callback(acd, (const struct ether_addr*) arp->arp_sha, acd->check_mac_userdata) > 0)
                 /* sender hardware is one of the host's interfaces, ignoring. */
-                return true;
+                return false;
 
         return true; /* conflict! */
 }
@@ -351,18 +349,17 @@ static int ipv4acd_on_packet(
                 uint32_t revents,
                 void *userdata) {
 
-        sd_ipv4acd *acd = userdata;
+        sd_ipv4acd *acd = ASSERT_PTR(userdata);
         struct ether_arp packet;
         ssize_t n;
         int r;
 
         assert(s);
-        assert(acd);
         assert(fd >= 0);
 
         n = recv(fd, &packet, sizeof(struct ether_arp), 0);
         if (n < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
+                if (ERRNO_IS_TRANSIENT(errno) || ERRNO_IS_DISCONNECT(errno))
                         return 0;
 
                 log_ipv4acd_errno(acd, errno, "Failed to read ARP packet: %m");
@@ -381,7 +378,7 @@ static int ipv4acd_on_packet(
                 if (ipv4acd_arp_conflict(acd, &packet, true)) {
                         usec_t ts;
 
-                        assert_se(sd_event_now(acd->event, clock_boottime_or_monotonic(), &ts) >= 0);
+                        assert_se(sd_event_now(acd->event, CLOCK_BOOTTIME, &ts) >= 0);
 
                         /* Defend address */
                         if (ts > acd->defend_window) {
@@ -399,6 +396,7 @@ static int ipv4acd_on_packet(
                 }
                 break;
 
+        case IPV4ACD_STATE_STARTED:
         case IPV4ACD_STATE_WAITING_PROBE:
         case IPV4ACD_STATE_PROBING:
         case IPV4ACD_STATE_WAITING_ANNOUNCE:
@@ -567,9 +565,16 @@ int sd_ipv4acd_get_address(sd_ipv4acd *acd, struct in_addr *address) {
 }
 
 int sd_ipv4acd_is_running(sd_ipv4acd *acd) {
-        assert_return(acd, false);
+        if (!acd)
+                return false;
 
         return acd->state != IPV4ACD_STATE_INIT;
+}
+
+int sd_ipv4acd_is_bound(sd_ipv4acd *acd) {
+        assert_return(acd, false);
+
+        return IN_SET(acd->state, IPV4ACD_STATE_ANNOUNCING, IPV4ACD_STATE_RUNNING);
 }
 
 int sd_ipv4acd_start(sd_ipv4acd *acd, bool reset_conflicts) {
@@ -582,11 +587,17 @@ int sd_ipv4acd_start(sd_ipv4acd *acd, bool reset_conflicts) {
         assert_return(!ether_addr_is_null(&acd->mac_addr), -EINVAL);
         assert_return(acd->state == IPV4ACD_STATE_INIT, -EBUSY);
 
+        r = sd_event_get_state(acd->event);
+        if (r < 0)
+                return r;
+        if (r == SD_EVENT_FINISHED)
+                return -ESTALE;
+
         r = arp_network_bind_raw_socket(acd->ifindex, &acd->address, &acd->mac_addr);
         if (r < 0)
                 return r;
 
-        CLOSE_AND_REPLACE(acd->fd, r);
+        close_and_replace(acd->fd, r);
 
         if (reset_conflicts)
                 acd->n_conflict = 0;

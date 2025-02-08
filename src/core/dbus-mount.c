@@ -6,36 +6,56 @@
 #include "dbus-kill.h"
 #include "dbus-mount.h"
 #include "dbus-util.h"
+#include "fstab-util.h"
 #include "mount.h"
 #include "string-util.h"
 #include "unit.h"
+#include "utf8.h"
 
-static const char *mount_get_what(const Mount *m) {
-        if (m->from_proc_self_mountinfo && m->parameters_proc_self_mountinfo.what)
-                return m->parameters_proc_self_mountinfo.what;
-        if (m->from_fragment && m->parameters_fragment.what)
-                return m->parameters_fragment.what;
-        return NULL;
+static int property_get_what(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        _cleanup_free_ char *escaped = NULL;
+        Mount *m = ASSERT_PTR(userdata);
+
+        assert(bus);
+        assert(reply);
+
+        escaped = mount_get_what_escaped(m);
+        if (!escaped)
+                return -ENOMEM;
+
+        return sd_bus_message_append_basic(reply, 's', escaped);
 }
 
-static const char *mount_get_options(const Mount *m) {
-        if (m->from_proc_self_mountinfo && m->parameters_proc_self_mountinfo.options)
-                return m->parameters_proc_self_mountinfo.options;
-        if (m->from_fragment && m->parameters_fragment.options)
-                return m->parameters_fragment.options;
-        return NULL;
+static int property_get_options(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        _cleanup_free_ char *escaped = NULL;
+        Mount *m = ASSERT_PTR(userdata);
+
+        assert(bus);
+        assert(reply);
+
+        escaped = mount_get_options_escaped(m);
+        if (!escaped)
+                return -ENOMEM;
+
+        return sd_bus_message_append_basic(reply, 's', escaped);
 }
 
-static const char *mount_get_fstype(const Mount *m) {
-        if (m->from_proc_self_mountinfo && m->parameters_proc_self_mountinfo.fstype)
-                return m->parameters_proc_self_mountinfo.fstype;
-        else if (m->from_fragment && m->parameters_fragment.fstype)
-                return m->parameters_fragment.fstype;
-        return NULL;
-}
-
-static BUS_DEFINE_PROPERTY_GET(property_get_what, "s", Mount, mount_get_what);
-static BUS_DEFINE_PROPERTY_GET(property_get_options, "s", Mount, mount_get_options);
 static BUS_DEFINE_PROPERTY_GET(property_get_type, "s", Mount, mount_get_fstype);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_result, mount_result, MountResult);
 
@@ -43,10 +63,10 @@ const sd_bus_vtable bus_mount_vtable[] = {
         SD_BUS_VTABLE_START(0),
         SD_BUS_PROPERTY("Where", "s", NULL, offsetof(Mount, where), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("What", "s", property_get_what, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("Options","s", property_get_options, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("Options", "s", property_get_options, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Type", "s", property_get_type, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("TimeoutUSec", "t", bus_property_get_usec, offsetof(Mount, timeout_usec), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("ControlPID", "u", bus_property_get_pid, offsetof(Mount, control_pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("ControlPID", "u", bus_property_get_pid, offsetof(Mount, control_pid.pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("DirectoryMode", "u", bus_property_get_mode, offsetof(Mount, directory_mode), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("SloppyOptions", "b", bus_property_get_bool, offsetof(Mount, sloppy_options), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("LazyUnmount", "b", bus_property_get_bool, offsetof(Mount, lazy_unmount), SD_BUS_VTABLE_PROPERTY_CONST),
@@ -55,6 +75,7 @@ const sd_bus_vtable bus_mount_vtable[] = {
         SD_BUS_PROPERTY("Result", "s", property_get_result, offsetof(Mount, result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("UID", "u", bus_property_get_uid, offsetof(Unit, ref_uid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("GID", "u", bus_property_get_gid, offsetof(Unit, ref_gid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("GracefulOptions", "as", NULL, offsetof(Mount, graceful_options), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_EXEC_COMMAND_VTABLE("ExecMount", offsetof(Mount, exec_command[MOUNT_EXEC_MOUNT]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
         BUS_EXEC_COMMAND_VTABLE("ExecUnmount", offsetof(Mount, exec_command[MOUNT_EXEC_UNMOUNT]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
         BUS_EXEC_COMMAND_VTABLE("ExecRemount", offsetof(Mount, exec_command[MOUNT_EXEC_REMOUNT]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
@@ -69,6 +90,7 @@ static int bus_mount_set_transient_property(
                 sd_bus_error *error) {
 
         Unit *u = UNIT(m);
+        int r;
 
         assert(m);
         assert(name);
@@ -79,8 +101,31 @@ static int bus_mount_set_transient_property(
         if (streq(name, "Where"))
                 return bus_set_transient_path(u, name, &m->where, message, flags, error);
 
-        if (streq(name, "What"))
-                return bus_set_transient_string(u, name, &m->parameters_fragment.what, message, flags, error);
+        if (streq(name, "What")) {
+                _cleanup_free_ char *path = NULL;
+                const char *v;
+
+                r = sd_bus_message_read(message, "s", &v);
+                if (r < 0)
+                        return r;
+
+                if (!isempty(v)) {
+                        path = fstab_node_to_udev_node(v);
+                        if (!path)
+                                return -ENOMEM;
+
+                        /* path_is_valid is not used - see the comment for config_parse_mount_node */
+                        if (strlen(path) >= PATH_MAX)
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Resolved What=%s too long", path);
+                }
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                        free_and_replace(m->parameters_fragment.what, path);
+                        unit_write_settingf(u, flags|UNIT_ESCAPE_SPECIFIERS, name, "What=%s", strempty(m->parameters_fragment.what));
+                }
+
+                return 1;
+        }
 
         if (streq(name, "Options"))
                 return bus_set_transient_string(u, name, &m->parameters_fragment.options, message, flags, error);
@@ -105,6 +150,30 @@ static int bus_mount_set_transient_property(
 
         if (streq(name, "ReadWriteOnly"))
                 return bus_set_transient_bool(u, name, &m->read_write_only, message, flags, error);
+
+        if (streq(name, "GracefulOptions")) {
+                _cleanup_strv_free_ char **add = NULL;
+                r = sd_bus_message_read_strv(message, &add);
+                if (r < 0)
+                        return r;
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+
+                        if (strv_isempty(add)) {
+                                m->graceful_options = strv_free(m->graceful_options);
+                                unit_write_settingf(u, flags, name, "GracefulOptions=");
+                        } else {
+                                r = strv_extend_strv(&m->graceful_options, add, /* filter_duplicates= */ false);
+                                if (r < 0)
+                                        return r;
+
+                                STRV_FOREACH(a, add)
+                                        unit_write_settingf(u, flags|UNIT_ESCAPE_SPECIFIERS, name, "GracefulOptions=%s", *a);
+                        }
+                }
+
+                return 1;
+        }
 
         return 0;
 }
@@ -149,7 +218,7 @@ int bus_mount_set_property(
 int bus_mount_commit_properties(Unit *u) {
         assert(u);
 
-        unit_realize_cgroup(u);
+        (void) unit_realize_cgroup(u);
 
         return 0;
 }

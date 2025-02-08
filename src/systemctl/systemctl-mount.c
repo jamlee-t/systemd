@@ -7,7 +7,7 @@
 #include "systemctl-util.h"
 #include "systemctl.h"
 
-int mount_bind(int argc, char *argv[], void *userdata) {
+int verb_bind(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_free_ char *n = NULL;
         sd_bus *bus;
@@ -41,7 +41,7 @@ int mount_bind(int argc, char *argv[], void *userdata) {
         return 0;
 }
 
-int mount_image(int argc, char *argv[], void *userdata) {
+int verb_mount_image(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *unit = argv[1], *src = argv[2], *dest = argv[3];
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
@@ -86,7 +86,7 @@ int mount_image(int argc, char *argv[], void *userdata) {
                 _cleanup_free_ char *partition = NULL, *mount_options = NULL;
                 const char *options = argv[4];
 
-                r = extract_many_words(&options, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &partition, &mount_options, NULL);
+                r = extract_many_words(&options, ":", EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS, &partition, &mount_options);
                 if (r < 0)
                         return r;
                 /* Single set of options, applying to the root partition/single filesystem */

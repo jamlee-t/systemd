@@ -1,339 +1,221 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-shared_sources = files('''
-        acl-util.h
-        acpi-fpdt.c
-        acpi-fpdt.h
-        apparmor-util.c
-        apparmor-util.h
-        ask-password-api.c
-        ask-password-api.h
-        barrier.c
-        barrier.h
-        base-filesystem.c
-        base-filesystem.h
-        binfmt-util.c
-        binfmt-util.h
-        bitmap.c
-        bitmap.h
-        blkid-util.h
-        blockdev-util.c
-        blockdev-util.h
-        bond-util.c
-        bond-util.h
-        boot-timestamps.c
-        boot-timestamps.h
-        bootspec.c
-        bootspec.h
-        bpf-dlopen.c
-        bpf-dlopen.h
-        bpf-program.c
-        bpf-program.h
-        bridge-util.c
-        bridge-util.h
-        btrfs-util.c
-        btrfs-util.h
-        bus-get-properties.c
-        bus-get-properties.h
-        bus-locator.c
-        bus-locator.h
-        bus-log-control-api.c
-        bus-log-control-api.h
-        bus-map-properties.c
-        bus-map-properties.h
-        bus-message-util.c
-        bus-message-util.h
-        bus-object.c
-        bus-object.h
-        bus-polkit.c
-        bus-polkit.h
-        bus-print-properties.c
-        bus-print-properties.h
-        bus-unit-procs.c
-        bus-unit-procs.h
-        bus-unit-util.c
-        bus-unit-util.h
-        bus-util.c
-        bus-util.h
-        bus-wait-for-jobs.c
-        bus-wait-for-jobs.h
-        bus-wait-for-units.c
-        bus-wait-for-units.h
-        calendarspec.c
-        calendarspec.h
-        cgroup-setup.c
-        cgroup-setup.h
-        cgroup-show.c
-        cgroup-show.h
-        chown-recursive.c
-        chown-recursive.h
-        clean-ipc.c
-        clean-ipc.h
-        clock-util.c
-        clock-util.h
-        condition.c
-        condition.h
-        conf-parser.c
-        conf-parser.h
-        copy.c
-        copy.h
-        coredump-util.c
-        coredump-util.h
-        cpu-set-util.c
-        cpu-set-util.h
-        creds-util.c
-        creds-util.h
-        cryptsetup-util.c
-        cryptsetup-util.h
-        daemon-util.h
-        data-fd-util.c
-        data-fd-util.h
-        dev-setup.c
-        dev-setup.h
-        device-nodes.c
-        device-nodes.h
-        devnode-acl.h
-        discover-image.c
-        discover-image.h
-        dissect-image.c
-        dissect-image.h
-        dlfcn-util.c
-        dlfcn-util.h
-        dm-util.c
-        dm-util.h
-        dns-domain.c
-        dns-domain.h
-        dropin.c
-        dropin.h
-        efi-loader.c
-        efi-loader.h
-        enable-mempool.c
-        env-file-label.c
-        env-file-label.h
-        ethtool-util.c
-        ethtool-util.h
-        exec-util.c
-        exec-util.h
-        exit-status.c
-        exit-status.h
-        extension-release.c
-        extension-release.h
-        fdset.c
-        fdset.h
-        fileio-label.c
-        fileio-label.h
-        firewall-util-nft.c
-        firewall-util-private.h
-        firewall-util.c
-        firewall-util.h
-        format-table.c
-        format-table.h
-        fsck-util.h
-        fstab-util.c
-        fstab-util.h
-        generator.c
-        generator.h
-        geneve-util.c
-        geneve-util.h
-        gpt.c
-        gpt.h
-        group-record.c
-        group-record.h
-        hostname-setup.c
-        hostname-setup.h
-        hwdb-util.c
-        hwdb-util.h
-        id128-print.c
-        id128-print.h
-        idn-util.c
-        idn-util.h
-        ima-util.c
-        ima-util.h
-        import-util.c
-        import-util.h
-        in-addr-prefix-util.c
-        in-addr-prefix-util.h
-        initreq.h
-        install-file.c
-        install-file.h
-        install-printf.c
-        install-printf.h
-        install.c
-        install.h
-        ip-protocol-list.c
-        ip-protocol-list.h
-        ipvlan-util.c
-        ipvlan-util.h
-        journal-importer.c
-        journal-importer.h
-        journal-util.c
-        journal-util.h
-        json-internal.h
-        json.c
-        json.h
-        kbd-util.c
-        kbd-util.h
-        keyring-util.h
-        keyring-util.c
-        killall.c
-        killall.h
-        label.c
-        label.h
-        libcrypt-util.c
-        libcrypt-util.h
-        libfido2-util.c
-        libfido2-util.h
-        libmount-util.h
-        linux/auto_dev-ioctl.h
-        linux/bpf.h
-        linux/bpf_common.h
-        linux/bpf_insn.h
-        linux/dm-ioctl.h
-        linux/ethtool.h
-        local-addresses.c
-        local-addresses.h
-        lockfile-util.c
-        lockfile-util.h
-        log-link.h
-        logs-show.c
-        logs-show.h
-        loop-util.c
-        loop-util.h
-        loopback-setup.c
-        loopback-setup.h
-        machine-id-setup.c
-        machine-id-setup.h
-        machine-pool.c
-        machine-pool.h
-        macvlan-util.c
-        macvlan-util.h
-        main-func.h
-        mkdir-label.c
-        mkdir-label.h
-        mkfs-util.c
-        mkfs-util.h
-        module-util.h
-        mount-setup.c
-        mount-setup.h
-        mount-util.c
-        mount-util.h
-        net-condition.c
-        net-condition.h
-        netif-naming-scheme.c
-        netif-naming-scheme.h
-        netif-util.c
-        netif-util.h
-        nscd-flush.h
-        nsflags.c
-        nsflags.h
-        numa-util.c
-        numa-util.h
-        openssl-util.c
-        openssl-util.h
-        output-mode.c
-        output-mode.h
-        pager.c
-        pager.h
-        parse-argument.c
-        parse-argument.h
-        parse-socket-bind-item.c
-        parse-socket-bind-item.h
-        pe-header.h
-        pkcs11-util.c
-        pkcs11-util.h
-        pretty-print.c
-        pretty-print.h
-        psi-util.c
-        psi-util.h
-        ptyfwd.c
-        ptyfwd.h
-        pwquality-util.c
-        pwquality-util.h
-        qrcode-util.c
-        qrcode-util.h
-        quota-util.c
-        quota-util.h
-        reboot-util.c
-        reboot-util.h
-        resize-fs.c
-        resize-fs.h
-        resolve-util.c
-        resolve-util.h
-        rm-rf.c
-        rm-rf.h
-        seccomp-util.h
-        securebits-util.c
-        securebits-util.h
-        selinux-util.c
-        selinux-util.h
-        serialize.c
-        serialize.h
-        service-util.c
-        service-util.h
-        sleep-config.c
-        sleep-config.h
-        smack-util.c
-        smack-util.h
-        socket-label.c
-        socket-netlink.c
-        socket-netlink.h
-        spawn-ask-password-agent.c
-        spawn-ask-password-agent.h
-        spawn-polkit-agent.c
-        spawn-polkit-agent.h
-        specifier.c
-        specifier.h
-        switch-root.c
-        switch-root.h
-        tmpfile-util-label.c
-        tmpfile-util-label.h
-        tomoyo-util.c
-        tomoyo-util.h
-        tpm2-util.c
-        tpm2-util.h
-        udev-util.c
-        udev-util.h
-        uid-alloc-range.c
-        uid-alloc-range.h
-        uid-range.c
-        uid-range.h
-        user-record-nss.c
-        user-record-nss.h
-        user-record-show.c
-        user-record-show.h
-        user-record.c
-        user-record.h
-        userdb-dropin.c
-        userdb-dropin.h
-        userdb.c
-        userdb.h
-        utmp-wtmp.h
-        varlink.c
-        varlink.h
-        verb-log-control.c
-        verb-log-control.h
-        verbs.c
-        verbs.h
-        vlan-util.c
-        vlan-util.h
-        volatile-util.c
-        volatile-util.h
-        watchdog.c
-        watchdog.h
-        web-util.c
-        web-util.h
-        wifi-util.c
-        wifi-util.h
-        xml.c
-        xml.h
-'''.split())
+shared_sources = files(
+        'acl-util.c',
+        'acpi-fpdt.c',
+        'apparmor-util.c',
+        'ask-password-agent.c',
+        'ask-password-api.c',
+        'async.c',
+        'barrier.c',
+        'base-filesystem.c',
+        'battery-util.c',
+        'binfmt-util.c',
+        'bitmap.c',
+        'blockdev-list.c',
+        'blockdev-util.c',
+        'bond-util.c',
+        'boot-entry.c',
+        'boot-timestamps.c',
+        'bootspec.c',
+        'bpf-dlopen.c',
+        'bpf-program.c',
+        'bridge-util.c',
+        'btrfs-util.c',
+        'bus-get-properties.c',
+        'bus-locator.c',
+        'bus-log-control-api.c',
+        'bus-map-properties.c',
+        'bus-message-util.c',
+        'bus-object.c',
+        'bus-polkit.c',
+        'bus-print-properties.c',
+        'bus-unit-procs.c',
+        'bus-unit-util.c',
+        'bus-util.c',
+        'bus-wait-for-jobs.c',
+        'bus-wait-for-units.c',
+        'calendarspec.c',
+        'cgroup-setup.c',
+        'cgroup-show.c',
+        'chown-recursive.c',
+        'clean-ipc.c',
+        'clock-util.c',
+        'color-util.c',
+        'common-signal.c',
+        'compare-operator.c',
+        'condition.c',
+        'conf-parser.c',
+        'copy.c',
+        'coredump-util.c',
+        'cpu-set-util.c',
+        'creds-util.c',
+        'cryptsetup-util.c',
+        'daemon-util.c',
+        'data-fd-util.c',
+        'dev-setup.c',
+        'device-nodes.c',
+        'discover-image.c',
+        'dissect-image.c',
+        'dm-util.c',
+        'dns-domain.c',
+        'dropin.c',
+        'edit-util.c',
+        'efi-api.c',
+        'efi-loader.c',
+        'elf-util.c',
+        'enable-mempool.c',
+        'env-file-label.c',
+        'ethtool-util.c',
+        'exec-util.c',
+        'exit-status.c',
+        'extension-util.c',
+        'fdset.c',
+        'fido2-util.c',
+        'find-esp.c',
+        'firewall-util-nft.c',
+        'firewall-util.c',
+        'format-table.c',
+        'fstab-util.c',
+        'generator.c',
+        'geneve-util.c',
+        'gpt.c',
+        'group-record.c',
+        'hibernate-util.c',
+        'hostname-setup.c',
+        'hwdb-util.c',
+        'id128-print.c',
+        'idn-util.c',
+        'ima-util.c',
+        'image-policy.c',
+        'import-util.c',
+        'in-addr-prefix-util.c',
+        'install-file.c',
+        'install-printf.c',
+        'install.c',
+        'ip-protocol-list.c',
+        'ipvlan-util.c',
+        'journal-file-util.c',
+        'journal-importer.c',
+        'journal-util.c',
+        'kbd-util.c',
+        'kernel-config.c',
+        'kernel-image.c',
+        'killall.c',
+        'label-util.c',
+        'libarchive-util.c',
+        'libcrypt-util.c',
+        'libfido2-util.c',
+        'libmount-util.c',
+        'local-addresses.c',
+        'locale-setup.c',
+        'logs-show.c',
+        'loop-util.c',
+        'loopback-setup.c',
+        'lsm-util.c',
+        'machine-credential.c',
+        'machine-id-setup.c',
+        'machine-pool.c',
+        'macvlan-util.c',
+        'mkdir-label.c',
+        'mkfs-util.c',
+        'module-util.c',
+        'mount-setup.c',
+        'mount-util.c',
+        'net-condition.c',
+        'netif-naming-scheme.c',
+        'netif-sriov.c',
+        'netif-util.c',
+        'nsflags.c',
+        'nsresource.c',
+        'numa-util.c',
+        'open-file.c',
+        'openssl-util.c',
+        'output-mode.c',
+        'pager.c',
+        'parse-argument.c',
+        'parse-helpers.c',
+        'password-quality-util-passwdqc.c',
+        'password-quality-util-pwquality.c',
+        'pcre2-util.c',
+        'pcrextend-util.c',
+        'pe-binary.c',
+        'pkcs11-util.c',
+        'plymouth-util.c',
+        'polkit-agent.c',
+        'portable-util.c',
+        'pretty-print.c',
+        'capsule-util.c',
+        'ptyfwd.c',
+        'qrcode-util.c',
+        'quota-util.c',
+        'reboot-util.c',
+        'recovery-key.c',
+        'resize-fs.c',
+        'resolve-util.c',
+        'rm-rf.c',
+        'securebits-util.c',
+        'selinux-util.c',
+        'serialize.c',
+        'service-util.c',
+        'shift-uid.c',
+        'sleep-config.c',
+        'smack-util.c',
+        'smbios11.c',
+        'socket-label.c',
+        'socket-netlink.c',
+        'specifier.c',
+        'switch-root.c',
+        'tmpfile-util-label.c',
+        'tomoyo-util.c',
+        'tpm2-util.c',
+        'tpm2-event-log.c',
+        'udev-util.c',
+        'unit-file.c',
+        'user-record-nss.c',
+        'user-record-show.c',
+        'user-record.c',
+        'userdb-dropin.c',
+        'userdb.c',
+        'varlink-idl-common.c',
+        'varlink-io.systemd.AskPassword.c',
+        'varlink-io.systemd.BootControl.c',
+        'varlink-io.systemd.Credentials.c',
+        'varlink-io.systemd.Hostname.c',
+        'varlink-io.systemd.Import.c',
+        'varlink-io.systemd.Journal.c',
+        'varlink-io.systemd.Login.c',
+        'varlink-io.systemd.Machine.c',
+        'varlink-io.systemd.MachineImage.c',
+        'varlink-io.systemd.ManagedOOM.c',
+        'varlink-io.systemd.MountFileSystem.c',
+        'varlink-io.systemd.NamespaceResource.c',
+        'varlink-io.systemd.Network.c',
+        'varlink-io.systemd.PCRExtend.c',
+        'varlink-io.systemd.PCRLock.c',
+        'varlink-io.systemd.Resolve.c',
+        'varlink-io.systemd.Resolve.Monitor.c',
+        'varlink-io.systemd.Udev.c',
+        'varlink-io.systemd.UserDatabase.c',
+        'varlink-io.systemd.oom.c',
+        'varlink-io.systemd.service.c',
+        'varlink-io.systemd.sysext.c',
+        'varlink-serialize.c',
+        'vconsole-util.c',
+        'verb-log-control.c',
+        'verbs.c',
+        'vlan-util.c',
+        'volatile-util.c',
+        'vpick.c',
+        'wall.c',
+        'watchdog.c',
+        'web-util.c',
+        'wifi-util.c',
+        'xml.c',
+)
 
 if get_option('tests') != 'false'
-        shared_sources += files('''
-                test-tables.h
-                tests.c
-                tests.h
-        '''.split())
+        shared_sources += files('tests.c')
 endif
 
 generate_syscall_list = find_program('generate-syscall-list.py')
@@ -347,10 +229,7 @@ syscall_list_h = custom_target(
         capture : true)
 
 if conf.get('HAVE_ACL') == 1
-        shared_sources += files('''
-                acl-util.c
-                devnode-acl.c
-        '''.split())
+        shared_sources += files('devnode-acl.c')
 endif
 
 if conf.get('ENABLE_UTMP') == 1
@@ -367,24 +246,19 @@ if conf.get('HAVE_LIBIPTC') == 1
 endif
 
 if conf.get('HAVE_LIBBPF') == 1
-        shared_sources += files('''
-                bpf-link.c
-                bpf-link.h
-        '''.split())
-endif
-
-if conf.get('HAVE_KMOD') == 1
-        shared_sources += files('module-util.c')
+        shared_sources += files('bpf-link.c')
 endif
 
 if conf.get('HAVE_PAM') == 1
-        shared_sources += files(
-                'pam-util.c',
-                'pam-util.h')
+        shared_sources += files('pam-util.c')
 endif
 
-if conf.get('ENABLE_NSCD') == 1
-        shared_sources += files('nscd-flush.c')
+if conf.get('HAVE_LIBFIDO2') == 1 and conf.get('HAVE_LIBCRYPTSETUP') == 1
+        shared_sources += files('cryptsetup-fido2.c')
+endif
+
+if conf.get('HAVE_TPM2') == 1 and conf.get('HAVE_LIBCRYPTSETUP') == 1
+        shared_sources += files('cryptsetup-tpm2.c')
 endif
 
 generate_ip_protocol_list = find_program('generate-ip-protocol-list.sh')
@@ -427,7 +301,25 @@ target2 = custom_target(
 shared_generated_gperf_headers = [target1, target2]
 shared_sources += shared_generated_gperf_headers
 
-libshared_name = 'systemd-shared-@0@'.format(meson.project_version())
+fname = 'ethtool-link-mode.h'
+ethtool_link_mode_h = custom_target(
+        fname,
+        input : ['ethtool-link-mode.py', '../basic/linux/ethtool.h'],
+        output : fname,
+        command : [python, '@INPUT0@', '--header', cpp, '@INPUT1@'],
+        capture : true)
+shared_sources += ethtool_link_mode_h
+
+fname = 'ethtool-link-mode.xml'
+ethtool_link_mode_xml = custom_target(
+        fname,
+        input : ['ethtool-link-mode.py', '../basic/linux/ethtool.h'],
+        output : fname,
+        command : [python, '@INPUT0@', '--xml', cpp, '@INPUT1@'],
+        capture : true)
+man_page_depends += ethtool_link_mode_xml
+
+libshared_name = 'systemd-shared-@0@'.format(shared_lib_tag)
 
 libshared_deps = [threads,
                   libacl,
@@ -436,38 +328,54 @@ libshared_deps = [threads,
                   libcrypt,
                   libdl,
                   libgcrypt,
-                  libiptc,
-                  libkmod,
-                  liblz4,
+                  libiptc_cflags,
+                  libkmod_cflags,
+                  liblz4_cflags,
                   libmount,
                   libopenssl,
-                  libp11kit,
+                  libp11kit_cflags,
                   libpam,
                   librt,
                   libseccomp,
                   libselinux,
-                  libzstd,
-                  libxz]
+                  libxenctrl_cflags,
+                  libxz_cflags,
+                  libzstd_cflags]
 
-libshared_sym_path = '@0@/libshared.sym'.format(meson.current_source_dir())
+libshared_sym_path = meson.current_source_dir() / 'libshared.sym'
+libshared_build_dir = meson.current_build_dir()
 
 libshared_static = static_library(
         libshared_name,
         shared_sources,
         include_directories : includes,
-        dependencies : libshared_deps,
-        c_args : ['-fvisibility=default'])
+        dependencies : [libshared_deps,
+                        userspace],
+        c_args : ['-fvisibility=default'],
+        build_by_default : false)
 
 libshared = shared_library(
         libshared_name,
         include_directories : includes,
+        c_args : ['-fvisibility=default'],
         link_args : ['-shared',
                      '-Wl,--version-script=' + libshared_sym_path],
+        link_depends : libshared_sym_path,
         link_whole : [libshared_static,
-                      libbasic,
-                      libbasic_gcrypt,
+                      libbasic_static,
                       libsystemd_static],
-        c_args : ['-fvisibility=default'],
-        dependencies : libshared_deps,
+        dependencies : [libshared_deps,
+                        userspace],
         install : true,
-        install_dir : rootlibexecdir)
+        install_dir : pkglibdir)
+
+shared_fdisk_sources = files('fdisk-util.c')
+
+libshared_fdisk = static_library(
+        'shared-fdisk',
+        shared_fdisk_sources,
+        include_directories : includes,
+        dependencies : [libfdisk,
+                        userspace],
+        c_args : ['-fvisibility=default'],
+        build_by_default : false)

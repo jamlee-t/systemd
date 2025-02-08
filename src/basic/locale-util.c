@@ -10,12 +10,14 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-#include "def.h"
+#include "constants.h"
 #include "dirent-util.h"
 #include "env-util.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "hashmap.h"
 #include "locale-util.h"
+#include "missing_syscall.h"
 #include "path-util.h"
 #include "set.h"
 #include "string-table.h"
@@ -94,7 +96,7 @@ static int add_locales_from_archive(Set *locales) {
         const struct locarhead *h;
         const struct namehashent *e;
         const void *p = MAP_FAILED;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         size_t sz = 0;
         struct stat st;
         int r;
@@ -111,6 +113,9 @@ static int add_locales_from_archive(Set *locales) {
 
         if (st.st_size < (off_t) sizeof(struct locarhead))
                 return -EBADMSG;
+
+        if (file_offset_beyond_memory_size(st.st_size))
+                return -EFBIG;
 
         p = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
         if (p == MAP_FAILED)
@@ -156,22 +161,21 @@ static int add_locales_from_archive(Set *locales) {
         return r;
 }
 
-static int add_locales_from_libdir (Set *locales) {
+static int add_locales_from_libdir(Set *locales) {
         _cleanup_closedir_ DIR *dir = NULL;
-        struct dirent *entry;
         int r;
 
         dir = opendir("/usr/lib/locale");
         if (!dir)
                 return errno == ENOENT ? 0 : -errno;
 
-        FOREACH_DIRENT(entry, dir, return -errno) {
+        FOREACH_DIRENT(de, dir, return -errno) {
                 char *z;
 
-                if (entry->d_type != DT_DIR)
+                if (de->d_type != DT_DIR)
                         continue;
 
-                z = normalize_locale(entry->d_name);
+                z = normalize_locale(de->d_name);
                 if (!z)
                         return -ENOMEM;
 
@@ -184,7 +188,7 @@ static int add_locales_from_libdir (Set *locales) {
 }
 
 int get_locales(char ***ret) {
-        _cleanup_set_free_ Set *locales = NULL;
+        _cleanup_set_free_free_ Set *locales = NULL;
         _cleanup_strv_free_ char **l = NULL;
         int r;
 
@@ -200,12 +204,24 @@ int get_locales(char ***ret) {
         if (r < 0)
                 return r;
 
+        char *locale;
+        SET_FOREACH(locale, locales) {
+                r = locale_is_installed(locale);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        free(set_remove(locales, locale));
+        }
+
         l = set_get_strv(locales);
         if (!l)
                 return -ENOMEM;
 
+        /* Now, all elements are owned by strv 'l'. Hence, do not call set_free_free(). */
+        locales = set_free(locales);
+
         r = getenv_bool("SYSTEMD_LIST_NON_UTF8_LOCALES");
-        if (r == -ENXIO || r == 0) {
+        if (IN_SET(r, -ENXIO, 0)) {
                 char **a, **b;
 
                 /* Filter out non-UTF-8 locales, because it's 2019, by default */
@@ -244,7 +260,10 @@ bool locale_is_valid(const char *name) {
         if (!filename_is_valid(name))
                 return false;
 
-        if (!string_is_safe(name))
+        /* Locales look like: ll_CC.ENC@variant, where ll and CC are alphabetic, ENC is alphanumeric with
+         * dashes, and variant seems to be alphabetic.
+         * See: https://www.gnu.org/software/gettext/manual/html_node/Locale-Names.html */
+        if (!in_charset(name, ALPHANUMERICAL "_.-@"))
                 return false;
 
         return true;
@@ -257,28 +276,36 @@ int locale_is_installed(const char *name) {
         if (STR_IN_SET(name, "C", "POSIX")) /* These ones are always OK */
                 return true;
 
-        _cleanup_(freelocalep) locale_t loc =
-                newlocale(LC_ALL_MASK, name, 0);
+        _cleanup_(freelocalep) locale_t loc = newlocale(LC_ALL_MASK, name, (locale_t) 0);
         if (loc == (locale_t) 0)
                 return errno == ENOMEM ? -ENOMEM : false;
 
         return true;
 }
 
-void init_gettext(void) {
-        setlocale(LC_ALL, "");
-        textdomain(GETTEXT_PACKAGE);
-}
-
 bool is_locale_utf8(void) {
-        const char *set;
         static int cached_answer = -1;
+        const char *set;
+        int r;
 
         /* Note that we default to 'true' here, since today UTF8 is
          * pretty much supported everywhere. */
 
         if (cached_answer >= 0)
                 goto out;
+
+        r = secure_getenv_bool("SYSTEMD_UTF8");
+        if (r >= 0) {
+                cached_answer = r;
+                goto out;
+        } else if (r != -ENXIO)
+                log_debug_errno(r, "Failed to parse $SYSTEMD_UTF8, ignoring: %m");
+
+        /* This function may be called from libsystemd, and setlocale() is not thread safe. Assuming yes. */
+        if (gettid() != raw_getpid()) {
+                cached_answer = true;
+                goto out;
+        }
 
         if (!setlocale(LC_ALL, "")) {
                 cached_answer = true;
@@ -317,27 +344,34 @@ out:
 }
 
 void locale_variables_free(char *l[_VARIABLE_LC_MAX]) {
-        if (!l)
-                return;
+        free_many_charp(l, _VARIABLE_LC_MAX);
+}
 
-        for (LocaleVariable i = 0; i < _VARIABLE_LC_MAX; i++)
-                l[i] = mfree(l[i]);
+void locale_variables_simplify(char *l[_VARIABLE_LC_MAX]) {
+        assert(l);
+
+        for (LocaleVariable p = 0; p < _VARIABLE_LC_MAX; p++) {
+                if (p == VARIABLE_LANG)
+                        continue;
+                if (isempty(l[p]) || streq_ptr(l[VARIABLE_LANG], l[p]))
+                        l[p] = mfree(l[p]);
+        }
 }
 
 static const char * const locale_variable_table[_VARIABLE_LC_MAX] = {
-        [VARIABLE_LANG] = "LANG",
-        [VARIABLE_LANGUAGE] = "LANGUAGE",
-        [VARIABLE_LC_CTYPE] = "LC_CTYPE",
-        [VARIABLE_LC_NUMERIC] = "LC_NUMERIC",
-        [VARIABLE_LC_TIME] = "LC_TIME",
-        [VARIABLE_LC_COLLATE] = "LC_COLLATE",
-        [VARIABLE_LC_MONETARY] = "LC_MONETARY",
-        [VARIABLE_LC_MESSAGES] = "LC_MESSAGES",
-        [VARIABLE_LC_PAPER] = "LC_PAPER",
-        [VARIABLE_LC_NAME] = "LC_NAME",
-        [VARIABLE_LC_ADDRESS] = "LC_ADDRESS",
-        [VARIABLE_LC_TELEPHONE] = "LC_TELEPHONE",
-        [VARIABLE_LC_MEASUREMENT] = "LC_MEASUREMENT",
+        [VARIABLE_LANG]              = "LANG",
+        [VARIABLE_LANGUAGE]          = "LANGUAGE",
+        [VARIABLE_LC_CTYPE]          = "LC_CTYPE",
+        [VARIABLE_LC_NUMERIC]        = "LC_NUMERIC",
+        [VARIABLE_LC_TIME]           = "LC_TIME",
+        [VARIABLE_LC_COLLATE]        = "LC_COLLATE",
+        [VARIABLE_LC_MONETARY]       = "LC_MONETARY",
+        [VARIABLE_LC_MESSAGES]       = "LC_MESSAGES",
+        [VARIABLE_LC_PAPER]          = "LC_PAPER",
+        [VARIABLE_LC_NAME]           = "LC_NAME",
+        [VARIABLE_LC_ADDRESS]        = "LC_ADDRESS",
+        [VARIABLE_LC_TELEPHONE]      = "LC_TELEPHONE",
+        [VARIABLE_LC_MEASUREMENT]    = "LC_MEASUREMENT",
         [VARIABLE_LC_IDENTIFICATION] = "LC_IDENTIFICATION"
 };
 

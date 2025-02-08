@@ -59,9 +59,9 @@ static void in_addr_prefix_hash_func(const struct in_addr_prefix *a, struct siph
         assert(a);
         assert(state);
 
-        siphash24_compress(&a->family, sizeof(a->family), state);
-        siphash24_compress(&a->prefixlen, sizeof(a->prefixlen), state);
-        siphash24_compress(&a->address, FAMILY_ADDRESS_SIZE(a->family), state);
+        siphash24_compress_typesafe(a->family, state);
+        siphash24_compress_typesafe(a->prefixlen, state);
+        in_addr_hash_func(&a->address, a->family, state);
 }
 
 static int in_addr_prefix_compare_func(const struct in_addr_prefix *x, const struct in_addr_prefix *y) {
@@ -108,7 +108,7 @@ int in_addr_prefixes_reduce(Set *prefixes) {
         struct in_addr_prefix *p;
 
         SET_FOREACH(p, prefixes)
-                switch(p->family) {
+                switch (p->family) {
                 case AF_INET:
                         assert(p->prefixlen <= 32);
                         if (p->prefixlen == 0)
@@ -147,7 +147,7 @@ int in_addr_prefixes_reduce(Set *prefixes) {
                 if (p->prefixlen == 0)
                         continue;
 
-                switch(p->family) {
+                switch (p->family) {
                 case AF_INET:
                         prefixlens = ipv4_prefixlens;
                         n = &ipv4_n_prefixlens;
@@ -218,10 +218,9 @@ int config_parse_in_addr_prefixes(
                 void *data,
                 void *userdata) {
 
-        Set **prefixes = data;
+        Set **prefixes = ASSERT_PTR(data);
         int r;
 
-        assert(prefixes);
         assert(IN_SET(ltype, AF_UNSPEC, AF_INET, AF_INET6));
 
         if (isempty(rvalue)) {
@@ -313,7 +312,8 @@ int config_parse_in_addr_prefixes(
                         }
                         if (r < 0) {
                                 log_syntax(unit, LOG_WARNING, filename, line, r,
-                                           "Address prefix is invalid, ignoring assignment: %s", word);
+                                           "Invalid address prefix is specified in [%s] %s=, ignoring assignment: %s",
+                                           section, lvalue, word);
                                 continue;
                         }
 

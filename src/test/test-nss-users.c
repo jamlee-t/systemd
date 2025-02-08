@@ -166,11 +166,10 @@ static int test_one_module(const char *dir,
 
         log_info("======== %s ========", module);
 
-        _cleanup_(dlclosep) void *handle = nss_open_handle(dir, module, RTLD_LAZY|RTLD_NODELETE);
+        _cleanup_(dlclosep) void *handle = nss_open_handle(dir, module, RTLD_NOW|RTLD_NODELETE);
         if (!handle)
                 return -EINVAL;
 
-        char **name;
         STRV_FOREACH(name, names)
                 test_byname(handle, module, *name);
 
@@ -214,7 +213,7 @@ static int parse_argv(int argc, char **argv,
 #if ENABLE_NSS_MYMACHINES
                                 "mymachines",
 #endif
-                                "files");
+                                NULL);
         assert_se(modules);
 
         if (argc > 2)
@@ -235,7 +234,6 @@ static int parse_argv(int argc, char **argv,
 static int run(int argc, char **argv) {
         _cleanup_free_ char *dir = NULL;
         _cleanup_strv_free_ char **modules = NULL, **names = NULL;
-        char **module;
         int r;
 
         test_setup_logging(LOG_INFO);

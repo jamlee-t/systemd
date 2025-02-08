@@ -3,8 +3,8 @@
 in_files = [
         ['macros.systemd',        rpmmacrosdir != 'no', rpmmacrosdir],
 
-        # we conditionalize on rpmmacrosdir, but install into rootlibexecdir
-        ['systemd-update-helper', rpmmacrosdir != 'no', rootlibexecdir],
+        # we conditionalize on rpmmacrosdir, but install into libexecdir
+        ['systemd-update-helper', rpmmacrosdir != 'no', libexecdir],
 
         ['triggers.systemd',      false],
         ['triggers.systemd.sh',   false]]
@@ -18,7 +18,7 @@ foreach tuple : in_files
                 file,
                 input : file + '.in',
                 output : file,
-                command : [meson_render_jinja2, config_h, '@INPUT@', '@OUTPUT@'],
+                command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
                 install : tuple[1],
                 install_dir : tuple.length() > 2 ? tuple[2] : '',
                 build_by_default : true)

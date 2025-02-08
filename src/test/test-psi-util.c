@@ -1,20 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "parse-util.h"
 #include "psi-util.h"
 #include "tests.h"
+#include "tmpfile-util.h"
 
-static void test_read_mem_pressure(void) {
+TEST(read_mem_pressure) {
         _cleanup_(unlink_tempfilep) char path[] = "/tmp/pressurereadtestXXXXXX";
+        _cleanup_close_ int fd = -EBADF;
         ResourcePressure rp;
 
         if (geteuid() != 0)
                 return (void) log_tests_skipped("not root");
 
-        assert_se(mkstemp(path));
+        assert_se((fd = mkostemp_safe(path)) >= 0);
 
         assert_se(read_resource_pressure("/verylikelynonexistentpath", PRESSURE_TYPE_SOME, &rp) < 0);
         assert_se(read_resource_pressure(path, PRESSURE_TYPE_SOME, &rp) < 0);
@@ -72,8 +75,4 @@ static void test_read_mem_pressure(void) {
         assert_se(rp.total == 58464525);
 }
 
-int main(void) {
-        test_setup_logging(LOG_DEBUG);
-        test_read_mem_pressure();
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_DEBUG);

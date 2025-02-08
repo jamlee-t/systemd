@@ -7,7 +7,9 @@
 #include "sd-bus.h"
 #include "sd-device.h"
 #include "sd-event.h"
+#include "sd-varlink.h"
 
+#include "calendarspec.h"
 #include "conf-parser.h"
 #include "hashmap.h"
 #include "list.h"
@@ -59,8 +61,8 @@ struct Manager {
         char **kill_only_users, **kill_exclude_users;
         bool kill_user_processes;
 
-        unsigned long session_counter;
-        unsigned long inhibit_counter;
+        uint64_t session_counter;
+        uint64_t inhibit_counter;
 
         Hashmap *session_units;
         Hashmap *user_units;
@@ -68,21 +70,15 @@ struct Manager {
         usec_t inhibit_delay_max;
         usec_t user_stop_delay;
 
-        /* If an action is currently being executed or is delayed,
-         * this is != 0 and encodes what is being done */
-        InhibitWhat action_what;
+        /* If a shutdown/suspend was delayed due to an inhibitor this contains the action we are supposed to
+         * start after the delay is over */
+        const HandleActionData *delayed_action;
 
-        /* If a shutdown/suspend was delayed due to an inhibitor this
-           contains the unit name we are supposed to start after the
-           delay is over */
-        const char *action_unit;
-
-        /* If a shutdown/suspend is currently executed, then this is
-         * the job of it */
+        /* If a shutdown/suspend is currently executed, then this is the job of it */
         char *action_job;
         sd_event_source *inhibit_timeout_source;
 
-        char *scheduled_shutdown_type;
+        HandleAction scheduled_shutdown_action;
         usec_t scheduled_shutdown_timeout;
         sd_event_source *scheduled_shutdown_timeout_source;
         uid_t scheduled_shutdown_uid;
@@ -91,7 +87,7 @@ struct Manager {
         bool unlink_nologin;
 
         char *wall_message;
-        unsigned enable_wall_messages;
+        bool enable_wall_messages;
         sd_event_source *wall_message_timeout_source;
 
         bool shutdown_dry_run;
@@ -100,6 +96,11 @@ struct Manager {
         usec_t idle_action_usec;
         usec_t idle_action_not_before_usec;
         HandleAction idle_action;
+        bool was_idle;
+
+        usec_t stop_idle_session_usec;
+
+        HandleActionSleepMask handle_action_sleep_mask;
 
         HandleAction handle_power_key;
         HandleAction handle_power_key_long_press;
@@ -109,6 +110,7 @@ struct Manager {
         HandleAction handle_suspend_key_long_press;
         HandleAction handle_hibernate_key;
         HandleAction handle_hibernate_key_long_press;
+        HandleAction handle_secure_attention_key;
 
         HandleAction handle_lid_switch;
         HandleAction handle_lid_switch_ep;
@@ -142,6 +144,12 @@ struct Manager {
 
         char *efi_loader_entry_one_shot;
         struct stat efi_loader_entry_one_shot_stat;
+
+        CalendarSpec *maintenance_time;
+
+        dual_timestamp init_ts;
+
+        sd_varlink_server *varlink_server;
 };
 
 void manager_reset_config(Manager *m);
@@ -166,7 +174,7 @@ bool manager_shall_kill(Manager *m, const char *user);
 int manager_get_idle_hint(Manager *m, dual_timestamp *t);
 
 int manager_get_user_by_pid(Manager *m, pid_t pid, User **user);
-int manager_get_session_by_pid(Manager *m, pid_t pid, Session **session);
+int manager_get_session_by_pidref(Manager *m, const PidRef *pid, Session **ret);
 
 bool manager_is_lid_closed(Manager *m);
 bool manager_is_docked_or_external_displays(Manager *m);
@@ -186,6 +194,6 @@ CONFIG_PARSER_PROTOTYPE(config_parse_n_autovts);
 CONFIG_PARSER_PROTOTYPE(config_parse_tmpfs_size);
 
 int manager_setup_wall_message_timer(Manager *m);
-bool logind_wall_tty_filter(const char *tty, void *userdata);
+bool logind_wall_tty_filter(const char *tty, bool is_local, void *userdata);
 
 int manager_read_efi_boot_loader_entries(Manager *m);

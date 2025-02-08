@@ -58,7 +58,7 @@ static int clean_sysvipc_shm(uid_t delete_uid, gid_t delete_gid, bool rm) {
 
                 r = read_line(f, LONG_LINE_MAX, &line);
                 if (r < 0)
-                        return log_warning_errno(errno, "Failed to read /proc/sysvipc/shm: %m");
+                        return log_warning_errno(r, "Failed to read /proc/sysvipc/shm: %m");
                 if (r == 0)
                         break;
 
@@ -219,7 +219,6 @@ static int clean_sysvipc_msg(uid_t delete_uid, gid_t delete_gid, bool rm) {
 }
 
 static int clean_posix_shm_internal(const char *dirname, DIR *dir, uid_t uid, gid_t gid, bool rm) {
-        struct dirent *de;
         int ret = 0, r;
 
         assert(dir);
@@ -315,7 +314,6 @@ static int clean_posix_shm(uid_t uid, gid_t gid, bool rm) {
 
 static int clean_posix_mq(uid_t uid, gid_t gid, bool rm) {
         _cleanup_closedir_ DIR *dir = NULL;
-        struct dirent *de;
         int ret = 0;
 
         dir = opendir("/dev/mqueue");

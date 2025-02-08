@@ -2,8 +2,9 @@
 #pragma once
 
 #include <stdint.h>
+#include <sys/stat.h>
 
-#include "def.h"
+#include "constants.h"
 #include "hashmap.h"
 #include "sparse-endian.h"
 
@@ -81,9 +82,8 @@ struct trie_value_entry2_f {
         le16_t padding;
 } _packed_;
 
-#define hwdb_bin_paths                          \
+#define HWDB_BIN_PATHS                          \
         "/etc/systemd/hwdb/hwdb.bin\0"          \
         "/etc/udev/hwdb.bin\0"                  \
         "/usr/lib/systemd/hwdb/hwdb.bin\0"      \
-        _CONF_PATHS_SPLIT_USR_NULSTR("systemd/hwdb/hwdb.bin") \
         UDEVLIBEXECDIR "/hwdb.bin\0"

@@ -19,39 +19,27 @@ static int property_get_monotonic_timers(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Timer *t = userdata;
-        TimerValue *v;
+        Timer *t = ASSERT_PTR(userdata);
         int r;
 
         assert(bus);
         assert(reply);
-        assert(t);
 
         r = sd_bus_message_open_container(reply, 'a', "(stt)");
         if (r < 0)
                 return r;
 
         LIST_FOREACH(value, v, t->values) {
-                _cleanup_free_ char *buf = NULL;
-                const char *s;
-                size_t l;
+                _cleanup_free_ char *usec = NULL;
 
                 if (v->base == TIMER_CALENDAR)
                         continue;
 
-                s = timer_base_to_string(v->base);
-                assert(endswith(s, "Sec"));
-
-                /* s/Sec/USec/ */
-                l = strlen(s);
-                buf = new(char, l+2);
-                if (!buf)
+                usec = timer_base_to_usec_string(v->base);
+                if (!usec)
                         return -ENOMEM;
 
-                memcpy(buf, s, l-3);
-                memcpy(buf+l-3, "USec", 5);
-
-                r = sd_bus_message_append(reply, "(stt)", buf, v->value, v->next_elapse);
+                r = sd_bus_message_append(reply, "(stt)", usec, v->value, v->next_elapse);
                 if (r < 0)
                         return r;
         }
@@ -68,13 +56,11 @@ static int property_get_calendar_timers(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Timer *t = userdata;
-        TimerValue *v;
+        Timer *t = ASSERT_PTR(userdata);
         int r;
 
         assert(bus);
         assert(reply);
-        assert(t);
 
         r = sd_bus_message_open_container(reply, 'a', "(sst)");
         if (r < 0)
@@ -107,15 +93,12 @@ static int property_get_next_elapse_monotonic(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Timer *t = userdata;
+        Timer *t = ASSERT_PTR(userdata);
 
         assert(bus);
         assert(reply);
-        assert(t);
 
-        return sd_bus_message_append(reply, "t",
-                                     (uint64_t) usec_shift_clock(t->next_elapse_monotonic_or_boottime,
-                                                                 TIMER_MONOTONIC_CLOCK(t), CLOCK_MONOTONIC));
+        return sd_bus_message_append(reply, "t", timer_next_elapse_monotonic(t));
 }
 
 const sd_bus_vtable bus_timer_vtable[] = {
@@ -135,6 +118,7 @@ const sd_bus_vtable bus_timer_vtable[] = {
         SD_BUS_PROPERTY("Persistent", "b", bus_property_get_bool, offsetof(Timer, persistent), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("WakeSystem", "b", bus_property_get_bool, offsetof(Timer, wake_system), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RemainAfterElapse", "b", bus_property_get_bool, offsetof(Timer, remain_after_elapse), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("DeferReactivation", "b", bus_property_get_bool, offsetof(Timer, defer_reactivation), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_VTABLE_END
 };
 
@@ -249,6 +233,9 @@ static int bus_timer_set_transient_property(
 
         if (streq(name, "OnClockChange"))
                 return bus_set_transient_bool(u, name, &t->on_clock_change, message, flags, error);
+
+        if (streq(name, "DeferReactivation"))
+                return bus_set_transient_bool(u, name, &t->defer_reactivation, message, flags, error);
 
         if (streq(name, "TimersMonotonic")) {
                 const char *base_name;

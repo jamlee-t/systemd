@@ -58,7 +58,6 @@ int _ordered_set_put_strdup(OrderedSet **s, const char *p  HASHMAP_DEBUG_PARAMS)
 
 int _ordered_set_put_strdupv(OrderedSet **s, char **l  HASHMAP_DEBUG_PARAMS) {
         int n = 0, r;
-        char **i;
 
         STRV_FOREACH(i, l) {
                 r = _ordered_set_put_strdup(s, *i  HASHMAP_DEBUG_PASS_ARGS);
@@ -92,13 +91,16 @@ void ordered_set_print(FILE *f, const char *field, OrderedSet *s) {
         bool space = false;
         char *p;
 
+        assert(f);
+        assert(field);
+
         if (ordered_set_isempty(s))
                 return;
 
         fputs(field, f);
 
         ORDERED_SET_FOREACH(p, s)
-                fputs_with_space(f, p, NULL, &space);
+                fputs_with_separator(f, p, NULL, &space);
 
         fputc('\n', f);
 }

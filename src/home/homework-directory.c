@@ -4,6 +4,7 @@
 
 #include "btrfs-util.h"
 #include "fd-util.h"
+#include "homework-blob.h"
 #include "homework-directory.h"
 #include "homework-mount.h"
 #include "homework-quota.h"
@@ -58,6 +59,7 @@ int home_setup_directory(UserRecord *h, HomeSetup *setup) {
 
 int home_activate_directory(
                 UserRecord *h,
+                HomeSetupFlags flags,
                 HomeSetup *setup,
                 PasswordCache *cache,
                 UserRecord **ret_home) {
@@ -74,11 +76,11 @@ int home_activate_directory(
         assert_se(hdo = user_record_home_directory(h));
         hd = strdupa_safe(hdo);
 
-        r = home_setup(h, 0, setup, cache, &header_home);
+        r = home_setup(h, flags, setup, cache, &header_home);
         if (r < 0)
                 return r;
 
-        r = home_refresh(h, setup, header_home, cache, NULL, &new_home);
+        r = home_refresh(h, flags, setup, header_home, cache, NULL, &new_home);
         if (r < 0)
                 return r;
 
@@ -107,7 +109,7 @@ int home_activate_directory(
 int home_create_directory_or_subvolume(UserRecord *h, HomeSetup *setup, UserRecord **ret_home) {
         _cleanup_(rm_rf_subvolume_and_freep) char *temporary = NULL;
         _cleanup_(user_record_unrefp) UserRecord *new_home = NULL;
-        _cleanup_close_ int mount_fd = -1;
+        _cleanup_close_ int mount_fd = -EBADF;
         _cleanup_free_ char *d = NULL;
         bool is_subvolume = false;
         const char *ip;
@@ -129,8 +131,8 @@ int home_create_directory_or_subvolume(UserRecord *h, HomeSetup *setup, UserReco
         switch (user_record_storage(h)) {
 
         case USER_SUBVOLUME:
-                RUN_WITH_UMASK(0077)
-                        r = btrfs_subvol_make(d);
+                WITH_UMASK(0077)
+                        r = btrfs_subvol_make(AT_FDCWD, d);
 
                 if (r >= 0) {
                         log_info("Subvolume created.");
@@ -177,7 +179,7 @@ int home_create_directory_or_subvolume(UserRecord *h, HomeSetup *setup, UserReco
         temporary = TAKE_PTR(d); /* Needs to be destroyed now */
 
         /* Let's decouple namespaces now, so that we can possibly mount a UID map mount into
-         * /run/systemd/user-home-mount/ that noone will see but us. */
+         * /run/systemd/user-home-mount/ that no one will see but us. */
         r = home_unshare_and_mkdir();
         if (r < 0)
                 return r;
@@ -264,7 +266,7 @@ int home_resize_directory(
                 UserRecord **ret_home) {
 
         _cleanup_(user_record_unrefp) UserRecord *embedded_home = NULL, *new_home = NULL;
-        int r;
+        int r, reconciled;
 
         assert(h);
         assert(setup);
@@ -275,21 +277,25 @@ int home_resize_directory(
         if (r < 0)
                 return r;
 
-        r = home_load_embedded_identity(h, setup->root_fd, NULL, USER_RECONCILE_REQUIRE_NEWER_OR_EQUAL, cache, &embedded_home, &new_home);
-        if (r < 0)
-                return r;
+        reconciled = home_load_embedded_identity(h, setup->root_fd, NULL, USER_RECONCILE_REQUIRE_NEWER_OR_EQUAL, cache, &embedded_home, &new_home);
+        if (reconciled < 0)
+                return reconciled;
 
-        r = home_maybe_shift_uid(h, setup);
+        r = home_maybe_shift_uid(h, flags, setup);
         if (r < 0)
                 return r;
 
         r = home_update_quota_auto(h, NULL);
-        if (ERRNO_IS_NOT_SUPPORTED(r))
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                 return -ESOCKTNOSUPPORT; /* make recognizable */
         if (r < 0)
                 return r;
 
-        r = home_store_embedded_identity(new_home, setup->root_fd, h->uid, embedded_home);
+        r = home_store_embedded_identity(new_home, setup->root_fd, embedded_home);
+        if (r < 0)
+                return r;
+
+        r = home_reconcile_blob_dirs(new_home, setup->root_fd, reconciled);
         if (r < 0)
                 return r;
 

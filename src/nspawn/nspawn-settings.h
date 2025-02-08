@@ -4,10 +4,6 @@
 #include <sched.h>
 #include <stdio.h>
 
-#if HAVE_SECCOMP
-#include <seccomp.h>
-#endif
-
 #include "sd-bus.h"
 #include "sd-id128.h"
 
@@ -18,6 +14,7 @@
 #include "missing_resource.h"
 #include "nspawn-expose-ports.h"
 #include "nspawn-mount.h"
+#include "seccomp-util.h"
 #include "time-util.h"
 
 typedef enum StartMode {
@@ -32,14 +29,16 @@ typedef enum UserNamespaceMode {
         USER_NAMESPACE_NO,
         USER_NAMESPACE_FIXED,
         USER_NAMESPACE_PICK,
+        USER_NAMESPACE_MANAGED,
         _USER_NAMESPACE_MODE_MAX,
         _USER_NAMESPACE_MODE_INVALID = -EINVAL,
 } UserNamespaceMode;
 
 typedef enum UserNamespaceOwnership {
-        USER_NAMESPACE_OWNERSHIP_OFF,
-        USER_NAMESPACE_OWNERSHIP_CHOWN,
-        USER_NAMESPACE_OWNERSHIP_MAP,
+        USER_NAMESPACE_OWNERSHIP_OFF,     /* do not change ownership */
+        USER_NAMESPACE_OWNERSHIP_CHOWN,   /* chown to target range */
+        USER_NAMESPACE_OWNERSHIP_MAP,     /* map from 0x00000000…0x0000FFFF range to target range */
+        USER_NAMESPACE_OWNERSHIP_FOREIGN, /* map from 0x7FFE0000…0x7FFEFFFF range to target range */
         USER_NAMESPACE_OWNERSHIP_AUTO,
         _USER_NAMESPACE_OWNERSHIP_MAX,
         _USER_NAMESPACE_OWNERSHIP_INVALID = -1,
@@ -259,28 +258,30 @@ CONFIG_PARSER_PROTOTYPE(config_parse_tmpfs);
 CONFIG_PARSER_PROTOTYPE(config_parse_overlay);
 CONFIG_PARSER_PROTOTYPE(config_parse_inaccessible);
 CONFIG_PARSER_PROTOTYPE(config_parse_veth_extra);
+CONFIG_PARSER_PROTOTYPE(config_parse_network_iface_pair);
+CONFIG_PARSER_PROTOTYPE(config_parse_macvlan_iface_pair);
+CONFIG_PARSER_PROTOTYPE(config_parse_ipvlan_iface_pair);
 CONFIG_PARSER_PROTOTYPE(config_parse_network_zone);
 CONFIG_PARSER_PROTOTYPE(config_parse_boot);
 CONFIG_PARSER_PROTOTYPE(config_parse_pid2);
 CONFIG_PARSER_PROTOTYPE(config_parse_private_users);
 CONFIG_PARSER_PROTOTYPE(config_parse_syscall_filter);
-CONFIG_PARSER_PROTOTYPE(config_parse_hostname);
 CONFIG_PARSER_PROTOTYPE(config_parse_oom_score_adjust);
 CONFIG_PARSER_PROTOTYPE(config_parse_cpu_affinity);
 CONFIG_PARSER_PROTOTYPE(config_parse_resolv_conf);
 CONFIG_PARSER_PROTOTYPE(config_parse_link_journal);
-CONFIG_PARSER_PROTOTYPE(config_parse_timezone);
+CONFIG_PARSER_PROTOTYPE(config_parse_timezone_mode);
 CONFIG_PARSER_PROTOTYPE(config_parse_userns_chown);
 CONFIG_PARSER_PROTOTYPE(config_parse_userns_ownership);
 CONFIG_PARSER_PROTOTYPE(config_parse_bind_user);
 
-const char *resolv_conf_mode_to_string(ResolvConfMode a) _const_;
+const char* resolv_conf_mode_to_string(ResolvConfMode a) _const_;
 ResolvConfMode resolv_conf_mode_from_string(const char *s) _pure_;
 
-const char *timezone_mode_to_string(TimezoneMode a) _const_;
+const char* timezone_mode_to_string(TimezoneMode a) _const_;
 TimezoneMode timezone_mode_from_string(const char *s) _pure_;
 
-const char *user_namespace_ownership_to_string(UserNamespaceOwnership a) _const_;
+const char* user_namespace_ownership_to_string(UserNamespaceOwnership a) _const_;
 UserNamespaceOwnership user_namespace_ownership_from_string(const char *s) _pure_;
 
 int parse_link_journal(const char *s, LinkJournal *ret_mode, bool *ret_try);

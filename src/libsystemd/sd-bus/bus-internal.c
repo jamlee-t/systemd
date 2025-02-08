@@ -29,10 +29,8 @@ bool object_path_is_valid(const char *p) {
                 } else {
                         bool good;
 
-                        good =
-                                (*q >= 'a' && *q <= 'z') ||
-                                (*q >= 'A' && *q <= 'Z') ||
-                                (*q >= '0' && *q <= '9') ||
+                        good = ascii_isalpha(*q) ||
+                                ascii_isdigit(*q) ||
                                 *q == '_';
 
                         if (!good)
@@ -87,9 +85,8 @@ bool interface_name_is_valid(const char *p) {
                         bool good;
 
                         good =
-                                (*q >= 'a' && *q <= 'z') ||
-                                (*q >= 'A' && *q <= 'Z') ||
-                                (!dot && *q >= '0' && *q <= '9') ||
+                                ascii_isalpha(*q) ||
+                                (!dot && ascii_isdigit(*q)) ||
                                 *q == '_';
 
                         if (!good) {
@@ -134,9 +131,8 @@ bool service_name_is_valid(const char *p) {
                         bool good;
 
                         good =
-                                (*q >= 'a' && *q <= 'z') ||
-                                (*q >= 'A' && *q <= 'Z') ||
-                                ((!dot || unique) && *q >= '0' && *q <= '9') ||
+                                ascii_isalpha(*q) ||
+                                ((!dot || unique) && ascii_isdigit(*q)) ||
                                 IN_SET(*q, '_', '-');
 
                         if (!good)
@@ -167,9 +163,8 @@ bool member_name_is_valid(const char *p) {
                 bool good;
 
                 good =
-                        (*q >= 'a' && *q <= 'z') ||
-                        (*q >= 'A' && *q <= 'Z') ||
-                        (*q >= '0' && *q <= '9') ||
+                        ascii_isalpha(*q) ||
+                        ascii_isdigit(*q) ||
                         *q == '_';
 
                 if (!good)
@@ -278,7 +273,7 @@ int bus_message_type_from_string(const char *s, uint8_t *u) {
         return 0;
 }
 
-const char *bus_message_type_to_string(uint8_t u) {
+const char* bus_message_type_to_string(uint8_t u) {
         if (u == SD_BUS_MESSAGE_SIGNAL)
                 return "signal";
         else if (u == SD_BUS_MESSAGE_METHOD_CALL)
@@ -291,7 +286,7 @@ const char *bus_message_type_to_string(uint8_t u) {
                 return NULL;
 }
 
-char *bus_address_escape(const char *v) {
+char* bus_address_escape(const char *v) {
         const char *a;
         char *r, *b;
 
@@ -301,9 +296,8 @@ char *bus_address_escape(const char *v) {
 
         for (a = v, b = r; *a; a++) {
 
-                if ((*a >= '0' && *a <= '9') ||
-                    (*a >= 'a' && *a <= 'z') ||
-                    (*a >= 'A' && *a <= 'Z') ||
+                if (ascii_isdigit(*a) ||
+                    ascii_isalpha(*a) ||
                     strchr("_-/.", *a))
                         *(b++) = *a;
                 else {

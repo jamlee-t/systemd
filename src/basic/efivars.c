@@ -37,7 +37,7 @@ int efi_get_variable(
                 void **ret_value,
                 size_t *ret_size) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         _cleanup_free_ void *buf = NULL;
         struct stat st;
         usec_t begin = 0; /* Unnecessary initialization to appease gcc */
@@ -93,8 +93,24 @@ int efi_get_variable(
                                 return -EBUSY;
 
                         if (try >= EFI_N_RETRIES_NO_DELAY)
-                                (void) usleep(EFI_RETRY_DELAY);
+                                (void) usleep_safe(EFI_RETRY_DELAY);
                 }
+
+                /* Unfortunately kernel reports EOF if there's an inconsistency between efivarfs var list
+                 * and what's actually stored in firmware, c.f. #34304. A zero size env var is not allowed in
+                 * efi and hence the variable doesn't really exist in the backing store as long as it is zero
+                 * sized, and the kernel calls this "uncommitted". Hence we translate EOF back to ENOENT here,
+                 * as with kernel behavior before
+                 * https://github.com/torvalds/linux/commit/3fab70c165795431f00ddf9be8b84ddd07bd1f8f
+                 *
+                 * If the kernel changes behaviour (to flush dentries on resume), we can drop
+                 * this at some point in the future. But note that the commit is 11
+                 * years old at this point so we'll need to deal with the current behaviour for
+                 * a long time.
+                 */
+                if (n == 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ENOENT),
+                                               "EFI variable %s is uncommitted", p);
 
                 if (n != sizeof(a))
                         return log_debug_errno(SYNTHETIC_ERRNO(EIO),
@@ -142,11 +158,13 @@ int efi_get_variable(
         return 0;
 }
 
-int efi_get_variable_string(const char *variable, char **p) {
+int efi_get_variable_string(const char *variable, char **ret) {
         _cleanup_free_ void *s = NULL;
         size_t ss = 0;
-        int r;
         char *x;
+        int r;
+
+        assert(variable);
 
         r = efi_get_variable(variable, NULL, &s, &ss);
         if (r < 0)
@@ -156,8 +174,25 @@ int efi_get_variable_string(const char *variable, char **p) {
         if (!x)
                 return -ENOMEM;
 
-        *p = x;
+        if (ret)
+                *ret = x;
+
         return 0;
+}
+
+int efi_get_variable_path(const char *variable, char **ret) {
+        int r;
+
+        assert(variable);
+
+        r = efi_get_variable_string(variable, ret);
+        if (r < 0)
+                return r;
+
+        if (ret)
+                efi_tilt_backslashes(*ret);
+
+        return r;
 }
 
 static int efi_verify_variable(const char *variable, uint32_t attr, const void *value, size_t size) {
@@ -177,12 +212,13 @@ static int efi_verify_variable(const char *variable, uint32_t attr, const void *
 }
 
 int efi_set_variable(const char *variable, const void *value, size_t size) {
+        static const uint32_t attr = EFI_VARIABLE_NON_VOLATILE|EFI_VARIABLE_BOOTSERVICE_ACCESS|EFI_VARIABLE_RUNTIME_ACCESS;
+
         struct var {
                 uint32_t attr;
                 char buf[];
         } _packed_ * _cleanup_free_ buf = NULL;
-        _cleanup_close_ int fd = -1;
-        uint32_t attr = EFI_VARIABLE_NON_VOLATILE|EFI_VARIABLE_BOOTSERVICE_ACCESS|EFI_VARIABLE_RUNTIME_ACCESS;
+        _cleanup_close_ int fd = -EBADF;
         bool saved_flags_valid = false;
         unsigned saved_flags;
         int r;
@@ -190,13 +226,13 @@ int efi_set_variable(const char *variable, const void *value, size_t size) {
         assert(variable);
         assert(value || size == 0);
 
-        const char *p = strjoina("/sys/firmware/efi/efivars/", variable);
-
         /* size 0 means removal, empty variable would not be enough for that */
         if (size > 0 && efi_verify_variable(variable, attr, value, size) > 0) {
                 log_debug("Variable '%s' is already in wanted state, skipping write.", variable);
                 return 0;
         }
+
+        const char *p = strjoina("/sys/firmware/efi/efivars/", variable);
 
         /* Newer efivarfs protects variables that are not in an allow list with FS_IMMUTABLE_FL by default,
          * to protect them for accidental removal and modification. We are not changing these variables
@@ -232,16 +268,13 @@ int efi_set_variable(const char *variable, const void *value, size_t size) {
         buf->attr = attr;
         memcpy(buf->buf, value, size);
 
-        r = loop_write(fd, buf, sizeof(uint32_t) + size, false);
+        r = loop_write(fd, buf, sizeof(uint32_t) + size);
         if (r < 0)
                 goto finish;
 
         /* For some reason efivarfs doesn't update mtime automatically. Let's do it manually then. This is
          * useful for processes that cache EFI variables to detect when changes occurred. */
-        if (futimens(fd, (struct timespec[2]) {
-                                { .tv_nsec = UTIME_NOW },
-                                { .tv_nsec = UTIME_NOW }
-                        }) < 0)
+        if (futimens(fd, /* times = */ NULL) < 0)
                 log_debug_errno(errno, "Failed to update mtime/atime on %s, ignoring: %m", p);
 
         r = 0;
@@ -265,7 +298,7 @@ finish:
 int efi_set_variable_string(const char *variable, const char *value) {
         _cleanup_free_ char16_t *u16 = NULL;
 
-        u16 = utf8_to_utf16(value, strlen(value));
+        u16 = utf8_to_utf16(value, SIZE_MAX);
         if (!u16)
                 return -ENOMEM;
 
@@ -310,9 +343,17 @@ static int read_flag(const char *variable) {
 
 bool is_efi_secure_boot(void) {
         static int cache = -1;
+        int r;
 
-        if (cache < 0)
-                cache = read_flag(EFI_GLOBAL_VARIABLE(SecureBoot));
+        if (cache < 0) {
+                r = read_flag(EFI_GLOBAL_VARIABLE_STR("SecureBoot"));
+                if (r == -ENOENT)
+                        cache = false;
+                else if (r < 0)
+                        log_debug_errno(r, "Error reading SecureBoot EFI variable, assuming not in SecureBoot mode: %m");
+                else
+                        cache = r;
+        }
 
         return cache > 0;
 }
@@ -323,29 +364,30 @@ SecureBootMode efi_get_secure_boot_mode(void) {
         if (cache != _SECURE_BOOT_INVALID)
                 return cache;
 
-        int secure = read_flag(EFI_GLOBAL_VARIABLE(SecureBoot));
+        int secure = read_flag(EFI_GLOBAL_VARIABLE_STR("SecureBoot"));
         if (secure < 0) {
                 if (secure != -ENOENT)
-                        log_debug_errno(secure, "Error reading SecureBoot EFI variable: %m");
+                        log_debug_errno(secure, "Error reading SecureBoot EFI variable, assuming not in SecureBoot mode: %m");
+
                 return (cache = SECURE_BOOT_UNSUPPORTED);
         }
 
         /* We can assume false for all these if they are abscent (AuditMode and
          * DeployedMode may not exist on older firmware). */
-        int audit    = read_flag(EFI_GLOBAL_VARIABLE(AuditMode));
-        int deployed = read_flag(EFI_GLOBAL_VARIABLE(DeployedMode));
-        int setup    = read_flag(EFI_GLOBAL_VARIABLE(SetupMode));
+        int audit    = read_flag(EFI_GLOBAL_VARIABLE_STR("AuditMode"));
+        int deployed = read_flag(EFI_GLOBAL_VARIABLE_STR("DeployedMode"));
+        int setup    = read_flag(EFI_GLOBAL_VARIABLE_STR("SetupMode"));
         log_debug("Secure boot variables: SecureBoot=%d AuditMode=%d DeployedMode=%d SetupMode=%d",
                   secure, audit, deployed, setup);
 
         return (cache = decode_secure_boot_mode(secure, audit > 0, deployed > 0, setup > 0));
 }
 
-static int read_efi_options_variable(char **line) {
+static int read_efi_options_variable(char **ret) {
         int r;
 
         /* In SecureBoot mode this is probably not what you want. As your cmdline is cryptographically signed
-         * like when using Type #2 EFI Unified Kernel Images (https://systemd.io/BOOT_LOADER_SPECIFICATION)
+         * like when using Type #2 EFI Unified Kernel Images (https://uapi-group.org/specifications/specs/boot_loader_specification)
          * The user's intention is then that the cmdline should not be modified. You want to make sure that
          * the system starts up as exactly specified in the signed artifact.
          *
@@ -355,13 +397,13 @@ static int read_efi_options_variable(char **line) {
                 /* Let's be helpful with the returned error and check if the variable exists at all. If it
                  * does, let's return a recognizable error (EPERM), and if not ENODATA. */
 
-                if (access(EFIVAR_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), F_OK) < 0)
+                if (access(EFIVAR_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), F_OK) < 0)
                         return errno == ENOENT ? -ENODATA : -errno;
 
                 return -EPERM;
         }
 
-        r = efi_get_variable_string(EFI_SYSTEMD_VARIABLE(SystemdOptions), line);
+        r = efi_get_variable_string(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions"), ret);
         if (r == -ENOENT)
                 return -ENODATA;
         return r;
@@ -375,64 +417,55 @@ int cache_efi_options_variable(void) {
         if (r < 0)
                 return r;
 
-        return write_string_file(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), line,
+        return write_string_file(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), line,
                                  WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755);
 }
 
-int systemd_efi_options_variable(char **line) {
+int systemd_efi_options_variable(char **ret) {
         const char *e;
         int r;
 
         /* Returns the contents of the variable for current boot from the cache. */
 
-        assert(line);
+        assert(ret);
 
         /* For testing purposes it is sometimes useful to be able to override this */
         e = secure_getenv("SYSTEMD_EFI_OPTIONS");
-        if (e) {
-                char *m;
+        if (e)
+                return strdup_to(ret, e);
 
-                m = strdup(e);
-                if (!m)
-                        return -ENOMEM;
-
-                *line = m;
-                return 0;
-        }
-
-        r = read_one_line_file(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), line);
+        r = read_one_line_file(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), ret);
         if (r == -ENOENT)
                 return -ENODATA;
         return r;
 }
 
-static inline int compare_stat_mtime(const struct stat *a, const struct stat *b) {
+static int compare_stat_mtime(const struct stat *a, const struct stat *b) {
         return CMP(timespec_load(&a->st_mtim), timespec_load(&b->st_mtim));
 }
 
-int systemd_efi_options_efivarfs_if_newer(char **line) {
+int systemd_efi_options_efivarfs_if_newer(char **ret) {
         struct stat a = {}, b;
         int r;
 
-        if (stat(EFIVAR_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), &a) < 0 && errno != ENOENT)
+        if (stat(EFIVAR_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), &a) < 0 && errno != ENOENT)
                 return log_debug_errno(errno, "Failed to stat EFI variable SystemdOptions: %m");
 
-        if (stat(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), &b) < 0) {
+        if (stat(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), &b) < 0) {
                 if (errno != ENOENT)
-                        log_debug_errno(errno, "Failed to stat "EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions))": %m");
+                        log_debug_errno(errno, "Failed to stat "EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions"))": %m");
         } else if (compare_stat_mtime(&a, &b) > 0)
                 log_debug("Variable SystemdOptions in evifarfs is newer than in cache.");
         else {
                 log_debug("Variable SystemdOptions in cache is up to date.");
-                *line = NULL;
+                *ret = NULL;
                 return 0;
         }
 
-        r = read_efi_options_variable(line);
+        r = read_efi_options_variable(ret);
         if (r < 0)
-                log_warning_errno(r, "Failed to read SystemdOptions EFI variable: %m");
-        if (r == -ENOENT)
-                return -ENODATA;
-        return r;
+                return log_debug_errno(r, "Failed to read SystemdOptions EFI variable: %m");
+
+        return 0;
 }
 #endif

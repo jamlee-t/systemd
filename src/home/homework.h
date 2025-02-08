@@ -1,13 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <linux/fs.h>
 #include <sys/vfs.h>
 
 #include "sd-id128.h"
 
+#include "cryptsetup-util.h"
 #include "homework-password-cache.h"
 #include "loop-util.h"
+#include "missing_fs.h" /* for FS_KEY_DESCRIPTOR_SIZE, do not include linux/fs.h */
+#include "missing_keyctl.h"
+#include "missing_syscall.h"
 #include "user-record.h"
 #include "user-record-util.h"
 
@@ -28,6 +31,8 @@ typedef struct HomeSetup {
         void *volume_key;
         size_t volume_key_size;
 
+        key_serial_t key_serial;
+
         bool undo_dm:1;
         bool undo_mount:1;            /* Whether to unmount /run/systemd/user-home-mount */
         bool do_offline_fitrim:1;
@@ -45,10 +50,11 @@ typedef struct HomeSetup {
 
 #define HOME_SETUP_INIT                                 \
         {                                               \
-                .root_fd = -1,                          \
-                .image_fd = -1,                         \
+                .root_fd = -EBADF,                      \
+                .image_fd = -EBADF,                     \
                 .partition_offset = UINT64_MAX,         \
                 .partition_size = UINT64_MAX,           \
+                .key_serial = -1,                       \
         }
 
 /* Various flags for the operation of setting up a home directory */
@@ -71,15 +77,17 @@ int home_setup_done(HomeSetup *setup);
 int home_setup_undo_mount(HomeSetup *setup, int level);
 int home_setup_undo_dm(HomeSetup *setup, int level);
 
+int keyring_unlink(key_serial_t k);
+
 int home_setup(UserRecord *h, HomeSetupFlags flags, HomeSetup *setup, PasswordCache *cache, UserRecord **ret_header_home);
 
-int home_refresh(UserRecord *h, HomeSetup *setup, UserRecord *header_home, PasswordCache *cache, struct statfs *ret_statfs, UserRecord **ret_new_home);
+int home_refresh(UserRecord *h, HomeSetupFlags flags, HomeSetup *setup, UserRecord *header_home, PasswordCache *cache, struct statfs *ret_statfs, UserRecord **ret_new_home);
 
-int home_maybe_shift_uid(UserRecord *h, HomeSetup *setup);
+int home_maybe_shift_uid(UserRecord *h, HomeSetupFlags flags, HomeSetup *setup);
 int home_populate(UserRecord *h, int dir_fd);
 
 int home_load_embedded_identity(UserRecord *h, int root_fd, UserRecord *header_home, UserReconcileMode mode, PasswordCache *cache, UserRecord **ret_embedded_home, UserRecord **ret_new_home);
-int home_store_embedded_identity(UserRecord *h, int root_fd, uid_t uid, UserRecord *old_home);
+int home_store_embedded_identity(UserRecord *h, int root_fd, UserRecord *old_home);
 int home_extend_embedded_identity(UserRecord *h, UserRecord *used, HomeSetup *setup);
 
 int user_record_authenticate(UserRecord *h, UserRecord *secret, PasswordCache *cache, bool strict_verify);

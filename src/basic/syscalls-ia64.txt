@@ -21,6 +21,7 @@ bpf	1341
 brk	1060
 cachectl
 cacheflush
+cachestat	1475
 capget	1185
 capset	1186
 chdir	1034
@@ -78,6 +79,7 @@ fanotify_mark	1324
 fchdir	1035
 fchmod	1099
 fchmodat	1292
+fchmodat2	1476
 fchown	1100
 fchown32
 fchownat	1284
@@ -89,7 +91,6 @@ finit_module	1335
 flistxattr	1225
 flock	1145
 fork
-fp_udfiex_crtl
 fremovexattr	1228
 fsconfig	1455
 fsetxattr	1219
@@ -106,6 +107,7 @@ ftruncate	1098
 ftruncate64
 futex	1230
 futex_time64
+futex_waitv	1473
 futimesat	1285
 get_kernel_syms
 get_mempolicy	1260
@@ -200,9 +202,11 @@ lsetxattr	1218
 lstat	1211
 lstat64
 madvise	1209
+map_shadow_stack
 mbind	1259
 membarrier	1344
 memfd_create	1340
+memfd_secret
 memory_ordering
 migrate_pages	1280
 mincore	1208
@@ -374,7 +378,6 @@ pciconfig_read	1173
 pciconfig_write	1174
 perf_event_open	1352
 perfctr
-perfmonctl	1175
 personality	1140
 pidfd_getfd	1462
 pidfd_open	1458
@@ -394,6 +397,7 @@ preadv	1319
 preadv2	1348
 prlimit64	1325
 process_madvise	1464
+process_mrelease	1472
 process_vm_readv	1332
 process_vm_writev	1333
 pselect6	1294
@@ -404,7 +408,7 @@ pwritev	1320
 pwritev2	1349
 query_module
 quotactl	1137
-quotactl_path
+quotactl_fd	1467
 read	1026
 readahead	1216
 readdir
@@ -425,6 +429,7 @@ renameat2	1338
 request_key	1272
 restart_syscall	1246
 riscv_flush_icache
+riscv_hwprobe
 rmdir	1056
 rseq	1357
 rt_sigaction	1177
@@ -471,6 +476,7 @@ sendmmsg	1331
 sendmsg	1205
 sendto	1199
 set_mempolicy	1261
+set_mempolicy_home_node	1474
 set_robust_list	1298
 set_thread_area
 set_tid_address	1233
