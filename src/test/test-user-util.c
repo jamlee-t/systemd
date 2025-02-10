@@ -8,6 +8,7 @@
 #include "memory-util.h"
 #include "path-util.h"
 #include "string-util.h"
+#include "tests.h"
 #include "user-util.h"
 
 static void test_uid_to_name_one(uid_t uid, const char *name) {
@@ -20,7 +21,14 @@ static void test_uid_to_name_one(uid_t uid, const char *name) {
                 log_info("(skipping detailed tests because nobody is not synthesized)");
                 return;
         }
-        assert_se(streq_ptr(t, name));
+        ASSERT_STREQ(t, name);
+}
+
+TEST(uid_to_name) {
+        test_uid_to_name_one(0, "root");
+        test_uid_to_name_one(UID_NOBODY, NOBODY_USER_NAME);
+        test_uid_to_name_one(0xFFFF, "65535");
+        test_uid_to_name_one(0xFFFFFFFF, "4294967295");
 }
 
 static void test_gid_to_name_one(gid_t gid, const char *name) {
@@ -33,14 +41,19 @@ static void test_gid_to_name_one(gid_t gid, const char *name) {
                 log_info("(skipping detailed tests because nobody is not synthesized)");
                 return;
         }
-        assert_se(streq_ptr(t, name));
+        ASSERT_STREQ(t, name);
 }
 
-static void test_parse_uid(void) {
+TEST(gid_to_name) {
+        test_gid_to_name_one(0, "root");
+        test_gid_to_name_one(GID_NOBODY, NOBODY_GROUP_NAME);
+        test_gid_to_name_one(0xFFFF, "65535");
+        test_gid_to_name_one(0xFFFFFFFF, "4294967295");
+}
+
+TEST(parse_uid) {
         int r;
         uid_t uid;
-
-        log_info("/* %s */", __func__);
 
         r = parse_uid("0", &uid);
         assert_se(r == 0);
@@ -123,19 +136,15 @@ static void test_parse_uid(void) {
         assert_se(uid == 100);
 }
 
-static void test_uid_ptr(void) {
-        log_info("/* %s */", __func__);
-
-        assert_se(UID_TO_PTR(0) != NULL);
-        assert_se(UID_TO_PTR(1000) != NULL);
+TEST(uid_ptr) {
+        ASSERT_NOT_NULL(UID_TO_PTR(0));
+        ASSERT_NOT_NULL(UID_TO_PTR(1000));
 
         assert_se(PTR_TO_UID(UID_TO_PTR(0)) == 0);
         assert_se(PTR_TO_UID(UID_TO_PTR(1000)) == 1000);
 }
 
-static void test_valid_user_group_name_relaxed(void) {
-        log_info("/* %s */", __func__);
-
+TEST(valid_user_group_name_relaxed) {
         assert_se(!valid_user_group_name(NULL, VALID_USER_RELAX));
         assert_se(!valid_user_group_name("", VALID_USER_RELAX));
         assert_se(!valid_user_group_name("1", VALID_USER_RELAX));
@@ -174,9 +183,7 @@ static void test_valid_user_group_name_relaxed(void) {
         assert_se(valid_user_group_name("Dāvis", VALID_USER_RELAX));
 }
 
-static void test_valid_user_group_name(void) {
-        log_info("/* %s */", __func__);
-
+TEST(valid_user_group_name) {
         assert_se(!valid_user_group_name(NULL, 0));
         assert_se(!valid_user_group_name("", 0));
         assert_se(!valid_user_group_name("1", 0));
@@ -216,9 +223,7 @@ static void test_valid_user_group_name(void) {
         assert_se(!valid_user_group_name("Dāvis", 0));
 }
 
-static void test_valid_user_group_name_or_numeric_relaxed(void) {
-        log_info("/* %s */", __func__);
-
+TEST(valid_user_group_name_or_numeric_relaxed) {
         assert_se(!valid_user_group_name(NULL, VALID_USER_ALLOW_NUMERIC|VALID_USER_RELAX));
         assert_se(!valid_user_group_name("", VALID_USER_ALLOW_NUMERIC|VALID_USER_RELAX));
         assert_se(valid_user_group_name("0", VALID_USER_ALLOW_NUMERIC|VALID_USER_RELAX));
@@ -254,9 +259,7 @@ static void test_valid_user_group_name_or_numeric_relaxed(void) {
         assert_se(valid_user_group_name("Dāvis", VALID_USER_ALLOW_NUMERIC|VALID_USER_RELAX));
 }
 
-static void test_valid_user_group_name_or_numeric(void) {
-        log_info("/* %s */", __func__);
-
+TEST(valid_user_group_name_or_numeric) {
         assert_se(!valid_user_group_name(NULL, VALID_USER_ALLOW_NUMERIC));
         assert_se(!valid_user_group_name("", VALID_USER_ALLOW_NUMERIC));
         assert_se(valid_user_group_name("0", VALID_USER_ALLOW_NUMERIC));
@@ -292,9 +295,7 @@ static void test_valid_user_group_name_or_numeric(void) {
         assert_se(!valid_user_group_name("Dāvis", VALID_USER_ALLOW_NUMERIC));
 }
 
-static void test_valid_gecos(void) {
-        log_info("/* %s */", __func__);
-
+TEST(valid_gecos) {
         assert_se(!valid_gecos(NULL));
         assert_se(valid_gecos(""));
         assert_se(valid_gecos("test"));
@@ -303,9 +304,7 @@ static void test_valid_gecos(void) {
         assert_se(!valid_gecos("In:valid"));
 }
 
-static void test_valid_home(void) {
-        log_info("/* %s */", __func__);
-
+TEST(valid_home) {
         assert_se(!valid_home(NULL));
         assert_se(!valid_home(""));
         assert_se(!valid_home("."));
@@ -319,6 +318,24 @@ static void test_valid_home(void) {
         assert_se(valid_home("/"));
         assert_se(valid_home("/home"));
         assert_se(valid_home("/home/foo"));
+        assert_se(valid_home("/home/foo/"));
+}
+
+TEST(valid_shell) {
+        assert_se(!valid_shell(NULL));
+        assert_se(!valid_shell(""));
+        assert_se(!valid_shell("."));
+        assert_se(!valid_shell("/shell/.."));
+        assert_se(!valid_shell("/shell/../"));
+        assert_se(!valid_shell("/shell\n/foo"));
+        assert_se(!valid_shell("./piep"));
+        assert_se(!valid_shell("piep"));
+        assert_se(!valid_shell("/shell/user:lennart"));
+        assert_se(!valid_shell("/"));
+        assert_se(!valid_shell("/bin/sh/"));
+        assert_se(valid_shell("/shell"));
+        assert_se(valid_shell("/shell/foo"));
+        assert_se(valid_shell("/bin/sh"));
 }
 
 static void test_get_user_creds_one(const char *id, const char *name, uid_t uid, gid_t gid, const char *home, const char *shell) {
@@ -339,11 +356,17 @@ static void test_get_user_creds_one(const char *id, const char *name, uid_t uid,
                 return;
         }
         assert_se(r == 0);
-        assert_se(streq_ptr(id, name));
+        ASSERT_STREQ(id, name);
         assert_se(ruid == uid);
         assert_se(rgid == gid);
         assert_se(path_equal(rhome, home));
-        assert_se(path_equal(rshell, shell));
+}
+
+TEST(get_user_creds) {
+        test_get_user_creds_one("root", "root", 0, 0, "/root", DEFAULT_USER_SHELL);
+        test_get_user_creds_one("0", "root", 0, 0, "/root", DEFAULT_USER_SHELL);
+        test_get_user_creds_one(NOBODY_USER_NAME, NOBODY_USER_NAME, UID_NOBODY, GID_NOBODY, "/", NOLOGIN);
+        test_get_user_creds_one("65534", NOBODY_USER_NAME, UID_NOBODY, GID_NOBODY, "/", NOLOGIN);
 }
 
 static void test_get_group_creds_one(const char *id, const char *name, gid_t gid) {
@@ -359,13 +382,18 @@ static void test_get_group_creds_one(const char *id, const char *name, gid_t gid
                 return;
         }
         assert_se(r == 0);
-        assert_se(streq_ptr(id, name));
+        ASSERT_STREQ(id, name);
         assert_se(rgid == gid);
 }
 
-static void test_make_salt(void) {
-        log_info("/* %s */", __func__);
+TEST(get_group_creds) {
+        test_get_group_creds_one("root", "root", 0);
+        test_get_group_creds_one("0", "root", 0);
+        test_get_group_creds_one(NOBODY_GROUP_NAME, NOBODY_GROUP_NAME, GID_NOBODY);
+        test_get_group_creds_one("65534", NOBODY_GROUP_NAME, GID_NOBODY);
+}
 
+TEST(make_salt) {
         _cleanup_free_ char *s, *t;
 
         assert_se(make_salt(&s) == 0);
@@ -377,14 +405,14 @@ static void test_make_salt(void) {
         assert_se(!streq(s, t));
 }
 
-static void test_in_gid(void) {
+TEST(in_gid) {
         assert_se(in_gid(getgid()) >= 0);
         assert_se(in_gid(getegid()) >= 0);
         assert_se(in_gid(GID_INVALID) < 0);
         assert_se(in_gid(TTY_GID) == 0); /* The TTY gid is for owning ttys, it would be really really weird if we were in it. */
 }
 
-static void test_gid_lists_ops(void) {
+TEST(gid_lists_ops) {
         static const gid_t l1[] = { 5, 10, 15, 20, 25};
         static const gid_t l2[] = { 1, 2, 3, 15, 20, 25};
         static const gid_t l3[] = { 5, 10, 15, 20, 25, 26, 27};
@@ -416,15 +444,12 @@ static void test_gid_lists_ops(void) {
         assert_se(nresult >= 0);
         assert_se(memcmp_nn(result2, ELEMENTSOF(result2), res4, nresult) == 0);
 
-        nresult = getgroups_alloc(&gids);
-        assert_se(nresult >= 0 || nresult == -EINVAL || nresult == -ENOMEM);
-        assert_se(gids);
+        ASSERT_OK(nresult = getgroups_alloc(&gids));
+        assert_se(gids || nresult == 0);
 }
 
-static void test_parse_uid_range(void) {
+TEST(parse_uid_range) {
         uid_t a = 4711, b = 4711;
-
-        log_info("/* %s */", __func__);
 
         assert_se(parse_uid_range("", &a, &b) == -EINVAL && a == 4711 && b == 4711);
         assert_se(parse_uid_range(" ", &a, &b) == -EINVAL && a == 4711 && b == 4711);
@@ -458,11 +483,11 @@ static void test_mangle_gecos_one(const char *input, const char *expected) {
         _cleanup_free_ char *p = NULL;
 
         assert_se(p = mangle_gecos(input));
-        assert_se(streq(p, expected));
+        ASSERT_STREQ(p, expected);
         assert_se(valid_gecos(p));
 }
 
-static void test_mangle_gecos(void) {
+TEST(mangle_gecos) {
         test_mangle_gecos_one("", "");
         test_mangle_gecos_one("root", "root");
         test_mangle_gecos_one("wuff\nwuff", "wuff wuff");
@@ -473,45 +498,4 @@ static void test_mangle_gecos(void) {
         test_mangle_gecos_one("\xe2\x28\xa1", " ( ");
 }
 
-int main(int argc, char *argv[]) {
-        test_uid_to_name_one(0, "root");
-        test_uid_to_name_one(UID_NOBODY, NOBODY_USER_NAME);
-        test_uid_to_name_one(0xFFFF, "65535");
-        test_uid_to_name_one(0xFFFFFFFF, "4294967295");
-
-        test_gid_to_name_one(0, "root");
-        test_gid_to_name_one(GID_NOBODY, NOBODY_GROUP_NAME);
-        test_gid_to_name_one(TTY_GID, "tty");
-        test_gid_to_name_one(0xFFFF, "65535");
-        test_gid_to_name_one(0xFFFFFFFF, "4294967295");
-
-        test_get_user_creds_one("root", "root", 0, 0, "/root", "/bin/sh");
-        test_get_user_creds_one("0", "root", 0, 0, "/root", "/bin/sh");
-        test_get_user_creds_one(NOBODY_USER_NAME, NOBODY_USER_NAME, UID_NOBODY, GID_NOBODY, "/", NOLOGIN);
-        test_get_user_creds_one("65534", NOBODY_USER_NAME, UID_NOBODY, GID_NOBODY, "/", NOLOGIN);
-
-        test_get_group_creds_one("root", "root", 0);
-        test_get_group_creds_one("0", "root", 0);
-        test_get_group_creds_one(NOBODY_GROUP_NAME, NOBODY_GROUP_NAME, GID_NOBODY);
-        test_get_group_creds_one("65534", NOBODY_GROUP_NAME, GID_NOBODY);
-
-        test_parse_uid();
-        test_uid_ptr();
-
-        test_valid_user_group_name_relaxed();
-        test_valid_user_group_name();
-        test_valid_user_group_name_or_numeric_relaxed();
-        test_valid_user_group_name_or_numeric();
-        test_valid_gecos();
-        test_mangle_gecos();
-        test_valid_home();
-
-        test_make_salt();
-
-        test_in_gid();
-        test_gid_lists_ops();
-
-        test_parse_uid_range();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_INFO);

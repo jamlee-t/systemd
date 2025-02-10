@@ -7,8 +7,9 @@
 #include "af-list.h"
 #include "alloc-util.h"
 #include "dlfcn-util.h"
+#include "env-util.h"
 #include "errno-list.h"
-#include "format-util.h"
+#include "format-ifname.h"
 #include "hexdecoct.h"
 #include "hostname-util.h"
 #include "in-addr-util.h"
@@ -19,6 +20,7 @@
 #include "nss-util.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "socket-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -66,8 +68,6 @@ static int print_gaih_addrtuples(const struct gaih_addrtuple *tuples) {
 }
 
 static void print_struct_hostent(struct hostent *host, const char *canon) {
-        char **s;
-
         log_info("        \"%s\"", host->h_name);
         STRV_FOREACH(s, host->h_aliases)
                 log_info("        alias \"%s\"", *s);
@@ -114,10 +114,10 @@ static void test_gethostbyname4_r(void *handle, const char *module, const char *
 
         status = f(name, &pat, buffer, sizeof buffer, &errno1, &errno2, &ttl);
         if (status == NSS_STATUS_SUCCESS) {
-                log_info("%s(\"%s\") → status=%s%-20spat=buffer+0x%tx errno=%d/%s h_errno=%d/%s ttl=%"PRIi32,
+                log_info("%s(\"%s\") → status=%s%-20spat=buffer+0x%"PRIxPTR" errno=%d/%s h_errno=%d/%s ttl=%"PRIi32,
                          fname, name,
                          nss_status_to_string(status, pretty_status, sizeof pretty_status), "\n",
-                         pat ? (char*) pat - buffer : 0,
+                         pat ? (uintptr_t) pat - (uintptr_t) buffer : 0,
                          errno1, errno_to_name(errno1) ?: "---",
                          errno2, hstrerror(errno2),
                          ttl);
@@ -135,9 +135,18 @@ static void test_gethostbyname4_r(void *handle, const char *module, const char *
         if (STR_IN_SET(module, "resolve", "mymachines") && status == NSS_STATUS_UNAVAIL)
                 return;
 
-        if (STR_IN_SET(module, "myhostname", "resolve") && streq(name, "localhost")) {
-                assert_se(status == NSS_STATUS_SUCCESS);
-                assert_se(n == 2);
+        if (streq(name, "localhost")) {
+                if (streq(module, "myhostname")) {
+                        assert_se(status == NSS_STATUS_SUCCESS);
+                        assert_se(n == socket_ipv6_is_enabled() + 1);
+
+                } else if (streq(module, "resolve") && secure_getenv_bool("SYSTEMD_NSS_RESOLVE_SYNTHESIZE") != 0) {
+                        assert_se(status == NSS_STATUS_SUCCESS);
+                        if (socket_ipv6_is_enabled())
+                                assert_se(n == 2);
+                        else
+                                assert_se(n <= 2); /* Even if IPv6 is disabled, /etc/hosts may contain ::1. */
+                }
         }
 }
 
@@ -315,7 +324,7 @@ static void test_byname(void *handle, const char *module, const char *name) {
         puts("");
         test_gethostbyname3_r(handle, module, name, AF_UNSPEC);
         puts("");
-        test_gethostbyname3_r(handle, module, name, AF_LOCAL);
+        test_gethostbyname3_r(handle, module, name, AF_UNIX);
         puts("");
 
         test_gethostbyname2_r(handle, module, name, AF_INET);
@@ -324,7 +333,7 @@ static void test_byname(void *handle, const char *module, const char *name) {
         puts("");
         test_gethostbyname2_r(handle, module, name, AF_UNSPEC);
         puts("");
-        test_gethostbyname2_r(handle, module, name, AF_LOCAL);
+        test_gethostbyname2_r(handle, module, name, AF_UNIX);
         puts("");
 
         test_gethostbyname_r(handle, module, name);
@@ -358,7 +367,9 @@ static int make_addresses(struct local_address **addresses) {
                                               .address.in = { htobe32(0x7F000002) } };
         addrs[n++] = (struct local_address) { .family = AF_INET6,
                                               .address.in6 = in6addr_loopback };
-        return 0;
+
+        *addresses = TAKE_PTR(addrs);
+        return n;
 }
 
 static int test_one_module(const char *dir,
@@ -369,11 +380,10 @@ static int test_one_module(const char *dir,
 
         log_info("======== %s ========", module);
 
-        _cleanup_(dlclosep) void *handle = nss_open_handle(dir, module, RTLD_LAZY|RTLD_NODELETE);
+        _cleanup_(dlclosep) void *handle = nss_open_handle(dir, module, RTLD_NOW|RTLD_NODELETE);
         if (!handle)
                 return -EINVAL;
 
-        char **name;
         STRV_FOREACH(name, names)
                 test_byname(handle, module, *name);
 
@@ -417,11 +427,10 @@ static int parse_argv(int argc, char **argv,
 #if ENABLE_NSS_MYMACHINES
                                 "mymachines",
 #endif
-                                "dns");
+                                NULL);
         assert_se(modules);
 
         if (argc > 2) {
-                char **name;
                 int family;
                 union in_addr_union address;
 
@@ -440,9 +449,13 @@ static int parse_argv(int argc, char **argv,
                         }
                 }
         } else {
-                _cleanup_free_ char *hostname;
+                _cleanup_free_ char *hostname = NULL;
                 assert_se(hostname = gethostname_malloc());
-                assert_se(names = strv_new("localhost", "_gateway", "_outbound", "foo_no_such_host", hostname));
+                assert_se(names = strv_new("localhost",
+                                           "_gateway",
+                                           "_outbound",
+                                           hostname,
+                                           slow_tests_enabled() ? "foo_no_such_host" : NULL));
 
                 n = make_addresses(&addrs);
                 assert_se(n >= 0);
@@ -460,7 +473,6 @@ static int run(int argc, char **argv) {
         _cleanup_strv_free_ char **modules = NULL, **names = NULL;
         _cleanup_free_ struct local_address *addresses = NULL;
         int n_addresses = 0;
-        char **module;
         int r;
 
         test_setup_logging(LOG_INFO);

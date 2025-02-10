@@ -8,18 +8,16 @@
 #include "tmpfile-util.h"
 #include "umask-util.h"
 
-static void test_install_file(void) {
+TEST(install_file) {
         _cleanup_(rm_rf_physical_and_freep) char *p = NULL;
         _cleanup_free_ char *a = NULL, *b = NULL, *c = NULL;
         struct stat stat1, stat2;
-
-        log_info("/* %s */", __func__);
 
         assert_se(mkdtemp_malloc(NULL, &p) >= 0);
         assert_se(a = path_join(p, "foo"));
         assert_se(b = path_join(p, "bar"));
 
-        RUN_WITH_UMASK(0077)
+        WITH_UMASK(0077)
                 assert_se(write_string_file(a, "wups", WRITE_STRING_FILE_CREATE) >= 0);
 
         assert_se(lstat(a, &stat1) >= 0);
@@ -63,10 +61,4 @@ static void test_install_file(void) {
         assert_se(install_file(AT_FDCWD, b, AT_FDCWD, a, INSTALL_FSYNC_FULL|INSTALL_REPLACE) == 0);
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_INFO);
-
-        test_install_file();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_INFO);

@@ -11,6 +11,7 @@
 #include "extract-word.h"
 #include "fd-util.h"
 #include "log.h"
+#include "macro-fundamental.h"
 #include "memory-util.h"
 #include "socket-util.h"
 #include "string-table.h"
@@ -23,7 +24,7 @@ static const char* const duplex_table[_DUP_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(duplex, Duplex);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_duplex, duplex, Duplex, "Failed to parse duplex setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_duplex, duplex, Duplex);
 
 static const struct {
         uint32_t opt;
@@ -48,9 +49,9 @@ int wol_options_to_string_alloc(uint32_t opts, char **ret) {
                 return 0;
         }
 
-        for (size_t i = 0; i < ELEMENTSOF(wol_option_map); i++)
-                if (opts & wol_option_map[i].opt &&
-                    !strextend_with_separator(&str, ",", wol_option_map[i].name))
+        FOREACH_ELEMENT(option, wol_option_map)
+                if (opts & option->opt &&
+                    !strextend_with_separator(&str, ",", option->name))
                         return -ENOMEM;
 
         if (!str) {
@@ -72,7 +73,16 @@ static const char* const port_table[] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(port, NetDevPort);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_port, port, NetDevPort, "Failed to parse Port setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_port, port, NetDevPort);
+
+static const char* const mdi_table[] = {
+        [ETH_TP_MDI_INVALID]  = "unknown",
+        [ETH_TP_MDI]          = "mdi",
+        [ETH_TP_MDI_X]        = "mdi-x",
+        [ETH_TP_MDI_AUTO]     = "auto",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(mdi, int);
 
 static const char* const netdev_feature_table[_NET_DEV_FEAT_MAX] = {
         [NET_DEV_FEAT_SG]                  = "tx-scatter-gather",
@@ -142,98 +152,7 @@ static const char* const netdev_feature_table[_NET_DEV_FEAT_MAX] = {
 };
 
 static const char* const ethtool_link_mode_bit_table[] = {
-        [ETHTOOL_LINK_MODE_10baseT_Half_BIT]               = "10baset-half",
-        [ETHTOOL_LINK_MODE_10baseT_Full_BIT]               = "10baset-full",
-        [ETHTOOL_LINK_MODE_100baseT_Half_BIT]              = "100baset-half",
-        [ETHTOOL_LINK_MODE_100baseT_Full_BIT]              = "100baset-full",
-        [ETHTOOL_LINK_MODE_1000baseT_Half_BIT]             = "1000baset-half",
-        [ETHTOOL_LINK_MODE_1000baseT_Full_BIT]             = "1000baset-full",
-        [ETHTOOL_LINK_MODE_Autoneg_BIT]                    = "autonegotiation",
-        [ETHTOOL_LINK_MODE_TP_BIT]                         = "tp",
-        [ETHTOOL_LINK_MODE_AUI_BIT]                        = "aui",
-        [ETHTOOL_LINK_MODE_MII_BIT]                        = "mii",
-        [ETHTOOL_LINK_MODE_FIBRE_BIT]                      = "fibre",
-        [ETHTOOL_LINK_MODE_BNC_BIT]                        = "bnc",
-        [ETHTOOL_LINK_MODE_10000baseT_Full_BIT]            = "10000baset-full",
-        [ETHTOOL_LINK_MODE_Pause_BIT]                      = "pause",
-        [ETHTOOL_LINK_MODE_Asym_Pause_BIT]                 = "asym-pause",
-        [ETHTOOL_LINK_MODE_2500baseX_Full_BIT]             = "2500basex-full",
-        [ETHTOOL_LINK_MODE_Backplane_BIT]                  = "backplane",
-        [ETHTOOL_LINK_MODE_1000baseKX_Full_BIT]            = "1000basekx-full",
-        [ETHTOOL_LINK_MODE_10000baseKX4_Full_BIT]          = "10000basekx4-full",
-        [ETHTOOL_LINK_MODE_10000baseKR_Full_BIT]           = "10000basekr-full",
-        [ETHTOOL_LINK_MODE_10000baseR_FEC_BIT]             = "10000baser-fec",
-        [ETHTOOL_LINK_MODE_20000baseMLD2_Full_BIT]         = "20000basemld2-full",
-        [ETHTOOL_LINK_MODE_20000baseKR2_Full_BIT]          = "20000basekr2-full",
-        [ETHTOOL_LINK_MODE_40000baseKR4_Full_BIT]          = "40000basekr4-full",
-        [ETHTOOL_LINK_MODE_40000baseCR4_Full_BIT]          = "40000basecr4-full",
-        [ETHTOOL_LINK_MODE_40000baseSR4_Full_BIT]          = "40000basesr4-full",
-        [ETHTOOL_LINK_MODE_40000baseLR4_Full_BIT]          = "40000baselr4-full",
-        [ETHTOOL_LINK_MODE_56000baseKR4_Full_BIT]          = "56000basekr4-full",
-        [ETHTOOL_LINK_MODE_56000baseCR4_Full_BIT]          = "56000basecr4-full",
-        [ETHTOOL_LINK_MODE_56000baseSR4_Full_BIT]          = "56000basesr4-full",
-        [ETHTOOL_LINK_MODE_56000baseLR4_Full_BIT]          = "56000baselr4-full",
-        [ETHTOOL_LINK_MODE_25000baseCR_Full_BIT]           = "25000basecr-full",
-        [ETHTOOL_LINK_MODE_25000baseKR_Full_BIT]           = "25000basekr-full",
-        [ETHTOOL_LINK_MODE_25000baseSR_Full_BIT]           = "25000basesr-full",
-        [ETHTOOL_LINK_MODE_50000baseCR2_Full_BIT]          = "50000basecr2-full",
-        [ETHTOOL_LINK_MODE_50000baseKR2_Full_BIT]          = "50000basekr2-full",
-        [ETHTOOL_LINK_MODE_100000baseKR4_Full_BIT]         = "100000basekr4-full",
-        [ETHTOOL_LINK_MODE_100000baseSR4_Full_BIT]         = "100000basesr4-full",
-        [ETHTOOL_LINK_MODE_100000baseCR4_Full_BIT]         = "100000basecr4-full",
-        [ETHTOOL_LINK_MODE_100000baseLR4_ER4_Full_BIT]     = "100000baselr4-er4-full",
-        [ETHTOOL_LINK_MODE_50000baseSR2_Full_BIT]          = "50000basesr2-full",
-        [ETHTOOL_LINK_MODE_1000baseX_Full_BIT]             = "1000basex-full",
-        [ETHTOOL_LINK_MODE_10000baseCR_Full_BIT]           = "10000basecr-full",
-        [ETHTOOL_LINK_MODE_10000baseSR_Full_BIT]           = "10000basesr-full",
-        [ETHTOOL_LINK_MODE_10000baseLR_Full_BIT]           = "10000baselr-full",
-        [ETHTOOL_LINK_MODE_10000baseLRM_Full_BIT]          = "10000baselrm-full",
-        [ETHTOOL_LINK_MODE_10000baseER_Full_BIT]           = "10000baseer-full",
-        [ETHTOOL_LINK_MODE_2500baseT_Full_BIT]             = "2500baset-full",
-        [ETHTOOL_LINK_MODE_5000baseT_Full_BIT]             = "5000baset-full",
-        [ETHTOOL_LINK_MODE_FEC_NONE_BIT]                   = "fec-none",
-        [ETHTOOL_LINK_MODE_FEC_RS_BIT]                     = "fec-rs",
-        [ETHTOOL_LINK_MODE_FEC_BASER_BIT]                  = "fec-baser",
-        [ETHTOOL_LINK_MODE_50000baseKR_Full_BIT]           = "50000basekr-full",
-        [ETHTOOL_LINK_MODE_50000baseSR_Full_BIT]           = "50000basesr-full",
-        [ETHTOOL_LINK_MODE_50000baseCR_Full_BIT]           = "50000basecr-full",
-        [ETHTOOL_LINK_MODE_50000baseLR_ER_FR_Full_BIT]     = "50000baselr-er-fr-full",
-        [ETHTOOL_LINK_MODE_50000baseDR_Full_BIT]           = "50000basedr-full",
-        [ETHTOOL_LINK_MODE_100000baseKR2_Full_BIT]         = "100000basekr2-full",
-        [ETHTOOL_LINK_MODE_100000baseSR2_Full_BIT]         = "100000basesr2-full",
-        [ETHTOOL_LINK_MODE_100000baseCR2_Full_BIT]         = "100000basecr2-full",
-        [ETHTOOL_LINK_MODE_100000baseLR2_ER2_FR2_Full_BIT] = "100000baselr2-er2-fr2-full",
-        [ETHTOOL_LINK_MODE_100000baseDR2_Full_BIT]         = "100000basedr2-full",
-        [ETHTOOL_LINK_MODE_200000baseKR4_Full_BIT]         = "200000basekr4-full",
-        [ETHTOOL_LINK_MODE_200000baseSR4_Full_BIT]         = "200000basesr4-full",
-        [ETHTOOL_LINK_MODE_200000baseLR4_ER4_FR4_Full_BIT] = "200000baselr4-er4-fr4-full",
-        [ETHTOOL_LINK_MODE_200000baseDR4_Full_BIT]         = "200000basedr4-full",
-        [ETHTOOL_LINK_MODE_200000baseCR4_Full_BIT]         = "200000basecr4-full",
-        [ETHTOOL_LINK_MODE_100baseT1_Full_BIT]             = "100baset1-full",
-        [ETHTOOL_LINK_MODE_1000baseT1_Full_BIT]            = "1000baset1-full",
-        [ETHTOOL_LINK_MODE_400000baseKR8_Full_BIT]         = "400000basekr8-full",
-        [ETHTOOL_LINK_MODE_400000baseSR8_Full_BIT]         = "400000basesr8-full",
-        [ETHTOOL_LINK_MODE_400000baseLR8_ER8_FR8_Full_BIT] = "400000baselr8-er8-fr8-full",
-        [ETHTOOL_LINK_MODE_400000baseDR8_Full_BIT]         = "400000basedr8-full",
-        [ETHTOOL_LINK_MODE_400000baseCR8_Full_BIT]         = "400000basecr8-full",
-        [ETHTOOL_LINK_MODE_FEC_LLRS_BIT]                   = "fec-llrs",
-        [ETHTOOL_LINK_MODE_100000baseKR_Full_BIT]          = "100000basekr-full",
-        [ETHTOOL_LINK_MODE_100000baseSR_Full_BIT]          = "100000basesr-full",
-        [ETHTOOL_LINK_MODE_100000baseLR_ER_FR_Full_BIT]    = "100000baselr-er-fr-full",
-        [ETHTOOL_LINK_MODE_100000baseCR_Full_BIT]          = "100000basecr-full",
-        [ETHTOOL_LINK_MODE_100000baseDR_Full_BIT]          = "100000basedr-full",
-        [ETHTOOL_LINK_MODE_200000baseKR2_Full_BIT]         = "200000basekr2-full",
-        [ETHTOOL_LINK_MODE_200000baseSR2_Full_BIT]         = "200000basesr2-full",
-        [ETHTOOL_LINK_MODE_200000baseLR2_ER2_FR2_Full_BIT] = "200000baselr2-er2-fr2-full",
-        [ETHTOOL_LINK_MODE_200000baseDR2_Full_BIT]         = "200000basedr2-full",
-        [ETHTOOL_LINK_MODE_200000baseCR2_Full_BIT]         = "200000basecr2-full",
-        [ETHTOOL_LINK_MODE_400000baseKR4_Full_BIT]         = "400000basekr4-full",
-        [ETHTOOL_LINK_MODE_400000baseSR4_Full_BIT]         = "400000basesr4-full",
-        [ETHTOOL_LINK_MODE_400000baseLR4_ER4_FR4_Full_BIT] = "400000baselr4-er4-fr4-full",
-        [ETHTOOL_LINK_MODE_400000baseDR4_Full_BIT]         = "400000basedr4-full",
-        [ETHTOOL_LINK_MODE_400000baseCR4_Full_BIT]         = "400000basecr4-full",
-        [ETHTOOL_LINK_MODE_100baseFX_Half_BIT]             = "100basefx-half",
-        [ETHTOOL_LINK_MODE_100baseFX_Full_BIT]             = "100basefx-full",
+#  include "ethtool-link-mode.h"
 };
 /* Make sure the array is large enough to fit all bits */
 assert_cc((ELEMENTSOF(ethtool_link_mode_bit_table)-1) / 32 < N_ADVERTISE);
@@ -264,7 +183,6 @@ int ethtool_get_driver(int *ethtool_fd, const char *ifname, char **ret) {
         struct ifreq ifr = {
                 .ifr_data = (void*) &ecmd,
         };
-        char *d;
         int r;
 
         assert(ethtool_fd);
@@ -283,12 +201,7 @@ int ethtool_get_driver(int *ethtool_fd, const char *ifname, char **ret) {
         if (isempty(ecmd.driver))
                 return -ENODATA;
 
-        d = strdup(ecmd.driver);
-        if (!d)
-                return -ENOMEM;
-
-        *ret = d;
-        return 0;
+        return strdup_to(ret, ecmd.driver);
 }
 
 int ethtool_get_link_info(
@@ -340,7 +253,7 @@ int ethtool_get_link_info(
 }
 
 int ethtool_get_permanent_hw_addr(int *ethtool_fd, const char *ifname, struct hw_addr_data *ret) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct {
                 struct ethtool_perm_addr addr;
                 uint8_t space[HW_ADDR_MAX_SIZE];
@@ -384,7 +297,7 @@ int ethtool_get_permanent_hw_addr(int *ethtool_fd, const char *ifname, struct hw
                 if (dest != _v)                        \
                         updated = true;                \
                 dest = _v;                             \
-        } while(false)
+        } while (false)
 
 #define UPDATE_WITH_MAX(dest, max, val, updated)       \
         do {                                           \
@@ -395,7 +308,7 @@ int ethtool_get_permanent_hw_addr(int *ethtool_fd, const char *ifname, struct hw
                 if (dest != _v)                        \
                         updated = true;                \
                 dest = _v;                             \
-        } while(false)
+        } while (false)
 
 int ethtool_set_wol(
                 int *ethtool_fd,
@@ -425,6 +338,8 @@ int ethtool_set_wol(
 
         strscpy(ifr.ifr_name, sizeof(ifr.ifr_name), ifname);
 
+        CLEANUP_ERASE(ecmd);
+
         if (ioctl(*ethtool_fd, SIOCETHTOOL, &ifr) < 0)
                 return -errno;
 
@@ -440,7 +355,7 @@ int ethtool_set_wol(
                 _cleanup_free_ char *str = NULL;
 
                 (void) wol_options_to_string_alloc(wolopts & ~ecmd.supported, &str);
-                log_debug("Network interface %s does not support requested Wake on LAN option(s) \"%s\", ignoring.",
+                log_debug("Network interface %s does not support requested Wake on LAN options \"%s\", ignoring.",
                           ifname, strna(str));
 
                 wolopts &= ecmd.supported;
@@ -457,16 +372,11 @@ int ethtool_set_wol(
                 need_update = true;
         }
 
-        if (!need_update) {
-                explicit_bzero_safe(&ecmd, sizeof(ecmd));
+        if (!need_update)
                 return 0;
-        }
 
         ecmd.cmd = ETHTOOL_SWOL;
-        r = RET_NERRNO(ioctl(*ethtool_fd, SIOCETHTOOL, &ifr));
-
-        explicit_bzero_safe(&ecmd, sizeof(ecmd));
-        return r;
+        return RET_NERRNO(ioctl(*ethtool_fd, SIOCETHTOOL, &ifr));
 }
 
 int ethtool_set_nic_buffer_size(int *ethtool_fd, const char *ifname, const netdev_ring_param *ring) {
@@ -543,12 +453,9 @@ static int get_stringset(int ethtool_fd, const char *ifname, enum ethtool_string
         if (buffer.info.sset_mask == 0)
                 return -EOPNOTSUPP;
 
-#pragma GCC diagnostic push
-#if HAVE_ZERO_LENGTH_BOUNDS
-#  pragma GCC diagnostic ignored "-Wzero-length-bounds"
-#endif
+        DISABLE_WARNING_ZERO_LENGTH_BOUNDS;
         len = buffer.info.data[0];
-#pragma GCC diagnostic pop
+        REENABLE_WARNING;
         if (len == 0)
                 return -EOPNOTSUPP;
 
@@ -835,6 +742,8 @@ static int get_gset(int fd, struct ifreq *ifr, struct ethtool_link_usettings **r
                 .base.phy_address = ecmd.phy_address,
                 .base.autoneg = ecmd.autoneg,
                 .base.mdio_support = ecmd.mdio_support,
+                .base.eth_tp_mdix = ecmd.eth_tp_mdix,
+                .base.eth_tp_mdix_ctrl = ecmd.eth_tp_mdix_ctrl,
 
                 .link_modes.supported[0] = ecmd.supported,
                 .link_modes.advertising[0] = ecmd.advertising,
@@ -914,7 +823,8 @@ int ethtool_set_glinksettings(
                 const uint32_t advertise[static N_ADVERTISE],
                 uint64_t speed,
                 Duplex duplex,
-                NetDevPort port) {
+                NetDevPort port,
+                uint8_t mdi) {
 
         _cleanup_free_ struct ethtool_link_usettings *u = NULL;
         struct ifreq ifr = {};
@@ -926,7 +836,7 @@ int ethtool_set_glinksettings(
         assert(advertise);
 
         if (autonegotiation < 0 && memeqzero(advertise, sizeof(uint32_t) * N_ADVERTISE) &&
-            speed == 0 && duplex < 0 && port < 0)
+            speed == 0 && duplex < 0 && port < 0 && mdi == ETH_TP_MDI_INVALID)
                 return 0;
 
         /* If autonegotiation is disabled, the speed and duplex represent the fixed link mode and are
@@ -957,7 +867,7 @@ int ethtool_set_glinksettings(
         if (r < 0) {
                 r = get_gset(*fd, &ifr, &u);
                 if (r < 0)
-                        return log_debug_errno(r, "ethtool: Cannot get device settings for %s : %m", ifname);
+                        return log_debug_errno(r, "ethtool: Cannot get device settings for %s: %m", ifname);
         }
 
         if (speed > 0)
@@ -982,6 +892,13 @@ int ethtool_set_glinksettings(
                 memcpy(&u->link_modes.advertising, advertise, sizeof(uint32_t) * N_ADVERTISE);
                 memzero((uint8_t*) &u->link_modes.advertising + sizeof(uint32_t) * N_ADVERTISE,
                         ETHTOOL_LINK_MODE_MASK_MAX_KERNEL_NBYTES - sizeof(uint32_t) * N_ADVERTISE);
+        }
+
+        if (mdi != ETH_TP_MDI_INVALID) {
+                if (u->base.eth_tp_mdix_ctrl == ETH_TP_MDI_INVALID)
+                        log_debug("ethtool: setting MDI not supported for %s, ignoring.", ifname);
+                else
+                        UPDATE(u->base.eth_tp_mdix_ctrl, mdi, changed);
         }
 
         if (!changed)
@@ -1206,6 +1123,62 @@ int ethtool_set_nic_coalesce_settings(int *ethtool_fd, const char *ifname, const
         return RET_NERRNO(ioctl(*ethtool_fd, SIOCETHTOOL, &ifr));
 }
 
+int ethtool_set_eee_settings(
+                int *ethtool_fd,
+                const char *ifname,
+                int enabled,
+                int tx_lpi_enabled,
+                usec_t tx_lpi_timer_usec,
+                uint32_t advertise) {
+
+        int r;
+
+        assert(ethtool_fd);
+        assert(ifname);
+
+        if (enabled < 0 &&
+            tx_lpi_enabled < 0 &&
+            tx_lpi_timer_usec == USEC_INFINITY &&
+            advertise == 0)
+                return 0; /* Nothing requested. */
+
+        r = ethtool_connect(ethtool_fd);
+        if (r < 0)
+                return r;
+
+        struct ethtool_eee ecmd = {
+                .cmd = ETHTOOL_GEEE,
+        };
+        struct ifreq ifr = {
+                .ifr_data = (void*) &ecmd,
+        };
+
+        strscpy(ifr.ifr_name, sizeof(ifr.ifr_name), ifname);
+
+        if (ioctl(*ethtool_fd, SIOCETHTOOL, &ifr) < 0)
+                return -errno;
+
+        if (ecmd.supported == 0)
+                return 0; /* Unsupported. */
+
+        bool need_update = false;
+
+        if (enabled >= 0)
+                UPDATE(ecmd.eee_enabled, (uint32_t) enabled, need_update);
+        if (tx_lpi_enabled >= 0)
+                UPDATE(ecmd.tx_lpi_enabled, (uint32_t) tx_lpi_enabled, need_update);
+        if (tx_lpi_timer_usec != USEC_INFINITY)
+                UPDATE(ecmd.tx_lpi_timer, (uint32_t) MIN(DIV_ROUND_UP(tx_lpi_timer_usec, USEC_PER_MSEC), (usec_t) UINT32_MAX), need_update);
+        if (advertise != 0)
+                UPDATE(ecmd.advertised, advertise & ecmd.supported, need_update);
+
+        if (!need_update)
+                return 0; /* Nothing changed. */
+
+        ecmd.cmd = ETHTOOL_SEEE;
+        return RET_NERRNO(ioctl(*ethtool_fd, SIOCETHTOOL, &ifr));
+}
+
 int config_parse_advertise(
                 const char *unit,
                 const char *filename,
@@ -1218,14 +1191,13 @@ int config_parse_advertise(
                 void *data,
                 void *userdata) {
 
-        uint32_t *advertise = data;
+        uint32_t *advertise = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(section);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         if (isempty(rvalue)) {
                 /* Empty string resets the value. */
@@ -1261,6 +1233,48 @@ int config_parse_advertise(
         }
 }
 
+int config_parse_mdi(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        uint8_t *mdi = ASSERT_PTR(data);
+
+        assert(filename);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                *mdi = ETH_TP_MDI_INVALID;
+                return 0;
+        }
+
+        if (STR_IN_SET(rvalue, "mdi", "straight")) {
+                *mdi = ETH_TP_MDI;
+                return 0;
+        }
+
+        if (STR_IN_SET(rvalue, "mdi-x", "mdix", "crossover")) {
+                *mdi = ETH_TP_MDI_X;
+                return 0;
+        }
+
+        if (streq(rvalue, "auto")) {
+                *mdi = ETH_TP_MDI_AUTO;
+                return 0;
+        }
+
+        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                   "Failed to parse %s= setting, ignoring assignment: %s", lvalue, rvalue);
+        return 0;
+}
+
 int config_parse_ring_buffer_or_channel(
                 const char *unit,
                 const char *filename,
@@ -1273,7 +1287,7 @@ int config_parse_ring_buffer_or_channel(
                 void *data,
                 void *userdata) {
 
-        u32_opt *dst = data;
+        u32_opt *dst = ASSERT_PTR(data);
         uint32_t k;
         int r;
 
@@ -1281,7 +1295,6 @@ int config_parse_ring_buffer_or_channel(
         assert(section);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         if (isempty(rvalue)) {
                 dst->value = 0;
@@ -1358,9 +1371,9 @@ int config_parse_wol(
                 if (r == 0)
                         break;
 
-                for (size_t i = 0; i < ELEMENTSOF(wol_option_map); i++)
-                        if (streq(w, wol_option_map[i].name)) {
-                                new_opts |= wol_option_map[i].opt;
+                FOREACH_ELEMENT(option, wol_option_map)
+                        if (streq(w, option->name)) {
+                                new_opts |= option->opt;
                                 found = true;
                                 break;
                         }

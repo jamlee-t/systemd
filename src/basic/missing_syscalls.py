@@ -9,18 +9,22 @@ SYSCALLS = [
     'bpf',
     'close_range',
     'copy_file_range',
-    'epoll_pwait2',
+    'fchmodat2',
     'getrandom',
     'memfd_create',
     'mount_setattr',
     'move_mount',
     'name_to_handle_at',
     'open_tree',
+    'openat2',
     'pidfd_open',
     'pidfd_send_signal',
     'pkey_mprotect',
+    'quotactl_fd',
+    'removexattrat',
     'renameat2',
     'setns',
+    'setxattrat',
     'statx',
 ]
 
@@ -59,6 +63,8 @@ DEF_TEMPLATE_B = '''\
 #    define systemd_NR_{syscall} {nr_i386}
 #  elif defined(__ia64__)
 #    define systemd_NR_{syscall} {nr_ia64}
+#  elif defined(__loongarch_lp64)
+#    define systemd_NR_{syscall} {nr_loongarch64}
 #  elif defined(__m68k__)
 #    define systemd_NR_{syscall} {nr_m68k}
 #  elif defined(_MIPS_SIM)
@@ -71,6 +77,8 @@ DEF_TEMPLATE_B = '''\
 #    else
 #      error "Unknown MIPS ABI"
 #    endif
+#  elif defined(__hppa__)
+#    define systemd_NR_{syscall} {nr_parisc}
 #  elif defined(__powerpc__)
 #    define systemd_NR_{syscall} {nr_powerpc}
 #  elif defined(__riscv)
@@ -139,6 +147,7 @@ def print_syscall_defs(syscalls, tables, out):
  * Use 'ninja -C build update-syscall-tables' to download new syscall tables,
  * and 'ninja -C build update-syscall-header' to regenerate this file.
  */
+#pragma once
 ''',
           file=out)
     print(ARCH_CHECK, file=out)

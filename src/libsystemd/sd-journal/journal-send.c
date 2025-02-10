@@ -6,6 +6,9 @@
 #include <stddef.h>
 #include <sys/un.h>
 #include <unistd.h>
+#if HAVE_VALGRIND_VALGRIND_H
+#  include <valgrind/valgrind.h>
+#endif
 
 #define SD_JOURNAL_SUPPRESS_LOCATION
 
@@ -14,9 +17,14 @@
 #include "alloc-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
-#include "io-util.h"
 #include "fileio.h"
+#include "io-util.h"
+#include "iovec-util.h"
+#include "journal-send.h"
 #include "memfd-util.h"
+#include "missing_mman.h"
+#include "missing_syscall.h"
+#include "process-util.h"
 #include "socket-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
@@ -39,10 +47,10 @@
  * all its threads, and all its subprocesses. This means we need to
  * initialize it atomically, and need to operate on it atomically
  * never assuming we are the only user */
+static int fd_plus_one = 0;
 
 static int journal_fd(void) {
         int fd;
-        static int fd_plus_one = 0;
 
 retry:
         if (fd_plus_one > 0)
@@ -54,12 +62,41 @@ retry:
 
         fd_inc_sndbuf(fd, SNDBUF_SIZE);
 
-        if (!__sync_bool_compare_and_swap(&fd_plus_one, 0, fd+1)) {
+        if (!__atomic_compare_exchange_n(&fd_plus_one, &(int){0}, fd+1,
+                false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
                 safe_close(fd);
                 goto retry;
         }
 
         return fd;
+}
+
+int journal_fd_nonblock(bool nonblock) {
+        int r;
+
+        r = journal_fd();
+        if (r < 0)
+                return r;
+
+        return fd_nonblock(r, nonblock);
+}
+
+void close_journal_fd(void) {
+#if HAVE_VALGRIND_VALGRIND_H
+        /* Be nice to valgrind. This is not atomic, so it is useful mainly for debugging. */
+
+        if (!RUNNING_ON_VALGRIND)
+                return;
+
+        if (getpid_cached() != gettid())
+                return;
+
+        if (fd_plus_one <= 0)
+                return;
+
+        safe_close(fd_plus_one - 1);
+        fd_plus_one = 0;
+#endif
 }
 
 _public_ int sd_journal_print(int priority, const char *format, ...) {
@@ -85,7 +122,7 @@ _public_ int sd_journal_printv(int priority, const char *format, va_list ap) {
         assert_return(priority <= 7, -EINVAL);
         assert_return(format, -EINVAL);
 
-        xsprintf(p, "PRIORITY=%i", priority & LOG_PRIMASK);
+        xsprintf(p, "PRIORITY=%i", LOG_PRI(priority));
 
         va_copy(aq, ap);
         len = vsnprintf(buffer + 8, LINE_MAX, format, aq);
@@ -114,99 +151,76 @@ _public_ int sd_journal_printv(int priority, const char *format, va_list ap) {
         return sd_journal_sendv(iov, 2);
 }
 
-_printf_(1, 0) static int fill_iovec_sprintf(const char *format, va_list ap, int extra, struct iovec **_iov) {
-        PROTECT_ERRNO;
-        int r, n = 0, i = 0, j;
-        struct iovec *iov = NULL;
+_printf_(1, 0) static int fill_iovec_sprintf(
+                const char *format,
+                va_list ap,
+                size_t extra,
+                struct iovec **ret_iov,
+                size_t *ret_n_iov) {
 
-        assert(_iov);
+        PROTECT_ERRNO;
+        struct iovec *iov = NULL;
+        size_t n = 0;
+
+        assert(ret_iov);
+        assert(ret_n_iov);
 
         if (extra > 0) {
-                n = MAX(extra * 2, extra + 4);
-                iov = malloc0(n * sizeof(struct iovec));
-                if (!iov) {
-                        r = -ENOMEM;
-                        goto fail;
-                }
+                if (!GREEDY_REALLOC0(iov, extra))
+                        return -ENOMEM;
 
-                i = extra;
+                n = extra;
         }
 
+        CLEANUP_ARRAY(iov, n, iovec_array_free);
+
         while (format) {
-                struct iovec *c;
-                char *buffer;
+                _cleanup_free_ char *buffer = NULL;
                 va_list aq;
-
-                if (i >= n) {
-                        n = MAX(i*2, 4);
-                        c = reallocarray(iov, n, sizeof(struct iovec));
-                        if (!c) {
-                                r = -ENOMEM;
-                                goto fail;
-                        }
-
-                        iov = c;
-                }
 
                 va_copy(aq, ap);
                 if (vasprintf(&buffer, format, aq) < 0) {
                         va_end(aq);
-                        r = -ENOMEM;
-                        goto fail;
+                        return -ENOMEM;
                 }
                 va_end(aq);
 
                 VA_FORMAT_ADVANCE(format, ap);
-
-                (void) strstrip(buffer); /* strip trailing whitespace, keep prefixing whitespace */
-
-                iov[i++] = IOVEC_MAKE_STRING(buffer);
-
                 format = va_arg(ap, char *);
+
+                if (!GREEDY_REALLOC(iov, n + 1))
+                        return -ENOMEM;
+
+                /* strip trailing whitespace, keep prefixing whitespace */
+                iov[n++] = IOVEC_MAKE_STRING(delete_trailing_chars(TAKE_PTR(buffer), NULL));
         }
 
-        *_iov = iov;
-
-        return i;
-
-fail:
-        for (j = 0; j < i; j++)
-                free(iov[j].iov_base);
-
-        free(iov);
-
-        return r;
+        *ret_iov = TAKE_PTR(iov);
+        *ret_n_iov = n;
+        return 0;
 }
 
 _public_ int sd_journal_send(const char *format, ...) {
-        int r, i, j;
-        va_list ap;
         struct iovec *iov = NULL;
+        size_t n_iov = 0;
+        va_list ap;
+        int r;
+
+        CLEANUP_ARRAY(iov, n_iov, iovec_array_free);
 
         va_start(ap, format);
-        i = fill_iovec_sprintf(format, ap, 0, &iov);
+        r = fill_iovec_sprintf(format, ap, 0, &iov, &n_iov);
         va_end(ap);
+        if (r < 0)
+                return r;
 
-        if (_unlikely_(i < 0)) {
-                r = i;
-                goto finish;
-        }
-
-        r = sd_journal_sendv(iov, i);
-
-finish:
-        for (j = 0; j < i; j++)
-                free(iov[j].iov_base);
-
-        free(iov);
-
-        return r;
+        return sd_journal_sendv(iov, n_iov);
 }
 
 _public_ int sd_journal_sendv(const struct iovec *iov, int n) {
         PROTECT_ERRNO;
         int fd, r;
-        _cleanup_close_ int buffer_fd = -1;
+        _cleanup_close_ int buffer_fd = -EBADF;
         struct iovec *w;
         uint64_t *l;
         int i, j = 0;
@@ -220,7 +234,6 @@ _public_ int sd_journal_sendv(const struct iovec *iov, int n) {
         };
         ssize_t k;
         bool have_syslog_identifier = false;
-        bool seal = true;
 
         assert_return(iov, -EINVAL);
         assert_return(n > 0, -EINVAL);
@@ -249,7 +262,7 @@ _public_ int sd_journal_sendv(const struct iovec *iov, int n) {
 
                         /* Already includes a newline? Bummer, then
                          * let's write the variable name, then a
-                         * newline, then the size (64bit LE), followed
+                         * newline, then the size (64-bit LE), followed
                          * by the data and a final newline */
 
                         w[j++] = IOVEC_MAKE(iov[i].iov_base, c - (char*) iov[i].iov_base);
@@ -296,38 +309,22 @@ _public_ int sd_journal_sendv(const struct iovec *iov, int n) {
         if (errno == ENOENT)
                 return 0;
 
-        if (!IN_SET(errno, EMSGSIZE, ENOBUFS))
+        if (!IN_SET(errno, EMSGSIZE, ENOBUFS, EAGAIN))
                 return -errno;
 
-        /* Message doesn't fit... Let's dump the data in a memfd or
-         * temporary file and just pass a file descriptor of it to the
-         * other side.
-         *
-         * For the temporary files we use /dev/shm instead of /tmp
-         * here, since we want this to be a tmpfs, and one that is
-         * available from early boot on and where unprivileged users
-         * can create files. */
-        buffer_fd = memfd_new(NULL);
-        if (buffer_fd < 0) {
-                if (buffer_fd == -ENOSYS) {
-                        buffer_fd = open_tmpfile_unlinkable("/dev/shm", O_RDWR | O_CLOEXEC);
-                        if (buffer_fd < 0)
-                                return buffer_fd;
-
-                        seal = false;
-                } else
-                        return buffer_fd;
-        }
+        /* Message doesn't fit... Let's dump the data in a memfd or temporary file and just pass a file
+         * descriptor of it to the other side. */
+        buffer_fd = memfd_new_full("journal-data", MFD_ALLOW_SEALING);
+        if (buffer_fd < 0)
+                return buffer_fd;
 
         n = writev(buffer_fd, w, j);
         if (n < 0)
                 return -errno;
 
-        if (seal) {
-                r = memfd_set_sealed(buffer_fd);
-                if (r < 0)
-                        return r;
-        }
+        r = memfd_set_sealed(buffer_fd);
+        if (r < 0)
+                return r;
 
         r = send_one_fd_sa(fd, buffer_fd, mh.msg_name, mh.msg_namelen, 0);
         if (r == -ENOENT)
@@ -385,26 +382,30 @@ _public_ int sd_journal_perror(const char *message) {
         return fill_iovec_perror_and_send(message, 0, iovec);
 }
 
-_public_ int sd_journal_stream_fd(const char *identifier, int priority, int level_prefix) {
-        static const union sockaddr_union sa = {
-                .un.sun_family = AF_UNIX,
-                .un.sun_path = "/run/systemd/journal/stdout",
-        };
-        _cleanup_close_ int fd = -1;
-        char *header;
-        size_t l;
+_public_ int sd_journal_stream_fd_with_namespace(
+                const char *name_space,
+                const char *identifier,
+                int priority,
+                int level_prefix) {
+
+        _cleanup_close_ int fd = -EBADF;
+        const char *path;
         int r;
 
         assert_return(priority >= 0, -EINVAL);
         assert_return(priority <= 7, -EINVAL);
 
+        path = journal_stream_path(name_space);
+        if (!path)
+                return -EINVAL;
+
         fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
         if (fd < 0)
                 return -errno;
 
-        r = connect(fd, &sa.sa, SOCKADDR_UN_LEN(sa.un));
+        r = connect_unix_path(fd, AT_FDCWD, path);
         if (r < 0)
-                return -errno;
+                return r;
 
         if (shutdown(fd, SHUT_RD) < 0)
                 return -errno;
@@ -412,6 +413,9 @@ _public_ int sd_journal_stream_fd(const char *identifier, int priority, int leve
         (void) fd_inc_sndbuf(fd, SNDBUF_SIZE);
 
         identifier = strempty(identifier);
+
+        char *header;
+        size_t l;
 
         l = strlen(identifier);
         header = newa(char, l + 1 + 1 + 2 + 2 + 2 + 2 + 2);
@@ -430,11 +434,15 @@ _public_ int sd_journal_stream_fd(const char *identifier, int priority, int leve
         header[l++] = '0';
         header[l++] = '\n';
 
-        r = loop_write(fd, header, l, false);
+        r = loop_write(fd, header, l);
         if (r < 0)
                 return r;
 
         return TAKE_FD(fd);
+}
+
+_public_ int sd_journal_stream_fd(const char *identifier, int priority, int level_prefix) {
+        return sd_journal_stream_fd_with_namespace(NULL, identifier, priority, level_prefix);
 }
 
 _public_ int sd_journal_print_with_location(int priority, const char *file, const char *line, const char *func, const char *format, ...) {
@@ -461,7 +469,7 @@ _public_ int sd_journal_printv_with_location(int priority, const char *file, con
         assert_return(priority <= 7, -EINVAL);
         assert_return(format, -EINVAL);
 
-        xsprintf(p, "PRIORITY=%i", priority & LOG_PRIMASK);
+        xsprintf(p, "PRIORITY=%i", LOG_PRI(priority));
 
         va_copy(aq, ap);
         len = vsnprintf(buffer + 8, LINE_MAX, format, aq);
@@ -499,19 +507,19 @@ _public_ int sd_journal_printv_with_location(int priority, const char *file, con
 }
 
 _public_ int sd_journal_send_with_location(const char *file, const char *line, const char *func, const char *format, ...) {
-        _cleanup_free_ struct iovec *iov = NULL;
-        int r, i, j;
+        struct iovec *iov = NULL;
+        size_t n_iov = 0;
         va_list ap;
         char *f;
+        int r;
+
+        CLEANUP_ARRAY(iov, n_iov, iovec_array_free);
 
         va_start(ap, format);
-        i = fill_iovec_sprintf(format, ap, 3, &iov);
+        r = fill_iovec_sprintf(format, ap, 3, &iov, &n_iov);
         va_end(ap);
-
-        if (_unlikely_(i < 0)) {
-                r = i;
-                goto finish;
-        }
+        if (r < 0)
+                return r;
 
         ALLOCA_CODE_FUNC(f, func);
 
@@ -519,11 +527,9 @@ _public_ int sd_journal_send_with_location(const char *file, const char *line, c
         iov[1] = IOVEC_MAKE_STRING(line);
         iov[2] = IOVEC_MAKE_STRING(f);
 
-        r = sd_journal_sendv(iov, i);
+        r = sd_journal_sendv(iov, n_iov);
 
-finish:
-        for (j = 3; j < i; j++)
-                free(iov[j].iov_base);
+        iov[0] = iov[1] = iov[2] = (struct iovec) {};
 
         return r;
 }

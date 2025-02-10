@@ -4,10 +4,16 @@
 #include "sd-netlink.h"
 
 #include "conf-parser.h"
+#include "ether-addr-util.h"
+#include "hash-funcs.h"
 #include "list.h"
 #include "log-link.h"
+#include "netdev-util.h"
 #include "networkd-link.h"
 #include "time-util.h"
+
+/* Special hardware address value to suppress generating persistent hardware address for the netdev. */
+#define HW_ADDR_NONE ((struct hw_addr_data) { .length = 1, })
 
 #define NETDEV_COMMON_SECTIONS "Match\0NetDev\0"
 /* This is the list of known sections. We need to ignore them in the initial parsing phase. */
@@ -18,6 +24,7 @@
         "-Bridge\0"                               \
         "-FooOverUDP\0"                           \
         "-GENEVE\0"                               \
+        "-IPoIB\0"                                \
         "-IPVLAN\0"                               \
         "-IPVTAP\0"                               \
         "-L2TP\0"                                 \
@@ -36,6 +43,7 @@
         "-VRF\0"                                  \
         "-VXCAN\0"                                \
         "-VXLAN\0"                                \
+        "-WLAN\0"                                 \
         "-WireGuard\0"                            \
         "-WireGuardPeer\0"                        \
         "-Xfrm\0"
@@ -56,6 +64,7 @@ typedef enum NetDevKind {
         NETDEV_KIND_IP6GRETAP,
         NETDEV_KIND_IP6TNL,
         NETDEV_KIND_IPIP,
+        NETDEV_KIND_IPOIB,
         NETDEV_KIND_IPVLAN,
         NETDEV_KIND_IPVTAP,
         NETDEV_KIND_L2TP,
@@ -76,6 +85,7 @@ typedef enum NetDevKind {
         NETDEV_KIND_VXCAN,
         NETDEV_KIND_VXLAN,
         NETDEV_KIND_WIREGUARD,
+        NETDEV_KIND_WLAN,
         NETDEV_KIND_XFRM,
         _NETDEV_KIND_MAX,
         _NETDEV_KIND_TUNNEL, /* Used by config_parse_stacked_netdev() */
@@ -94,16 +104,13 @@ typedef enum NetDevState {
 
 typedef enum NetDevCreateType {
         NETDEV_CREATE_INDEPENDENT,
-        NETDEV_CREATE_MASTER,
         NETDEV_CREATE_STACKED,
-        NETDEV_CREATE_AFTER_CONFIGURED,
         _NETDEV_CREATE_MAX,
         _NETDEV_CREATE_INVALID = -EINVAL,
 } NetDevCreateType;
 
 typedef struct Manager Manager;
 typedef struct Condition Condition;
-typedef struct Request Request;
 
 typedef struct NetDev {
         Manager *manager;
@@ -111,6 +118,8 @@ typedef struct NetDev {
         unsigned n_ref;
 
         char *filename;
+        char **dropins;
+        Hashmap *stats_by_path;
 
         LIST_HEAD(Condition, conditions);
 
@@ -118,7 +127,7 @@ typedef struct NetDev {
         NetDevKind kind;
         char *description;
         char *ifname;
-        struct ether_addr *mac;
+        struct hw_addr_data hw_addr;
         uint32_t mtu;
         int ifindex;
 } NetDev;
@@ -137,6 +146,9 @@ typedef struct NetDevVTable {
          * to be set != 0. */
         void (*init)(NetDev *n);
 
+        /* This is called when the interface is removed. */
+        void (*drop)(NetDev *n);
+
         /* This should free all kind-specific variables. It should be
          * idempotent. */
         void (*done)(NetDev *n);
@@ -147,20 +159,50 @@ typedef struct NetDevVTable {
         /* specifies if netdev is independent, or a master device or a stacked device */
         NetDevCreateType create_type;
 
+        /* This is used for stacked netdev. Return true when the underlying link is ready. */
+        int (*is_ready_to_create)(NetDev *netdev, Link *link);
+
         /* create netdev, if not done via rtnl */
         int (*create)(NetDev *netdev);
 
-        /* create netdev after link is fully configured */
-        int (*create_after_configured)(NetDev *netdev, Link *link);
-
         /* perform additional configuration after netdev has been createad */
-        int (*post_create)(NetDev *netdev, Link *link, sd_netlink_message *message);
+        int (*post_create)(NetDev *netdev, Link *link);
 
         /* verify that compulsory configuration options were specified */
         int (*config_verify)(NetDev *netdev, const char *filename);
 
+        /* attach/detach additional interfaces, e.g. veth peer or L2TP sessions. */
+        int (*attach)(NetDev *netdev);
+        void (*detach)(NetDev *netdev);
+
+        /* set ifindex of the created interface. */
+        int (*set_ifindex)(NetDev *netdev, const char *name, int ifindex);
+
+        /* get ifindex of the netdev. */
+        int (*get_ifindex)(NetDev *netdev, const char *name);
+
+        /* provides if MAC address can be set. If this is not set, assumed to be yes. */
+        bool (*can_set_mac)(NetDev *netdev, const struct hw_addr_data *hw_addr);
+
+        /* provides if MTU can be set. If this is not set, assumed to be yes. */
+        bool (*can_set_mtu)(NetDev *netdev, uint32_t mtu);
+
+        /* provides if the netdev needs to be reconfigured when a specified type of address on the underlying
+         * interface is updated. */
+        bool (*needs_reconfigure)(NetDev *netdev, NetDevLocalAddressType type);
+
+        /* expected iftype, e.g. ARPHRD_ETHER. */
+        uint16_t iftype;
+
         /* Generate MAC address when MACAddress= is not specified. */
         bool generate_mac;
+
+        /* When assigning ifindex to the netdev, skip to check if the netdev kind matches. */
+        bool skip_netdev_kind_check;
+
+        /* Provides if the netdev can be updated, that is, whether RTM_NEWLINK with existing ifindex is supported or not.
+         * If this is true, the netdev does not support updating. */
+        bool keep_existing;
 } NetDevVTable;
 
 extern const NetDevVTable * const netdev_vtable[_NETDEV_KIND_MAX];
@@ -168,39 +210,46 @@ extern const NetDevVTable * const netdev_vtable[_NETDEV_KIND_MAX];
 #define NETDEV_VTABLE(n) ((n)->kind != _NETDEV_KIND_INVALID ? netdev_vtable[(n)->kind] : NULL)
 
 /* For casting a netdev into the various netdev kinds */
-#define DEFINE_NETDEV_CAST(UPPERCASE, MixedCase)                            \
-        static inline MixedCase* UPPERCASE(NetDev *n) {                     \
-                if (_unlikely_(!n ||                                        \
-                               n->kind != NETDEV_KIND_##UPPERCASE) ||       \
-                               n->state == _NETDEV_STATE_INVALID)           \
-                        return NULL;                                        \
-                                                                            \
-                return (MixedCase*) n;                                      \
+#define DEFINE_NETDEV_CAST(UPPERCASE, MixedCase)                        \
+        static inline MixedCase* UPPERCASE(NetDev *n) {                 \
+                assert(n);                                              \
+                assert(n->kind == NETDEV_KIND_##UPPERCASE);             \
+                assert(n->state < _NETDEV_STATE_MAX);                   \
+                                                                        \
+                return (MixedCase*) n;                                  \
         }
 
 /* For casting the various netdev kinds into a netdev */
 #define NETDEV(n) (&(n)->meta)
 
-int netdev_load(Manager *manager, bool reload);
-int netdev_load_one(Manager *manager, const char *filename);
+int netdev_attach_name(NetDev *netdev, const char *name);
+NetDev* netdev_detach_name(NetDev *netdev, const char *name);
+void netdev_detach(NetDev *netdev);
+int netdev_set_ifindex_internal(NetDev *netdev, int ifindex);
+
+int netdev_load(Manager *manager);
+int netdev_reload(Manager *manager);
+int netdev_load_one(Manager *manager, const char *filename, NetDev **ret);
 void netdev_drop(NetDev *netdev);
 void netdev_enter_failed(NetDev *netdev);
+int netdev_enter_ready(NetDev *netdev);
 
-NetDev *netdev_unref(NetDev *netdev);
-NetDev *netdev_ref(NetDev *netdev);
+NetDev* netdev_unref(NetDev *netdev);
+NetDev* netdev_ref(NetDev *netdev);
 DEFINE_TRIVIAL_DESTRUCTOR(netdev_destroy_callback, NetDev, netdev_unref);
 DEFINE_TRIVIAL_CLEANUP_FUNC(NetDev*, netdev_unref);
 
 bool netdev_is_managed(NetDev *netdev);
 int netdev_get(Manager *manager, const char *name, NetDev **ret);
+void link_assign_netdev(Link *link);
 int netdev_set_ifindex(NetDev *netdev, sd_netlink_message *newlink);
-int netdev_get_mac(const char *ifname, struct ether_addr **ret);
-int netdev_join(NetDev *netdev, Link *link, link_netlink_message_handler_t cb);
+int netdev_generate_hw_addr(NetDev *netdev, Link *link, const char *name,
+                            const struct hw_addr_data *hw_addr, struct hw_addr_data *ret);
 
-int request_process_stacked_netdev(Request *req);
+bool netdev_needs_reconfigure(NetDev *netdev, NetDevLocalAddressType type);
 int link_request_stacked_netdev(Link *link, NetDev *netdev);
 
-const char *netdev_kind_to_string(NetDevKind d) _const_;
+const char* netdev_kind_to_string(NetDevKind d) _const_;
 NetDevKind netdev_kind_from_string(const char *d) _pure_;
 
 static inline NetDevCreateType netdev_get_create_type(NetDev *netdev) {
@@ -211,6 +260,7 @@ static inline NetDevCreateType netdev_get_create_type(NetDev *netdev) {
 }
 
 CONFIG_PARSER_PROTOTYPE(config_parse_netdev_kind);
+CONFIG_PARSER_PROTOTYPE(config_parse_netdev_hw_addr);
 
 /* gperf */
 const struct ConfigPerfItem* network_netdev_gperf_lookup(const char *key, GPERF_LEN_TYPE length);

@@ -31,25 +31,27 @@ int bus_image_method_remove(
                 void *userdata,
                 sd_bus_error *error) {
 
-        _cleanup_close_pair_ int errno_pipe_fd[2] = { -1, -1 };
-        Image *image = userdata;
+        _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
+        Image *image = ASSERT_PTR(userdata);
         Manager *m = image->userdata;
         pid_t child;
         int r;
 
         assert(message);
-        assert(image);
 
         if (m->n_operations >= OPERATIONS_MAX)
                 return sd_bus_error_set(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Too many ongoing operations.");
 
+        const char *details[] = {
+                "image", image->name,
+                "verb", "remove",
+                NULL
+        };
+
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
-                        NULL,
-                        false,
-                        UID_INVALID,
+                        details,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -65,25 +67,19 @@ int bus_image_method_remove(
                 return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
         if (r == 0) {
                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
-
                 r = image_remove(image);
-                if (r < 0) {
-                        (void) write(errno_pipe_fd[1], &r, sizeof(r));
-                        _exit(EXIT_FAILURE);
-                }
-
-                _exit(EXIT_SUCCESS);
+                report_errno_and_exit(errno_pipe_fd[1], r);
         }
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = operation_new(m, NULL, child, message, errno_pipe_fd[0], NULL);
+        r = operation_new_with_bus_reply(m, /* machine= */ NULL, child, message, errno_pipe_fd[0], /* ret= */ NULL);
         if (r < 0) {
                 (void) sigkill_wait(child);
                 return r;
         }
 
-        errno_pipe_fd[0] = -1;
+        errno_pipe_fd[0] = -EBADF;
 
         return 1;
 }
@@ -93,13 +89,12 @@ int bus_image_method_rename(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Image *image = userdata;
+        Image *image = ASSERT_PTR(userdata);
         Manager *m = image->userdata;
         const char *new_name;
         int r;
 
         assert(message);
-        assert(image);
 
         r = sd_bus_message_read(message, "s", &new_name);
         if (r < 0)
@@ -108,13 +103,17 @@ int bus_image_method_rename(
         if (!image_name_is_valid(new_name))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Image name '%s' is invalid.", new_name);
 
+        const char *details[] = {
+                "image", image->name,
+                "verb", "rename",
+                "new_name", new_name,
+                NULL
+        };
+
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
-                        NULL,
-                        false,
-                        UID_INVALID,
+                        details,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -122,9 +121,9 @@ int bus_image_method_rename(
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = image_rename(image, new_name);
+        r = rename_image_and_update_cache(m, image, new_name);
         if (r < 0)
-                return r;
+                return sd_bus_error_set_errnof(error, r, "Failed to rename image: %m");
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -134,16 +133,14 @@ int bus_image_method_clone(
                 void *userdata,
                 sd_bus_error *error) {
 
-        _cleanup_close_pair_ int errno_pipe_fd[2] = { -1, -1 };
-        Image *image = userdata;
-        Manager *m = image->userdata;
+        _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
+        Image *image = ASSERT_PTR(userdata);
+        Manager *m = ASSERT_PTR(image->userdata);
         const char *new_name;
         int r, read_only;
         pid_t child;
 
         assert(message);
-        assert(image);
-        assert(m);
 
         if (m->n_operations >= OPERATIONS_MAX)
                 return sd_bus_error_set(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Too many ongoing operations.");
@@ -155,13 +152,17 @@ int bus_image_method_clone(
         if (!image_name_is_valid(new_name))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Image name '%s' is invalid.", new_name);
 
+        const char *details[] = {
+                "image", image->name,
+                "verb", "clone",
+                "new_name", new_name,
+                NULL
+        };
+
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
-                        NULL,
-                        false,
-                        UID_INVALID,
+                        details,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -177,25 +178,19 @@ int bus_image_method_clone(
                 return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
         if (r == 0) {
                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
-
-                r = image_clone(image, new_name, read_only);
-                if (r < 0) {
-                        (void) write(errno_pipe_fd[1], &r, sizeof(r));
-                        _exit(EXIT_FAILURE);
-                }
-
-                _exit(EXIT_SUCCESS);
+                r = image_clone(image, new_name, read_only, m->runtime_scope);
+                report_errno_and_exit(errno_pipe_fd[1], r);
         }
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = operation_new(m, NULL, child, message, errno_pipe_fd[0], NULL);
+        r = operation_new_with_bus_reply(m, /* machine= */ NULL, child, message, errno_pipe_fd[0], /* ret= */ NULL);
         if (r < 0) {
                 (void) sigkill_wait(child);
                 return r;
         }
 
-        errno_pipe_fd[0] = -1;
+        errno_pipe_fd[0] = -EBADF;
 
         return 1;
 }
@@ -207,7 +202,7 @@ int bus_image_method_mark_read_only(
 
         Image *image = userdata;
         Manager *m = image->userdata;
-        int r, read_only;
+        int read_only, r;
 
         assert(message);
 
@@ -215,13 +210,17 @@ int bus_image_method_mark_read_only(
         if (r < 0)
                 return r;
 
+        const char *details[] = {
+                "image", image->name,
+                "verb", "mark_read_only",
+                "read_only", one_zero(read_only),
+                NULL
+        };
+
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
-                        NULL,
-                        false,
-                        UID_INVALID,
+                        details,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -254,13 +253,16 @@ int bus_image_method_set_limit(
         if (!FILE_SIZE_VALID_OR_INFINITY(limit))
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "New limit out of range");
 
+        const char *details[] = {
+                "machine", image->name,
+                "verb", "set_limit",
+                NULL
+        };
+
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
-                        NULL,
-                        false,
-                        UID_INVALID,
+                        details,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -284,7 +286,7 @@ int bus_image_method_get_hostname(
         int r;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image);
+                r = image_read_metadata(image, &image_policy_container);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -302,7 +304,7 @@ int bus_image_method_get_machine_id(
         int r;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image);
+                r = image_read_metadata(image, &image_policy_container);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -330,7 +332,7 @@ int bus_image_method_get_machine_info(
         int r;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image);
+                r = image_read_metadata(image, &image_policy_container);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -347,7 +349,7 @@ int bus_image_method_get_os_release(
         int r;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image);
+                r = image_read_metadata(image, &image_policy_container);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -355,20 +357,10 @@ int bus_image_method_get_os_release(
         return bus_reply_pair_array(message, image->os_release);
 }
 
-static int image_flush_cache(sd_event_source *s, void *userdata) {
-        Manager *m = userdata;
-
-        assert(s);
-        assert(m);
-
-        hashmap_clear(m->image_cache);
-        return 0;
-}
-
 static int image_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
         _cleanup_free_ char *e = NULL;
         Manager *m = userdata;
-        Image *image = NULL;
+        Image *image;
         const char *p;
         int r;
 
@@ -385,45 +377,17 @@ static int image_object_find(sd_bus *bus, const char *path, const char *interfac
         if (!e)
                 return -ENOMEM;
 
-        image = hashmap_get(m->image_cache, e);
-        if (image) {
-                *found = image;
-                return 1;
-        }
-
-        if (!m->image_cache_defer_event) {
-                r = sd_event_add_defer(m->event, &m->image_cache_defer_event, image_flush_cache, m);
-                if (r < 0)
-                        return r;
-
-                r = sd_event_source_set_priority(m->image_cache_defer_event, SD_EVENT_PRIORITY_IDLE);
-                if (r < 0)
-                        return r;
-        }
-
-        r = sd_event_source_set_enabled(m->image_cache_defer_event, SD_EVENT_ONESHOT);
-        if (r < 0)
-                return r;
-
-        r = image_find(IMAGE_MACHINE, e, NULL, &image);
+        r = manager_acquire_image(m, e, &image);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
                 return r;
 
-        image->userdata = m;
-
-        r = hashmap_ensure_put(&m->image_cache, &image_hash_ops, image->name, image);
-        if (r < 0) {
-                image_unref(image);
-                return r;
-        }
-
         *found = image;
         return 1;
 }
 
-char *image_bus_path(const char *name) {
+char* image_bus_path(const char *name) {
         _cleanup_free_ char *e = NULL;
 
         assert(name);
@@ -438,6 +402,7 @@ char *image_bus_path(const char *name) {
 static int image_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
         _cleanup_hashmap_free_ Hashmap *images = NULL;
         _cleanup_strv_free_ char **l = NULL;
+        Manager *m = ASSERT_PTR(userdata);
         Image *image;
         int r;
 
@@ -449,7 +414,7 @@ static int image_node_enumerator(sd_bus *bus, const char *path, void *userdata, 
         if (!images)
                 return -ENOMEM;
 
-        r = image_discover(IMAGE_MACHINE, NULL, images);
+        r = image_discover(m->runtime_scope, IMAGE_MACHINE, NULL, images);
         if (r < 0)
                 return r;
 

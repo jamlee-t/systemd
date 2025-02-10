@@ -1,148 +1,78 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "networkd-address.h"
-#include "networkd-address-label.h"
-#include "networkd-bridge-fdb.h"
-#include "networkd-bridge-mdb.h"
-#include "networkd-dhcp-server.h"
-#include "networkd-dhcp4.h"
-#include "networkd-dhcp6.h"
-#include "networkd-ipv6-proxy-ndp.h"
+#include "netdev.h"
+#include "netlink-util.h"
+#include "networkd-link.h"
 #include "networkd-manager.h"
-#include "networkd-neighbor.h"
-#include "networkd-nexthop.h"
-#include "networkd-route.h"
-#include "networkd-routing-policy-rule.h"
 #include "networkd-queue.h"
-#include "networkd-setlink.h"
+#include "string-table.h"
 
-static void request_free_object(RequestType type, void *object) {
-        switch(type) {
-        case REQUEST_TYPE_ACTIVATE_LINK:
-                break;
-        case REQUEST_TYPE_ADDRESS:
-                address_free(object);
-                break;
-        case REQUEST_TYPE_ADDRESS_LABEL:
-                address_label_free(object);
-                break;
-        case REQUEST_TYPE_BRIDGE_FDB:
-                bridge_fdb_free(object);
-                break;
-        case REQUEST_TYPE_BRIDGE_MDB:
-                bridge_mdb_free(object);
-                break;
-        case REQUEST_TYPE_DHCP_SERVER:
-        case REQUEST_TYPE_DHCP4_CLIENT:
-        case REQUEST_TYPE_DHCP6_CLIENT:
-                break;
-        case REQUEST_TYPE_IPV6_PROXY_NDP:
-                free(object);
-                break;
-        case REQUEST_TYPE_NEIGHBOR:
-                neighbor_free(object);
-                break;
-        case REQUEST_TYPE_NEXTHOP:
-                nexthop_free(object);
-                break;
-        case REQUEST_TYPE_RADV:
-                break;
-        case REQUEST_TYPE_ROUTE:
-                route_free(object);
-                break;
-        case REQUEST_TYPE_ROUTING_POLICY_RULE:
-                routing_policy_rule_free(object);
-                break;
-        case REQUEST_TYPE_SET_LINK:
-        case REQUEST_TYPE_STACKED_NETDEV:
-        case REQUEST_TYPE_UP_DOWN:
-                break;
-        default:
-                assert_not_reached();
-        }
+#define REPLY_CALLBACK_COUNT_THRESHOLD 128
+
+static Request* request_detach_impl(Request *req) {
+        assert(req);
+
+        if (!req->manager)
+                return NULL;
+
+        ordered_set_remove(req->manager->request_queue, req);
+        req->manager = NULL;
+        return req;
+}
+
+void request_detach(Request *req) {
+        request_unref(request_detach_impl(req));
 }
 
 static Request *request_free(Request *req) {
         if (!req)
                 return NULL;
 
-        if (req->link && req->link->manager)
-                /* To prevent from triggering assertions in hash functions, remove this request before
-                 * freeing object below. */
-                ordered_set_remove(req->link->manager->request_queue, req);
-        if (req->consume_object)
-                request_free_object(req->type, req->object);
-        link_unref(req->link);
+        /* To prevent from triggering assertions in the hash and compare functions, remove this request
+         * from the set before freeing userdata below. */
+        request_detach_impl(req);
+
+        if (req->free_func)
+                req->free_func(req->userdata);
+
+        if (req->counter)
+                (*req->counter)--;
+
+        link_unref(req->link); /* link may be NULL, but link_unref() can handle it gracefully. */
 
         return mfree(req);
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(Request*, request_free);
+DEFINE_TRIVIAL_REF_UNREF_FUNC(Request, request, request_free);
 
-void request_drop(Request *req) {
-        if (!req)
-                return;
+static void request_destroy_callback(Request *req) {
+        assert(req);
 
-        if (req->message_counter)
-                (*req->message_counter)--;
-
-        request_free(req);
+        request_detach(req);
+        request_unref(req);
 }
 
 static void request_hash_func(const Request *req, struct siphash *state) {
         assert(req);
-        assert(req->link);
         assert(state);
 
-        siphash24_compress(&req->link->ifindex, sizeof(req->link->ifindex), state);
-        siphash24_compress(&req->type, sizeof(req->type), state);
+        siphash24_compress_typesafe(req->type, state);
 
-        switch(req->type) {
-        case REQUEST_TYPE_ACTIVATE_LINK:
-                break;
-        case REQUEST_TYPE_ADDRESS:
-                address_hash_func(req->address, state);
-                break;
-        case REQUEST_TYPE_ADDRESS_LABEL:
-        case REQUEST_TYPE_BRIDGE_FDB:
-        case REQUEST_TYPE_BRIDGE_MDB:
-        case REQUEST_TYPE_STACKED_NETDEV:
-                /* TODO: Currently, these types do not have any specific hash and compare functions.
-                 * Fortunately, all these objects are 'static', thus we can use the trivial functions. */
-                trivial_hash_func(req->object, state);
-                break;
-        case REQUEST_TYPE_DHCP_SERVER:
-        case REQUEST_TYPE_DHCP4_CLIENT:
-        case REQUEST_TYPE_DHCP6_CLIENT:
-                /* These types do not have an object. */
-                break;
-        case REQUEST_TYPE_IPV6_PROXY_NDP:
-                in6_addr_hash_func(req->ipv6_proxy_ndp, state);
-                break;
-        case REQUEST_TYPE_NEIGHBOR:
-                neighbor_hash_func(req->neighbor, state);
-                break;
-        case REQUEST_TYPE_NEXTHOP:
-                nexthop_hash_func(req->nexthop, state);
-                break;
-        case REQUEST_TYPE_RADV:
-                /* This type does not have an object. */
-                break;
-        case REQUEST_TYPE_ROUTE:
-                route_hash_func(req->route, state);
-                break;
-        case REQUEST_TYPE_ROUTING_POLICY_RULE:
-                routing_policy_rule_hash_func(req->rule, state);
-                break;
-        case REQUEST_TYPE_SET_LINK: {
-                trivial_hash_func(req->set_link_operation_ptr, state);
-                break;
+        if (!IN_SET(req->type,
+                    REQUEST_TYPE_NEXTHOP,
+                    REQUEST_TYPE_ROUTE,
+                    REQUEST_TYPE_ROUTING_POLICY_RULE)) {
+
+                siphash24_compress_boolean(req->link, state);
+                if (req->link)
+                        siphash24_compress_typesafe(req->link->ifindex, state);
         }
-        case REQUEST_TYPE_UP_DOWN:
-                break;
-        default:
-                assert_not_reached();
-        }
+
+        siphash24_compress_typesafe(req->hash_func, state);
+        siphash24_compress_typesafe(req->compare_func, state);
+
+        if (req->hash_func)
+                req->hash_func(req->userdata, state);
 }
 
 static int request_compare_func(const struct Request *a, const struct Request *b) {
@@ -150,50 +80,39 @@ static int request_compare_func(const struct Request *a, const struct Request *b
 
         assert(a);
         assert(b);
-        assert(a->link);
-        assert(b->link);
-
-        r = CMP(a->link->ifindex, b->link->ifindex);
-        if (r != 0)
-                return r;
 
         r = CMP(a->type, b->type);
         if (r != 0)
                 return r;
 
-        switch (a->type) {
-        case REQUEST_TYPE_ACTIVATE_LINK:
-                return 0;
-        case REQUEST_TYPE_ADDRESS:
-                return address_compare_func(a->address, b->address);
-        case REQUEST_TYPE_ADDRESS_LABEL:
-        case REQUEST_TYPE_BRIDGE_FDB:
-        case REQUEST_TYPE_BRIDGE_MDB:
-        case REQUEST_TYPE_STACKED_NETDEV:
-                return trivial_compare_func(a->object, b->object);
-        case REQUEST_TYPE_DHCP_SERVER:
-        case REQUEST_TYPE_DHCP4_CLIENT:
-        case REQUEST_TYPE_DHCP6_CLIENT:
-                return 0;
-        case REQUEST_TYPE_IPV6_PROXY_NDP:
-                return in6_addr_compare_func(a->ipv6_proxy_ndp, b->ipv6_proxy_ndp);
-        case REQUEST_TYPE_NEIGHBOR:
-                return neighbor_compare_func(a->neighbor, b->neighbor);
-        case REQUEST_TYPE_NEXTHOP:
-                return nexthop_compare_func(a->nexthop, b->nexthop);
-        case REQUEST_TYPE_ROUTE:
-                return route_compare_func(a->route, b->route);
-        case REQUEST_TYPE_RADV:
-                return 0;
-        case REQUEST_TYPE_ROUTING_POLICY_RULE:
-                return routing_policy_rule_compare_func(a->rule, b->rule);
-        case REQUEST_TYPE_SET_LINK:
-                return trivial_compare_func(a->set_link_operation_ptr, b->set_link_operation_ptr);
-        case REQUEST_TYPE_UP_DOWN:
-                return 0;
-        default:
-                assert_not_reached();
+        if (!IN_SET(a->type,
+                    REQUEST_TYPE_NEXTHOP,
+                    REQUEST_TYPE_ROUTE,
+                    REQUEST_TYPE_ROUTING_POLICY_RULE)) {
+
+                r = CMP(!!a->link, !!b->link);
+                if (r != 0)
+                        return r;
+
+                if (a->link) {
+                        r = CMP(a->link->ifindex, b->link->ifindex);
+                        if (r != 0)
+                                return r;
+                }
         }
+
+        r = CMP(PTR_TO_UINT64(a->hash_func), PTR_TO_UINT64(b->hash_func));
+        if (r != 0)
+                return r;
+
+        r = CMP(PTR_TO_UINT64(a->compare_func), PTR_TO_UINT64(b->compare_func));
+        if (r != 0)
+                return r;
+
+        if (a->compare_func)
+                return a->compare_func(a->userdata, b->userdata);
+
+        return 0;
 }
 
 DEFINE_PRIVATE_HASH_OPS_WITH_KEY_DESTRUCTOR(
@@ -201,72 +120,72 @@ DEFINE_PRIVATE_HASH_OPS_WITH_KEY_DESTRUCTOR(
                 Request,
                 request_hash_func,
                 request_compare_func,
-                request_free);
+                request_detach);
 
-int link_queue_request(
+static int request_new(
+                Manager *manager,
                 Link *link,
                 RequestType type,
-                void *object,
-                bool consume_object,
-                unsigned *message_counter,
-                link_netlink_message_handler_t netlink_handler,
+                void *userdata,
+                mfree_func_t free_func,
+                hash_func_t hash_func,
+                compare_func_t compare_func,
+                request_process_func_t process,
+                unsigned *counter,
+                request_netlink_handler_t netlink_handler,
                 Request **ret) {
 
-        _cleanup_(request_freep) Request *req = NULL;
+        _cleanup_(request_unrefp) Request *req = NULL;
         Request *existing;
         int r;
 
-        assert(link);
-        assert(link->manager);
-        assert(type >= 0 && type < _REQUEST_TYPE_MAX);
-        assert(IN_SET(type,
-                      REQUEST_TYPE_ACTIVATE_LINK,
-                      REQUEST_TYPE_DHCP_SERVER,
-                      REQUEST_TYPE_DHCP4_CLIENT,
-                      REQUEST_TYPE_DHCP6_CLIENT,
-                      REQUEST_TYPE_RADV,
-                      REQUEST_TYPE_SET_LINK,
-                      REQUEST_TYPE_UP_DOWN) ||
-               object);
-        assert(IN_SET(type,
-                      REQUEST_TYPE_DHCP_SERVER,
-                      REQUEST_TYPE_DHCP4_CLIENT,
-                      REQUEST_TYPE_DHCP6_CLIENT,
-                      REQUEST_TYPE_RADV) ||
-               netlink_handler);
+        assert(manager);
+        assert(process);
+
+        /* Note, requests will be processed only when the manager is in MANAGER_RUNNING. If a new operation
+         * is requested when the manager is in MANAGER_TERMINATING or MANAGER_RESTARTING, the request will be
+         * successfully queued but will never be processed. Then, here why we refuse new requests when the
+         * manager is in MANAGER_STOPPED? This is because we cannot call link_ref() in that case, as this may
+         * be called during link_free(), that means the reference counter of the link is already 0 and
+         * calling link_ref() below triggers assertion. */
+        if (manager->state == MANAGER_STOPPED)
+                return -EBUSY;
 
         req = new(Request, 1);
-        if (!req) {
-                if (consume_object)
-                        request_free_object(type, object);
+        if (!req)
                 return -ENOMEM;
-        }
 
         *req = (Request) {
-                .link = link_ref(link),
+                .n_ref = 1,
+                .link = link_ref(link), /* link may be NULL, but link_ref() handles it gracefully. */
                 .type = type,
-                .object = object,
-                .consume_object = consume_object,
-                .message_counter = message_counter,
+                .userdata = userdata,
+                .hash_func = hash_func,
+                .compare_func = compare_func,
+                .process = process,
                 .netlink_handler = netlink_handler,
         };
 
-        existing = ordered_set_get(link->manager->request_queue, req);
+        existing = ordered_set_get(manager->request_queue, req);
         if (existing) {
-                /* To prevent from removing the existing request. */
-                req->link = link_unref(req->link);
-
                 if (ret)
                         *ret = existing;
                 return 0;
         }
 
-        r = ordered_set_ensure_put(&link->manager->request_queue, &request_hash_ops, req);
+        r = ordered_set_ensure_put(&manager->request_queue, &request_hash_ops, req);
         if (r < 0)
                 return r;
 
-        if (req->message_counter)
-                (*req->message_counter)++;
+        req->manager = manager;
+        req->free_func = free_func;
+        req->counter = counter;
+        if (req->counter)
+                (*req->counter)++;
+
+        /* If this is called in the ORDERED_SET_FOREACH() loop of manager_process_requests(), we need to
+         * exit from the loop, due to the limitation of the iteration on OrderedSet. */
+        manager->request_queued = true;
 
         if (ret)
                 *ret = req;
@@ -275,83 +194,312 @@ int link_queue_request(
         return 1;
 }
 
-int manager_process_requests(sd_event_source *s, void *userdata) {
-        Manager *manager = userdata;
+int netdev_queue_request(
+                NetDev *netdev,
+                request_process_func_t process,
+                Request **ret) {
+
+        int r;
+
+        assert(netdev);
+        assert(netdev->manager);
+
+        r = request_new(netdev->manager, NULL, REQUEST_TYPE_NETDEV_INDEPENDENT,
+                        netdev, (mfree_func_t) netdev_unref,
+                        trivial_hash_func, trivial_compare_func,
+                        process, NULL, NULL, ret);
+        if (r <= 0)
+                return r;
+
+        netdev_ref(netdev);
+        return 1;
+}
+
+int link_queue_request_full(
+                Link *link,
+                RequestType type,
+                void *userdata,
+                mfree_func_t free_func,
+                hash_func_t hash_func,
+                compare_func_t compare_func,
+                request_process_func_t process,
+                unsigned *counter,
+                request_netlink_handler_t netlink_handler,
+                Request **ret) {
+
+        assert(link);
+
+        return request_new(link->manager, link, type,
+                           userdata, free_func, hash_func, compare_func,
+                           process, counter, netlink_handler, ret);
+}
+
+int manager_queue_request_full(
+                Manager *manager,
+                RequestType type,
+                void *userdata,
+                mfree_func_t free_func,
+                hash_func_t hash_func,
+                compare_func_t compare_func,
+                request_process_func_t process,
+                unsigned *counter,
+                request_netlink_handler_t netlink_handler,
+                Request **ret) {
+
+        return request_new(manager, NULL, type,
+                           userdata, free_func, hash_func, compare_func,
+                           process, counter, netlink_handler, ret);
+}
+
+int link_requeue_request(Link *link, Request *req, void *userdata, Request **ret) {
+        assert(link);
+        assert(req);
+
+        return link_queue_request_full(
+                        link,
+                        req->type,
+                        userdata,
+                        req->free_func,
+                        req->hash_func,
+                        req->compare_func,
+                        req->process,
+                        req->counter,
+                        req->netlink_handler,
+                        ret);
+}
+
+int manager_process_requests(Manager *manager) {
+        Request *req;
         int r;
 
         assert(manager);
 
-        for (;;) {
-                bool processed = false;
-                Request *req;
+        /* Process only when no remove request is queued. */
+        if (!ordered_set_isempty(manager->remove_request_queue))
+                return 0;
 
-                ORDERED_SET_FOREACH(req, manager->request_queue) {
-                        switch(req->type) {
-                        case REQUEST_TYPE_ACTIVATE_LINK:
-                                r = request_process_activation(req);
+        manager->request_queued = false;
+
+        ORDERED_SET_FOREACH(req, manager->request_queue) {
+                if (req->waiting_reply)
+                        continue; /* Already processed, and waiting for netlink reply. */
+
+                /* Typically, requests send netlink message asynchronously. If there are many requests
+                 * queued, then this event may make reply callback queue in sd-netlink full. */
+                if (netlink_get_reply_callback_count(manager->rtnl) >= REPLY_CALLBACK_COUNT_THRESHOLD ||
+                    netlink_get_reply_callback_count(manager->genl) >= REPLY_CALLBACK_COUNT_THRESHOLD ||
+                    fw_ctx_get_reply_callback_count(manager->fw_ctx) >= REPLY_CALLBACK_COUNT_THRESHOLD)
+                        break;
+
+                /* Avoid the request and link freed by req->process() and request_detach(). */
+                _unused_ _cleanup_(request_unrefp) Request *req_unref = request_ref(req);
+                _cleanup_(link_unrefp) Link *link = link_ref(req->link);
+
+                assert(req->process);
+                r = req->process(req, link, req->userdata);
+                if (r < 0) {
+                        request_detach(req);
+
+                        if (link) {
+                                link_enter_failed(link);
+                                /* link_enter_failed() may detach multiple requests from the queue.
+                                 * Hence, we need to exit from the loop. */
                                 break;
-                        case REQUEST_TYPE_ADDRESS:
-                                r = request_process_address(req);
-                                break;
-                        case REQUEST_TYPE_ADDRESS_LABEL:
-                                r = request_process_address_label(req);
-                                break;
-                        case REQUEST_TYPE_BRIDGE_FDB:
-                                r = request_process_bridge_fdb(req);
-                                break;
-                        case REQUEST_TYPE_BRIDGE_MDB:
-                                r = request_process_bridge_mdb(req);
-                                break;
-                        case REQUEST_TYPE_DHCP_SERVER:
-                                r = request_process_dhcp_server(req);
-                                break;
-                        case REQUEST_TYPE_DHCP4_CLIENT:
-                                r = request_process_dhcp4_client(req);
-                                break;
-                        case REQUEST_TYPE_DHCP6_CLIENT:
-                                r = request_process_dhcp6_client(req);
-                                break;
-                        case REQUEST_TYPE_IPV6_PROXY_NDP:
-                                r = request_process_ipv6_proxy_ndp_address(req);
-                                break;
-                        case REQUEST_TYPE_NEIGHBOR:
-                                r = request_process_neighbor(req);
-                                break;
-                        case REQUEST_TYPE_NEXTHOP:
-                                r = request_process_nexthop(req);
-                                break;
-                        case REQUEST_TYPE_RADV:
-                                r = request_process_radv(req);
-                                break;
-                        case REQUEST_TYPE_ROUTE:
-                                r = request_process_route(req);
-                                break;
-                        case REQUEST_TYPE_ROUTING_POLICY_RULE:
-                                r = request_process_routing_policy_rule(req);
-                                break;
-                        case REQUEST_TYPE_SET_LINK:
-                                r = request_process_set_link(req);
-                                break;
-                        case REQUEST_TYPE_STACKED_NETDEV:
-                                r = request_process_stacked_netdev(req);
-                                break;
-                        case REQUEST_TYPE_UP_DOWN:
-                                r = request_process_link_up_or_down(req);
-                                break;
-                        default:
-                                return -EINVAL;
-                        }
-                        if (r < 0)
-                                link_enter_failed(req->link);
-                        if (r > 0) {
-                                ordered_set_remove(manager->request_queue, req);
-                                request_free(req);
-                                processed = true;
                         }
                 }
+                if (r > 0 && !req->waiting_reply)
+                        /* If the request sends netlink message, e.g. for Address or so, the Request object is
+                         * referenced by the netlink slot, and will be detached later by its destroy callback.
+                         * Otherwise, e.g. for DHCP client or so, detach the request from queue now. */
+                        request_detach(req);
 
-                if (!processed)
-                        break;
+                if (manager->request_queued)
+                        break; /* New request is queued. Exit from the loop. */
+        }
+
+        return 0;
+}
+
+static int request_netlink_handler(sd_netlink *nl, sd_netlink_message *m, Request *req) {
+        assert(req);
+
+        if (req->counter) {
+                assert(*req->counter > 0);
+                (*req->counter)--;
+                req->counter = NULL; /* To prevent double decrement on free. */
+        }
+
+        if (req->link && IN_SET(req->link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
+                return 0;
+
+        if (req->netlink_handler)
+                return req->netlink_handler(nl, m, req, req->link, req->userdata);
+
+        return 0;
+}
+
+int request_call_netlink_async(sd_netlink *nl, sd_netlink_message *m, Request *req) {
+        int r;
+
+        assert(nl);
+        assert(m);
+        assert(req);
+
+        r = netlink_call_async(nl, NULL, m, request_netlink_handler, request_destroy_callback, req);
+        if (r < 0)
+                return r;
+
+        request_ref(req);
+        req->waiting_reply = true;
+        return 0;
+}
+
+static const char *const request_type_table[_REQUEST_TYPE_MAX] = {
+        [REQUEST_TYPE_ACTIVATE_LINK]                    = "activate link",
+        [REQUEST_TYPE_ADDRESS]                          = "address",
+        [REQUEST_TYPE_ADDRESS_LABEL]                    = "address label",
+        [REQUEST_TYPE_BRIDGE_FDB]                       = "bridge FDB",
+        [REQUEST_TYPE_BRIDGE_MDB]                       = "bridge MDB",
+        [REQUEST_TYPE_DHCP_SERVER]                      = "DHCP server",
+        [REQUEST_TYPE_DHCP4_CLIENT]                     = "DHCPv4 client",
+        [REQUEST_TYPE_DHCP6_CLIENT]                     = "DHCPv6 client",
+        [REQUEST_TYPE_IPV6_PROXY_NDP]                   = "IPv6 proxy NDP",
+        [REQUEST_TYPE_NDISC]                            = "NDisc",
+        [REQUEST_TYPE_NEIGHBOR]                         = "neighbor",
+        [REQUEST_TYPE_NETDEV_INDEPENDENT]               = "independent netdev",
+        [REQUEST_TYPE_NETDEV_STACKED]                   = "stacked netdev",
+        [REQUEST_TYPE_NEXTHOP]                          = "nexthop",
+        [REQUEST_TYPE_RADV]                             = "RADV",
+        [REQUEST_TYPE_ROUTE]                            = "route",
+        [REQUEST_TYPE_ROUTING_POLICY_RULE]              = "routing policy rule",
+        [REQUEST_TYPE_SET_LINK_ADDRESS_GENERATION_MODE] = "IPv6LL address generation mode",
+        [REQUEST_TYPE_SET_LINK_BOND]                    = "bond configurations",
+        [REQUEST_TYPE_SET_LINK_BRIDGE]                  = "bridge configurations",
+        [REQUEST_TYPE_SET_LINK_BRIDGE_VLAN]             = "bridge VLAN configurations (step 1)",
+        [REQUEST_TYPE_DEL_LINK_BRIDGE_VLAN]             = "bridge VLAN configurations (step 2)",
+        [REQUEST_TYPE_SET_LINK_CAN]                     = "CAN interface configurations",
+        [REQUEST_TYPE_SET_LINK_FLAGS]                   = "link flags",
+        [REQUEST_TYPE_SET_LINK_GROUP]                   = "interface group",
+        [REQUEST_TYPE_SET_LINK_IPOIB]                   = "IPoIB configurations",
+        [REQUEST_TYPE_SET_LINK_MAC]                     = "MAC address",
+        [REQUEST_TYPE_SET_LINK_MASTER]                  = "master interface",
+        [REQUEST_TYPE_SET_LINK_MTU]                     = "MTU",
+        [REQUEST_TYPE_SRIOV]                            = "SR-IOV",
+        [REQUEST_TYPE_TC_QDISC]                         = "QDisc",
+        [REQUEST_TYPE_TC_CLASS]                         = "TClass",
+        [REQUEST_TYPE_UP_DOWN]                          = "bring link up or down",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(request_type, RequestType);
+
+static RemoveRequest* remove_request_free(RemoveRequest *req) {
+        if (!req)
+                return NULL;
+
+        if (req->manager)
+                ordered_set_remove(req->manager->remove_request_queue, req);
+
+        if (req->unref_func)
+                req->unref_func(req->userdata);
+
+        link_unref(req->link);
+        sd_netlink_unref(req->netlink);
+        sd_netlink_message_unref(req->message);
+
+        return mfree(req);
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(RemoveRequest*, remove_request_free);
+DEFINE_TRIVIAL_DESTRUCTOR(remove_request_destroy_callback, RemoveRequest, remove_request_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_KEY_DESTRUCTOR(
+                remove_request_hash_ops,
+                void,
+                trivial_hash_func,
+                trivial_compare_func,
+                remove_request_free);
+
+int remove_request_add(
+                Manager *manager,
+                Link *link,
+                void *userdata,
+                mfree_func_t unref_func,
+                sd_netlink *netlink,
+                sd_netlink_message *message,
+                remove_request_netlink_handler_t netlink_handler) {
+
+        _cleanup_(remove_request_freep) RemoveRequest *req = NULL;
+        int r;
+
+        assert(manager);
+        assert(userdata);
+        assert(netlink);
+        assert(message);
+
+        /* Unlike request_new(), remove requests will be also processed when the manager is in
+         * MANAGER_TERMINATING or MANAGER_RESTARTING. When the manager is in MANAGER_STOPPED, we cannot
+         * queue new remove requests anymore with the same reason explained in request_new(). */
+        if (manager->state == MANAGER_STOPPED)
+                return 0; /* ignored */
+
+        req = new(RemoveRequest, 1);
+        if (!req)
+                return -ENOMEM;
+
+        *req = (RemoveRequest) {
+                .link = link_ref(link), /* link may be NULL, but link_ref() handles it gracefully. */
+                .userdata = userdata,
+                .netlink = sd_netlink_ref(netlink),
+                .message = sd_netlink_message_ref(message),
+                .netlink_handler = netlink_handler,
+        };
+
+        r = ordered_set_ensure_put(&manager->remove_request_queue, &remove_request_hash_ops, req);
+        if (r < 0)
+                return r;
+        assert(r > 0);
+
+        req->manager = manager;
+        req->unref_func = unref_func;
+
+        TAKE_PTR(req);
+        return 1; /* queued */
+}
+
+int manager_process_remove_requests(Manager *manager) {
+        RemoveRequest *req;
+        int r;
+
+        assert(manager);
+
+        while ((req = ordered_set_first(manager->remove_request_queue))) {
+
+                /* Do not make the reply callback queue in sd-netlink full. */
+                if (netlink_get_reply_callback_count(req->netlink) >= REPLY_CALLBACK_COUNT_THRESHOLD)
+                        return 0;
+
+                r = netlink_call_async(
+                                req->netlink, NULL, req->message,
+                                req->netlink_handler,
+                                remove_request_destroy_callback,
+                                req);
+                if (r < 0) {
+                        _cleanup_(link_unrefp) Link *link = link_ref(req->link);
+
+                        log_link_warning_errno(link, r, "Failed to call netlink message: %m");
+
+                        /* First free the request. */
+                        remove_request_free(req);
+
+                        /* Then, make the link enter the failed state. */
+                        if (link)
+                                link_enter_failed(link);
+
+                } else {
+                        /* On success, netlink needs to be unref()ed. Otherwise, the netlink and remove
+                         * request may not freed on shutting down. */
+                        req->netlink = sd_netlink_unref(req->netlink);
+                        ordered_set_remove(manager->remove_request_queue, req);
+                }
         }
 
         return 0;

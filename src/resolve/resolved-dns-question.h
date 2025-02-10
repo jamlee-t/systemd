@@ -21,7 +21,7 @@ struct DnsQuestionItem {
 struct DnsQuestion {
         unsigned n_ref;
         size_t n_keys, n_allocated;
-        DnsQuestionItem items[0];
+        DnsQuestionItem items[];
 };
 
 DnsQuestion *dns_question_new(size_t n);
@@ -45,7 +45,7 @@ int dns_question_cname_redirect(DnsQuestion *q, const DnsResourceRecord *cname, 
 
 void dns_question_dump(DnsQuestion *q, FILE *f);
 
-const char *dns_question_first_name(DnsQuestion *q);
+const char* dns_question_first_name(DnsQuestion *q);
 
 static inline DnsResourceKey *dns_question_first_key(DnsQuestion *q) {
         return (q && q->n_keys > 0) ? q->items[0].key : NULL;
@@ -58,6 +58,8 @@ static inline size_t dns_question_size(DnsQuestion *q) {
 static inline bool dns_question_isempty(DnsQuestion *q) {
         return dns_question_size(q) <= 0;
 }
+
+int dns_question_merge(DnsQuestion *a, DnsQuestion *b, DnsQuestion **ret);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(DnsQuestion*, dns_question_unref);
 

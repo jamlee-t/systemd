@@ -13,37 +13,42 @@
 typedef struct Link Link;
 typedef struct Manager Manager;
 typedef struct Network Network;
-typedef struct Request Request;
 
 typedef struct Neighbor {
         Network *network;
         Link *link;
-        NetworkConfigSection *section;
+        ConfigSection *section;
         NetworkConfigSource source;
         NetworkConfigState state;
 
-        int family;
-        union in_addr_union in_addr;
+        unsigned n_ref;
+
+        struct in_addr_data dst_addr;
         struct hw_addr_data ll_addr;
 } Neighbor;
 
-Neighbor *neighbor_free(Neighbor *neighbor);
+Neighbor* neighbor_ref(Neighbor *neighbor);
+Neighbor* neighbor_unref(Neighbor *neighbor);
 
-void neighbor_hash_func(const Neighbor *neighbor, struct siphash *state);
-int neighbor_compare_func(const Neighbor *a, const Neighbor *b);
+int neighbor_get(Link *link, const Neighbor *in, Neighbor **ret);
+int neighbor_remove(Neighbor *neighbor, Link *link);
 
-void network_drop_invalid_neighbors(Network *network);
+int network_drop_invalid_neighbors(Network *network);
 
-int link_drop_neighbors(Link *link);
-int link_drop_foreign_neighbors(Link *link);
-void link_foreignize_neighbors(Link *link);
+int link_drop_static_neighbors(Link *link);
+int link_drop_unmanaged_neighbors(Link *link);
 
 int link_request_static_neighbors(Link *link);
-int request_process_neighbor(Request *req);
 
 int manager_rtnl_process_neighbor(sd_netlink *rtnl, sd_netlink_message *message, Manager *m);
 
 DEFINE_NETWORK_CONFIG_STATE_FUNCTIONS(Neighbor, neighbor);
 
-CONFIG_PARSER_PROTOTYPE(config_parse_neighbor_address);
-CONFIG_PARSER_PROTOTYPE(config_parse_neighbor_lladdr);
+typedef enum NeighborConfParserType {
+        NEIGHBOR_DESTINATION_ADDRESS,
+        NEIGHBOR_LINK_LAYER_ADDRESS,
+        _NEIGHBOR_CONF_PARSER_MAX,
+        _NEIGHBOR_CONF_PARSER_INVALID = -EINVAL,
+} NeighborConfParserType;
+
+CONFIG_PARSER_PROTOTYPE(config_parse_neighbor_section);

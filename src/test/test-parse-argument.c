@@ -6,36 +6,30 @@
 #include "stdio-util.h"
 #include "tests.h"
 
-static void test_parse_json_argument(void) {
-        log_info("/* %s */", __func__);
-
-        JsonFormatFlags flags = JSON_FORMAT_PRETTY;
+TEST(parse_json_argument) {
+        sd_json_format_flags_t flags = SD_JSON_FORMAT_PRETTY;
 
         assert_se(parse_json_argument("help", &flags) == 0);
-        assert_se(flags == JSON_FORMAT_PRETTY);
+        assert_se(flags == SD_JSON_FORMAT_PRETTY);
 
         assert_se(parse_json_argument("off", &flags) == 1);
-        assert_se(flags == JSON_FORMAT_OFF);
+        assert_se(flags == SD_JSON_FORMAT_OFF);
 }
 
-static void test_parse_path_argument(void) {
-        log_info("/* %s */", __func__);
-
+TEST(parse_path_argument) {
         _cleanup_free_ char *path = NULL;
 
         assert_se(parse_path_argument("help", false, &path) == 0);
-        assert_se(streq(basename(path), "help"));
+        ASSERT_STREQ(basename(path), "help");
 
         assert_se(parse_path_argument("/", false, &path) == 0);
-        assert_se(streq(path, "/"));
+        ASSERT_STREQ(path, "/");
 
         assert_se(parse_path_argument("/", true, &path) == 0);
-        assert_se(path == NULL);
+        ASSERT_NULL(path);
 }
 
-static void test_parse_signal_argument(void) {
-        log_info("/* %s */", __func__);
-
+TEST(parse_signal_argument) {
         int  signal = -1;
 
         assert_se(parse_signal_argument("help", &signal) == 0);
@@ -56,10 +50,4 @@ static void test_parse_signal_argument(void) {
         assert_se(signal == SIGABRT);
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_INFO);
-
-        test_parse_json_argument();
-        test_parse_path_argument();
-        test_parse_signal_argument();
-}
+DEFINE_TEST_MAIN(LOG_INFO);

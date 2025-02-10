@@ -2,6 +2,7 @@
 
 #include "sd-bus.h"
 
+#include "ansi-color.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
 #include "bus-locator.h"
@@ -35,20 +36,24 @@ static const struct {
         { "force-reload",          "ReloadOrTryRestartUnit", "reload-or-try-restart" }, /* legacy alias */
 };
 
-static const char *verb_to_method(const char *verb) {
-       for (size_t i = 0; i < ELEMENTSOF(unit_actions); i++)
-                if (streq_ptr(unit_actions[i].verb, verb))
-                        return unit_actions[i].method;
+static const char* verb_to_method(const char *verb) {
+        assert(verb);
 
-       return "StartUnit";
+        FOREACH_ELEMENT(i, unit_actions)
+                if (streq(i->verb, verb))
+                        return i->method;
+
+        return "StartUnit";
 }
 
-static const char *verb_to_job_type(const char *verb) {
-       for (size_t i = 0; i < ELEMENTSOF(unit_actions); i++)
-                if (streq_ptr(unit_actions[i].verb, verb))
-                        return unit_actions[i].job_type;
+static const char* verb_to_job_type(const char *verb) {
+        assert(verb);
 
-       return "start";
+        FOREACH_ELEMENT(i, unit_actions)
+                if (streq(i->verb, verb))
+                        return i->job_type;
+
+        return "start";
 }
 
 static int start_unit_one(
@@ -162,14 +167,22 @@ fail:
         if (arg_action != ACTION_SYSTEMCTL)
                 return r;
 
+        if (sd_bus_error_has_name(error, BUS_ERROR_UNIT_MASKED) &&
+            STR_IN_SET(method, "TryRestartUnit", "ReloadOrTryRestartUnit")) {
+                /* Ignore masked unit if try-* is requested */
+
+                log_debug_errno(r, "Failed to %s %s, ignoring: %s", job_type, name, bus_error_message(error, r));
+                return 0;
+        }
+
         log_error_errno(r, "Failed to %s %s: %s", job_type, name, bus_error_message(error, r));
 
         if (!sd_bus_error_has_names(error, BUS_ERROR_NO_SUCH_UNIT,
                                            BUS_ERROR_UNIT_MASKED,
                                            BUS_ERROR_JOB_TYPE_NOT_APPLICABLE))
                 log_error("See %s logs and 'systemctl%s status%s %s' for details.",
-                          arg_scope == UNIT_FILE_SYSTEM ? "system" : "user",
-                          arg_scope == UNIT_FILE_SYSTEM ? "" : " --user",
+                          runtime_scope_to_string(arg_runtime_scope),
+                          arg_runtime_scope == RUNTIME_SCOPE_SYSTEM ? "" : " --user",
                           name[0] == '-' ? " --" : "",
                           name);
 
@@ -199,16 +212,13 @@ static int enqueue_marked_jobs(
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        if (w) {
-                char **path;
-
+        if (w)
                 STRV_FOREACH(path, paths) {
                         log_debug("Adding %s to the set", *path);
                         r = bus_wait_for_jobs_add(w, *path);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to watch job %s: %m", *path);
                 }
-        }
 
         return 0;
 }
@@ -218,6 +228,7 @@ const struct action_metadata action_table[_ACTION_MAX] = {
         [ACTION_POWEROFF]               = { SPECIAL_POWEROFF_TARGET,               "poweroff",               "replace-irreversibly" },
         [ACTION_REBOOT]                 = { SPECIAL_REBOOT_TARGET,                 "reboot",                 "replace-irreversibly" },
         [ACTION_KEXEC]                  = { SPECIAL_KEXEC_TARGET,                  "kexec",                  "replace-irreversibly" },
+        [ACTION_SOFT_REBOOT]            = { SPECIAL_SOFT_REBOOT_TARGET,            "soft-reboot",            "replace-irreversibly" },
         [ACTION_RUNLEVEL2]              = { SPECIAL_MULTI_USER_TARGET,             NULL,                     "isolate"              },
         [ACTION_RUNLEVEL3]              = { SPECIAL_MULTI_USER_TARGET,             NULL,                     "isolate"              },
         [ACTION_RUNLEVEL4]              = { SPECIAL_MULTI_USER_TARGET,             NULL,                     "isolate"              },
@@ -230,9 +241,12 @@ const struct action_metadata action_table[_ACTION_MAX] = {
         [ACTION_HIBERNATE]              = { SPECIAL_HIBERNATE_TARGET,              "hibernate",              "replace-irreversibly" },
         [ACTION_HYBRID_SLEEP]           = { SPECIAL_HYBRID_SLEEP_TARGET,           "hybrid-sleep",           "replace-irreversibly" },
         [ACTION_SUSPEND_THEN_HIBERNATE] = { SPECIAL_SUSPEND_THEN_HIBERNATE_TARGET, "suspend-then-hibernate", "replace-irreversibly" },
+        [ACTION_SLEEP]                  = { NULL, /* handled only by logind */     "sleep",                  NULL                   },
 };
 
 enum action verb_to_action(const char *verb) {
+        assert(verb);
+
         for (enum action i = 0; i < _ACTION_MAX; i++)
                 if (streq_ptr(action_table[i].verb, verb))
                         return i;
@@ -245,23 +259,38 @@ static const char** make_extra_args(const char *extra_args[static 4]) {
 
         assert(extra_args);
 
-        if (arg_scope != UNIT_FILE_SYSTEM)
+        if (arg_runtime_scope != RUNTIME_SCOPE_SYSTEM)
                 extra_args[n++] = "--user";
 
-        if (arg_transport == BUS_TRANSPORT_REMOTE) {
+        switch (arg_transport) {
+
+        case BUS_TRANSPORT_REMOTE:
                 extra_args[n++] = "-H";
                 extra_args[n++] = arg_host;
-        } else if (arg_transport == BUS_TRANSPORT_MACHINE) {
+                break;
+
+        case BUS_TRANSPORT_MACHINE:
                 extra_args[n++] = "-M";
                 extra_args[n++] = arg_host;
-        } else
-                assert(arg_transport == BUS_TRANSPORT_LOCAL);
+                break;
+
+        case BUS_TRANSPORT_CAPSULE:
+                extra_args[n++] = "-C";
+                extra_args[n++] = arg_host;
+                break;
+
+        case BUS_TRANSPORT_LOCAL:
+                break;
+
+        default:
+                assert_not_reached();
+        }
 
         extra_args[n] = NULL;
         return extra_args;
 }
 
-int start_unit(int argc, char *argv[], void *userdata) {
+int verb_start(int argc, char *argv[], void *userdata) {
         _cleanup_(bus_wait_for_units_freep) BusWaitForUnits *wu = NULL;
         _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *w = NULL;
         const char *method, *job_type, *mode, *one_name, *suffix = NULL;
@@ -269,7 +298,6 @@ int start_unit(int argc, char *argv[], void *userdata) {
         _cleanup_strv_free_ char **names = NULL;
         int r, ret = EXIT_SUCCESS;
         sd_bus *bus;
-        char **name;
 
         if (arg_wait && !STR_IN_SET(argv[0], "start", "restart"))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -289,6 +317,8 @@ int start_unit(int argc, char *argv[], void *userdata) {
 
                 action = verb_to_action(argv[0]);
 
+                assert(action != ACTION_SLEEP);
+
                 if (action != _ACTION_INVALID) {
                         /* A command in style "systemctl reboot", "systemctl poweroff", … */
                         method = "StartUnit";
@@ -303,7 +333,7 @@ int start_unit(int argc, char *argv[], void *userdata) {
                                 mode = "isolate";
                                 suffix = ".target";
                         } else if (!arg_marked) {
-                                /* A command in style of "systemctl start <unit1> <unit2> …", "sysemctl stop <unit1> <unit2> …" and so on */
+                                /* A command in style of "systemctl start <unit1> <unit2> …", "systemctl stop <unit1> <unit2> …" and so on */
                                 method = verb_to_method(argv[0]);
                                 job_type = verb_to_job_type(argv[0]);
                                 mode = arg_job_mode();
@@ -352,10 +382,6 @@ int start_unit(int argc, char *argv[], void *userdata) {
         }
 
         if (arg_wait) {
-                r = bus_call_method_async(bus, NULL, bus_systemd_mgr, "Subscribe", NULL, NULL, NULL);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to enable subscription: %m");
-
                 r = bus_wait_for_units_new(bus, &wu);
                 if (r < 0)
                         return log_error_errno(r, "Failed to allocate unit watch context: %m");
@@ -363,7 +389,6 @@ int start_unit(int argc, char *argv[], void *userdata) {
 
         if (arg_marked)
                 ret = enqueue_marked_jobs(bus, w);
-
         else
                 STRV_FOREACH(name, names) {
                         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -380,17 +405,20 @@ int start_unit(int argc, char *argv[], void *userdata) {
                 }
 
         if (!arg_no_block) {
-                const char* extra_args[4];
+                const char *extra_args[4];
+                WaitJobsFlags flags = 0;
 
-                r = bus_wait_for_jobs(w, arg_quiet, make_extra_args(extra_args));
+                SET_FLAG(flags, BUS_WAIT_JOBS_LOG_ERROR, !arg_quiet);
+                SET_FLAG(flags, BUS_WAIT_JOBS_LOG_SUCCESS, arg_show_transaction);
+                r = bus_wait_for_jobs(w, flags, make_extra_args(extra_args));
                 if (r < 0)
                         return r;
 
                 /* When stopping units, warn if they can still be triggered by
                  * another active unit (socket, path, timer) */
-                if (!arg_quiet)
-                        STRV_FOREACH(name, stopped_units)
-                                (void) check_triggering_units(bus, *name);
+                if (!arg_quiet && !arg_no_warn)
+                        STRV_FOREACH(unit, stopped_units)
+                                warn_triggering_units(bus, *unit, "Stopping", /* ignore_masked = */ true);
         }
 
         if (arg_wait) {

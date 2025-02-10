@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sys/utsname.h>
+
 #include "sd-id128.h"
 
 #include "errno-util.h"
@@ -24,23 +26,21 @@ static const char* const cases[] = {
         NULL,
 };
 
-static void test_sysctl_normalize(void) {
-        log_info("/* %s */", __func__);
-
-        const char **s, **expected;
-        STRV_FOREACH_PAIR(s, expected, (const char**) cases) {
+TEST(sysctl_normalize) {
+        STRV_FOREACH_PAIR(s, expected, cases) {
                 _cleanup_free_ char *t;
 
                 assert_se(t = strdup(*s));
                 assert_se(sysctl_normalize(t) == t);
 
                 log_info("\"%s\" → \"%s\", expected \"%s\"", *s, t, *expected);
-                assert_se(streq(t, *expected));
+                ASSERT_STREQ(t, *expected);
         }
 }
 
-static void test_sysctl_read(void) {
-        _cleanup_free_ char *s = NULL, *h = NULL;
+TEST(sysctl_read) {
+        _cleanup_free_ char *s = NULL;
+        struct utsname u;
         sd_id128_t a, b;
         int r;
 
@@ -53,30 +53,23 @@ static void test_sysctl_read(void) {
         assert_se(sysctl_read_ip_property(AF_INET, "lo", "forwarding", &s));
         assert_se(STR_IN_SET(s, "0", "1"));
 
-        r = sysctl_write_ip_property(AF_INET, "lo", "forwarding", s);
+        r = sysctl_write_ip_property(AF_INET, "lo", "forwarding", s, NULL);
         assert_se(r >= 0 || ERRNO_IS_PRIVILEGE(r) || r == -EROFS);
         s = mfree(s);
 
         assert_se(sysctl_read_ip_property(AF_INET, NULL, "ip_forward", &s));
         assert_se(STR_IN_SET(s, "0", "1"));
 
-        r = sysctl_write_ip_property(AF_INET, NULL, "ip_forward", s);
+        r = sysctl_write_ip_property(AF_INET, NULL, "ip_forward", s, NULL);
         assert_se(r >= 0 || ERRNO_IS_PRIVILEGE(r) || r == -EROFS);
         s = mfree(s);
 
         assert_se(sysctl_read("kernel/hostname", &s) >= 0);
-        assert_se(gethostname_full(GET_HOSTNAME_ALLOW_NONE|GET_HOSTNAME_ALLOW_LOCALHOST, &h) >= 0);
-        assert_se(streq(s, h));
+        assert_se(uname(&u) >= 0);
+        ASSERT_STREQ(s, u.nodename);
 
         r = sysctl_write("kernel/hostname", s);
         assert_se(r >= 0 || ERRNO_IS_PRIVILEGE(r) || r == -EROFS);
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_INFO);
-
-        test_sysctl_normalize();
-        test_sysctl_read();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_INFO);

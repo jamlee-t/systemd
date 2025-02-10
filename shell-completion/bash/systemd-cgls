@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # systemd-cgls(1) completion                  -*- shell-script -*-
 # SPDX-License-Identifier: LGPL-2.1-or-later
 #
@@ -14,7 +15,7 @@
 # General Public License for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# along with systemd; If not, see <https://www.gnu.org/licenses/>.
 
 __contains_word() {
     local w word=$1; shift
@@ -25,7 +26,9 @@ __contains_word() {
 
 __get_machines() {
     local a b
-    machinectl list --full --no-legend --no-pager | { while read a b; do echo " $a"; done; };
+    { machinectl list --full --max-addresses=0 --no-legend --no-pager 2>/dev/null; echo ".host"; } | \
+	{ while read a b; do echo " $a"; done; } | \
+        sort -u
 }
 
 __get_units_have_cgroup() {
@@ -42,7 +45,7 @@ _systemd_cgls() {
 
     local -A OPTS=(
         [STANDALONE]='-h --help --version --all -l --full -k --no-pager --xattr=no --cgroup-id=no'
-        [ARG]='-M --machine -u --unit --user-unit'
+        [ARG]='-c --cgroup-id -M --machine -u --unit --user-unit -x --xattr'
     )
 
     _init_completion || return
@@ -54,6 +57,9 @@ _systemd_cgls() {
                 ;;
             --unit|-u)
                 comps=$( __get_units_have_cgroup --system )
+                ;;
+            -c|--cgroup-id|-x|--xattr)
+                comps='yes no'
                 ;;
             --user-unit)
                 comps=$( __get_units_have_cgroup --user )

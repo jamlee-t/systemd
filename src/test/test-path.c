@@ -17,14 +17,12 @@
 #include "strv.h"
 #include "tests.h"
 #include "unit.h"
-#include "util.h"
 
 typedef void (*test_function_t)(Manager *m);
 
 static int setup_test(Manager **m) {
         char **tests_path = STRV_MAKE("exists", "existsglobFOOBAR", "changed", "modified", "unit",
                                       "directorynotempty", "makedirectory");
-        char **test_path;
         Manager *tmp = NULL;
         int r;
 
@@ -34,7 +32,7 @@ static int setup_test(Manager **m) {
         if (r == -ENOMEDIUM)
                 return log_tests_skipped("cgroupfs not available");
 
-        r = manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_BASIC, &tmp);
+        r = manager_new(RUNTIME_SCOPE_USER, MANAGER_TEST_RUN_BASIC, &tmp);
         if (manager_errno_skip_test(r))
                 return log_tests_skipped_errno(r, "manager_new");
         assert_se(r >= 0);
@@ -95,7 +93,7 @@ static int _check_states(unsigned line,
                          UNIT(path)->id,
                          path_state_to_string(path->state),
                          path_result_to_string(path->result),
-                         end - n);
+                         (int64_t) (end - n));
                 log_info("line %u: %s: state = %s; result = %s",
                          line,
                          UNIT(service)->id,
@@ -103,16 +101,24 @@ static int _check_states(unsigned line,
                          service_result_to_string(service->result));
 
                 if (service->state == SERVICE_FAILED &&
-                    service->main_exec_status.status == EXIT_CGROUP &&
-                    !ci_environment())
+                    (service->main_exec_status.status == EXIT_CGROUP || service->result == SERVICE_FAILURE_RESOURCES)) {
+                        const char *ci = ci_environment();
+
                         /* On a general purpose system we may fail to start the service for reasons which are
                          * not under our control: permission limits, resource exhaustion, etc. Let's skip the
                          * test in those cases. On developer machines we require proper setup. */
-                        return log_notice_errno(SYNTHETIC_ERRNO(ECANCELED),
-                                                "Failed to start service %s, aborting test: %s/%s",
-                                                UNIT(service)->id,
-                                                service_state_to_string(service->state),
-                                                service_result_to_string(service->result));
+                        if (!ci)
+                                return log_notice_errno(SYNTHETIC_ERRNO(ECANCELED),
+                                                        "Failed to start service %s, aborting test: %s/%s",
+                                                        UNIT(service)->id,
+                                                        service_state_to_string(service->state),
+                                                        service_result_to_string(service->result));
+
+                        /* On Salsa we can't setup cgroups so the unit always fails. The test checks if it
+                         * can but continues if it cannot at the beginning, but on Salsa it fails here. */
+                        if (streq(ci, "salsa-ci"))
+                                exit(EXIT_TEST_SKIP);
+                }
 
                 if (n >= end) {
                         log_error("Test timeout when testing %s", UNIT(path)->id);
@@ -137,7 +143,7 @@ static void test_path_exists(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, NULL);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -171,7 +177,7 @@ static void test_path_existsglob(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, NULL);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -206,7 +212,7 @@ static void test_path_changed(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, NULL);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -248,7 +254,7 @@ static void test_path_modified(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, NULL);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -289,7 +295,7 @@ static void test_path_unit(Manager *m) {
         path = PATH(unit);
         service = service_for_path(m, path, "path-mycustomunit.service");
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -320,7 +326,7 @@ static void test_path_directorynotempty(Manager *m) {
 
         assert_se(access(test_path, F_OK) < 0);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
         if (check_states(m, path, service, PATH_WAITING, SERVICE_DEAD) < 0)
                 return;
 
@@ -357,7 +363,7 @@ static void test_path_makedirectory_directorymode(Manager *m) {
 
         assert_se(access(test_path, F_OK) < 0);
 
-        assert_se(unit_start(unit) >= 0);
+        assert_se(unit_start(unit, NULL) >= 0);
 
         /* Check if the directory has been created */
         assert_se(access(test_path, F_OK) >= 0);
@@ -391,8 +397,8 @@ int main(int argc, char *argv[]) {
 
         test_setup_logging(LOG_INFO);
 
-        assert_se(get_testdata_dir("test-path", &test_path) >= 0);
-        assert_se(set_unit_path(test_path) >= 0);
+        ASSERT_OK(get_testdata_dir("test-path", &test_path));
+        ASSERT_OK(setenv_unit_path(test_path));
         assert_se(runtime_dir = setup_fake_runtime_dir());
 
         for (const test_function_t *test = tests; *test; test++) {

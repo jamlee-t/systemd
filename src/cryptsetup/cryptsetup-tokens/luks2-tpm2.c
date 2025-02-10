@@ -1,148 +1,116 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
+#include "ask-password-api.h"
+#include "env-util.h"
 #include "hexdecoct.h"
-#include "json.h"
+#include "log.h"
 #include "luks2-tpm2.h"
 #include "parse-util.h"
 #include "random-util.h"
+#include "sha256.h"
+#include "strv.h"
 #include "tpm2-util.h"
 
 int acquire_luks2_key(
-                uint32_t pcr_mask,
-                uint16_t pcr_bank,
-                uint16_t primary_alg,
                 const char *device,
-                const void *key_data,
-                size_t key_data_size,
-                const void *policy_hash,
-                size_t policy_hash_size,
-                void **ret_decrypted_key,
-                size_t *ret_decrypted_key_size) {
+                uint32_t hash_pcr_mask,
+                uint16_t pcr_bank,
+                const struct iovec *pubkey,
+                uint32_t pubkey_pcr_mask,
+                const char *signature_path,
+                const char *pin,
+                const char *pcrlock_path,
+                uint16_t primary_alg,
+                const struct iovec blobs[],
+                size_t n_blobs,
+                const struct iovec policy_hash[],
+                size_t n_policy_hash,
+                const struct iovec *salt,
+                const struct iovec *srk,
+                const struct iovec *pcrlock_nv,
+                TPM2Flags flags,
+                struct iovec *ret_decrypted_key) {
 
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *signature_json = NULL;
         _cleanup_free_ char *auto_device = NULL;
+        _cleanup_(erase_and_freep) char *b64_salted_pin = NULL;
         int r;
 
+        assert(iovec_is_valid(salt));
         assert(ret_decrypted_key);
-        assert(ret_decrypted_key_size);
 
         if (!device) {
-                r = tpm2_find_device_auto(LOG_DEBUG, &auto_device);
+                r = tpm2_find_device_auto(&auto_device);
                 if (r == -ENODEV)
                         return -EAGAIN; /* Tell the caller to wait for a TPM2 device to show up */
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Could not find TPM2 device: %m");
 
                 device = auto_device;
         }
 
-        return tpm2_unseal(
-                        device,
-                        pcr_mask, pcr_bank,
-                        primary_alg,
-                        key_data, key_data_size,
-                        policy_hash, policy_hash_size,
-                        ret_decrypted_key, ret_decrypted_key_size);
-}
+        if ((flags & TPM2_FLAGS_USE_PIN) && !pin)
+                return -ENOANO;
 
-/* this function expects valid "systemd-tpm2" in json */
-int parse_luks2_tpm2_data(
-                const char *json,
-                uint32_t search_pcr_mask,
-                uint32_t *ret_pcr_mask,
-                uint16_t *ret_pcr_bank,
-                uint16_t *ret_primary_alg,
-                char **ret_base64_blob,
-                char **ret_hex_policy_hash) {
+        if (pin && iovec_is_set(salt)) {
+                uint8_t salted_pin[SHA256_DIGEST_SIZE] = {};
+                CLEANUP_ERASE(salted_pin);
+                r = tpm2_util_pbkdf2_hmac_sha256(pin, strlen(pin), salt->iov_base, salt->iov_len, salted_pin);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to perform PBKDF2: %m");
 
-        int r;
-        JsonVariant *w, *e;
-        uint32_t pcr_mask = 0;
-        uint16_t pcr_bank = UINT16_MAX, primary_alg = TPM2_ALG_ECC;
-        _cleanup_free_ char *base64_blob = NULL, *hex_policy_hash = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+                r = base64mem(salted_pin, sizeof(salted_pin), &b64_salted_pin);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to base64 encode salted pin: %m");
+                pin = b64_salted_pin;
+        }
 
-        assert(json);
-        assert(ret_pcr_mask);
-        assert(ret_pcr_bank);
-        assert(ret_primary_alg);
-        assert(ret_base64_blob);
-        assert(ret_hex_policy_hash);
+        if (pubkey_pcr_mask != 0) {
+                r = tpm2_load_pcr_signature(signature_path, &signature_json);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to load PCR signature: %m");
+        }
 
-        r = json_parse(json, 0, &v, NULL, NULL);
+        _cleanup_(tpm2_pcrlock_policy_done) Tpm2PCRLockPolicy pcrlock_policy = {};
+        if (FLAGS_SET(flags, TPM2_FLAGS_USE_PCRLOCK)) {
+                r = tpm2_pcrlock_policy_load(pcrlock_path, &pcrlock_policy);
+                if (r < 0)
+                        return r;
+                if (r == 0) {
+                        /* Not found? Then search among passed credentials */
+                        r = tpm2_pcrlock_policy_from_credentials(srk, pcrlock_nv, &pcrlock_policy);
+                        if (r < 0)
+                                return r;
+                        if (r == 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EREMOTE), "Couldn't find pcrlock policy for volume.");
+                }
+        }
+
+        _cleanup_(tpm2_context_unrefp) Tpm2Context *tpm2_context = NULL;
+        r = tpm2_context_new_or_warn(device, &tpm2_context);
         if (r < 0)
-                return -EINVAL;
+                return r;
 
-        w = json_variant_by_key(v, "tpm2-pcrs");
-        if (!w || !json_variant_is_array(w))
-                return -EINVAL;
+        r = tpm2_unseal(tpm2_context,
+                        hash_pcr_mask,
+                        pcr_bank,
+                        pubkey,
+                        pubkey_pcr_mask,
+                        signature_json,
+                        pin,
+                        FLAGS_SET(flags, TPM2_FLAGS_USE_PCRLOCK) ? &pcrlock_policy : NULL,
+                        primary_alg,
+                        blobs,
+                        n_blobs,
+                        policy_hash,
+                        n_policy_hash,
+                        srk,
+                        ret_decrypted_key);
+        if (r < 0)
+                return log_error_errno(r, "Failed to unseal secret using TPM2: %m");
 
-        JSON_VARIANT_ARRAY_FOREACH(e, w) {
-                uint64_t u;
-
-                if (!json_variant_is_number(e))
-                        return -EINVAL;
-
-                u = json_variant_unsigned(e);
-                if (u >= TPM2_PCRS_MAX)
-                        return -EINVAL;
-
-                pcr_mask |= UINT32_C(1) << u;
-        }
-
-        if (search_pcr_mask != UINT32_MAX &&
-            search_pcr_mask != pcr_mask)
-                return -ENXIO;
-
-        w = json_variant_by_key(v, "tpm2-pcr-bank");
-        if (w) {
-                /* The PCR bank field is optional */
-
-                if (!json_variant_is_string(w))
-                        return -EINVAL;
-
-                r = tpm2_pcr_bank_from_string(json_variant_string(w));
-                if (r < 0)
-                        return r;
-
-                pcr_bank = r;
-        }
-
-        w = json_variant_by_key(v, "tpm2-primary-alg");
-        if (w) {
-                /* The primary key algorithm is optional */
-
-                if (!json_variant_is_string(w))
-                        return -EINVAL;
-
-                r = tpm2_primary_alg_from_string(json_variant_string(w));
-                if (r < 0)
-                        return r;
-
-                primary_alg = r;
-        }
-
-        w = json_variant_by_key(v, "tpm2-blob");
-        if (!w || !json_variant_is_string(w))
-                return -EINVAL;
-
-        base64_blob = strdup(json_variant_string(w));
-        if (!base64_blob)
-                return -ENOMEM;
-
-        w = json_variant_by_key(v, "tpm2-policy-hash");
-        if (!w || !json_variant_is_string(w))
-                return -EINVAL;
-
-        hex_policy_hash = strdup(json_variant_string(w));
-        if (!hex_policy_hash)
-                return -ENOMEM;
-
-        *ret_pcr_mask = pcr_mask;
-        *ret_pcr_bank = pcr_bank;
-        *ret_primary_alg = primary_alg;
-        *ret_base64_blob = TAKE_PTR(base64_blob);
-        *ret_hex_policy_hash = TAKE_PTR(hex_policy_hash);
-
-        return 0;
+        return r;
 }
