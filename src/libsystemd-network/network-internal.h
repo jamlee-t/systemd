@@ -17,11 +17,14 @@ void serialize_in6_addrs(FILE *f, const struct in6_addr *addresses,
                          bool *with_leading_space);
 int deserialize_in6_addrs(struct in6_addr **addresses, const char *string);
 
+int serialize_dnr(FILE *f, const sd_dns_resolver *dnr, size_t n_dnr, bool *with_leading_space);
+int deserialize_dnr(sd_dns_resolver **ret, const char *string);
+
 /* don't include "dhcp-lease-internal.h" as it causes conflicts between netinet/ip.h and linux/ip.h */
 struct sd_dhcp_route;
 struct sd_dhcp_lease;
 
-void serialize_dhcp_routes(FILE *f, const char *key, sd_dhcp_route **routes, size_t size);
+void serialize_dhcp_routes(FILE *f, const char *key, struct sd_dhcp_route **routes, size_t size);
 int deserialize_dhcp_routes(struct sd_dhcp_route **ret, size_t *ret_size, const char *string);
 
 /* It is not necessary to add deserialize_dhcp_option(). Use unhexmem() instead. */

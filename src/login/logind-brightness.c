@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "bus-message-util.h"
 #include "bus-util.h"
 #include "device-util.h"
 #include "hash-funcs.h"
@@ -96,12 +97,11 @@ static void brightness_writer_reply(BrightnessWriter *w, int error) {
 static int brightness_writer_fork(BrightnessWriter *w);
 
 static int on_brightness_writer_exit(sd_event_source *s, const siginfo_t *si, void *userdata) {
-        BrightnessWriter *w = userdata;
+        BrightnessWriter *w = ASSERT_PTR(userdata);
         int r;
 
         assert(s);
         assert(si);
-        assert(w);
 
         assert(si->si_pid == w->child);
         w->child = 0;
@@ -137,7 +137,7 @@ static int brightness_writer_fork(BrightnessWriter *w) {
         assert(w->child == 0);
         assert(!w->child_event_source);
 
-        r = safe_fork("(sd-bright)", FORK_DEATHSIG|FORK_NULL_STDIO|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_REOPEN_LOG, &w->child);
+        r = safe_fork("(sd-bright)", FORK_DEATHSIG_SIGKILL|FORK_REARRANGE_STDIO|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_REOPEN_LOG, &w->child);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -174,10 +174,9 @@ static int set_add_message(Set **set, sd_bus_message *message) {
         if (r <= 0)
                 return r;
 
-        r = set_ensure_put(set, &bus_message_hash_ops, message);
+        r = set_ensure_consume(set, &bus_message_hash_ops, sd_bus_message_ref(message));
         if (r <= 0)
                 return r;
-        sd_bus_message_ref(message);
 
         return 1;
 }

@@ -3,6 +3,9 @@
 #include <linux/rtnetlink.h>
 
 #include "alloc-util.h"
+#include "bitfield.h"
+#include "logarithm.h"
+#include "missing_threads.h"
 #include "networkd-address.h"
 #include "networkd-link.h"
 #include "networkd-manager.h"
@@ -14,35 +17,58 @@
 #include "strv.h"
 #include "sysctl-util.h"
 
-#define ROUTES_DEFAULT_MAX_PER_FAMILY 4096U
+#define ROUTES_DEFAULT_MAX_PER_FAMILY 4096
 
 unsigned routes_max(void) {
         static thread_local unsigned cached = 0;
-        _cleanup_free_ char *s4 = NULL, *s6 = NULL;
-        unsigned val4 = ROUTES_DEFAULT_MAX_PER_FAMILY, val6 = ROUTES_DEFAULT_MAX_PER_FAMILY;
+        int val4 = ROUTES_DEFAULT_MAX_PER_FAMILY, val6 = ROUTES_DEFAULT_MAX_PER_FAMILY;
 
         if (cached > 0)
                 return cached;
 
-        if (sysctl_read_ip_property(AF_INET, NULL, "route/max_size", &s4) >= 0)
-                if (safe_atou(s4, &val4) >= 0 && val4 == 2147483647U)
+        /* The kernel internally stores these maximum size in int. */
+
+        if (sysctl_read_ip_property_int(AF_INET, /* ifname = */ NULL, "route/max_size", &val4) >= 0)
+                if (val4 == INT_MAX)
                         /* This is the default "no limit" value in the kernel */
                         val4 = ROUTES_DEFAULT_MAX_PER_FAMILY;
 
-        if (sysctl_read_ip_property(AF_INET6, NULL, "route/max_size", &s6) >= 0)
-                (void) safe_atou(s6, &val6);
+        if (sysctl_read_ip_property_int(AF_INET6, /* ifname = */ NULL, "route/max_size", &val6) >= 0)
+                if (val6 == INT_MAX)
+                        /* This is the default "no limit" value in the kernel */
+                        val6 = ROUTES_DEFAULT_MAX_PER_FAMILY;
 
         cached = MAX(ROUTES_DEFAULT_MAX_PER_FAMILY, val4) +
                  MAX(ROUTES_DEFAULT_MAX_PER_FAMILY, val6);
         return cached;
 }
 
-static Route *link_find_default_gateway(Link *link, int family, Route *gw) {
+bool route_type_is_reject(uint8_t type) {
+        return IN_SET(type, RTN_UNREACHABLE, RTN_PROHIBIT, RTN_BLACKHOLE, RTN_THROW);
+}
+
+bool route_is_reject(const Route *route) {
+        return route_type_is_reject(ASSERT_PTR(route)->type);
+}
+
+static bool route_lifetime_is_valid(const Route *route) {
+        assert(route);
+
+        return
+                route->lifetime_usec == USEC_INFINITY ||
+                route->lifetime_usec > now(CLOCK_BOOTTIME);
+}
+
+bool link_find_default_gateway(Link *link, int family, Route **gw) {
+        bool found = false;
         Route *route;
 
         assert(link);
+        assert(link->manager);
 
-        SET_FOREACH(route, link->routes) {
+        SET_FOREACH(route, link->manager->routes) {
+                if (route->nexthop.ifindex != link->ifindex)
+                        continue;
                 if (!route_exists(route))
                         continue;
                 if (family != AF_UNSPEC && route->family != family)
@@ -57,18 +83,26 @@ static Route *link_find_default_gateway(Link *link, int family, Route *gw) {
                         continue;
                 if (route->scope != RT_SCOPE_UNIVERSE)
                         continue;
-                if (!in_addr_is_set(route->gw_family, &route->gw))
+                if (!in_addr_is_set(route->nexthop.family, &route->nexthop.gw))
                         continue;
-                if (gw) {
-                        if (route->gw_weight > gw->gw_weight)
+
+                /* Found a default gateway. */
+                if (!gw)
+                        return true;
+
+                /* If we have already found another gw, then let's compare their weight and priority. */
+                if (*gw) {
+                        if (route->nexthop.weight > (*gw)->nexthop.weight)
                                 continue;
-                        if (route->priority >= gw->priority)
+                        if (route->priority >= (*gw)->priority)
                                 continue;
                 }
-                gw = route;
+
+                *gw = route;
+                found = true;
         }
 
-        return gw;
+        return found;
 }
 
 int manager_find_uplink(Manager *m, int family, Link *exclude, Link **ret) {
@@ -88,37 +122,43 @@ int manager_find_uplink(Manager *m, int family, Link *exclude, Link **ret) {
                 if (link->state != LINK_STATE_CONFIGURED)
                         continue;
 
-                gw = link_find_default_gateway(link, family, gw);
+                link_find_default_gateway(link, family, &gw);
         }
 
         if (!gw)
                 return -ENOENT;
 
-        if (ret) {
-                assert(gw->link);
-                *ret = gw->link;
-        }
-
-        return 0;
+        return link_get_by_index(m, gw->nexthop.ifindex, ret);
 }
 
-static bool link_address_is_reachable(Link *link, int family, const union in_addr_union *address) {
+bool gateway_is_ready(Link *link, bool onlink, int family, const union in_addr_union *gw) {
         Route *route;
         Address *a;
 
         assert(link);
         assert(link->manager);
-        assert(IN_SET(family, AF_INET, AF_INET6));
-        assert(address);
 
-        SET_FOREACH(route, link->routes) {
+        if (onlink)
+                return true;
+
+        if (!gw || !in_addr_is_set(family, gw))
+                return true;
+
+        if (family == AF_INET6 && in6_addr_is_link_local(&gw->in6))
+                return true;
+
+        SET_FOREACH(route, link->manager->routes) {
+                if (route->nexthop.ifindex != link->ifindex)
+                        continue;
                 if (!route_exists(route))
+                        continue;
+                if (!route_lifetime_is_valid(route))
                         continue;
                 if (route->family != family)
                         continue;
-                if (!in_addr_is_set(route->family, &route->dst))
+                if (!in_addr_is_set(route->family, &route->dst) && route->dst_prefixlen == 0)
                         continue;
-                if (in_addr_prefix_covers(family, &route->dst, route->dst_prefixlen, address) > 0)
+                if (in_addr_prefix_covers(family, &route->dst, route->dst_prefixlen, gw) > 0)
                         return true;
         }
 
@@ -134,29 +174,161 @@ static bool link_address_is_reachable(Link *link, int family, const union in_add
                         continue;
                 if (FLAGS_SET(a->flags, IFA_F_NOPREFIXROUTE))
                         continue;
-                if (in_addr_is_set(a->family, &a->in_addr_peer))
-                        continue;
-                if (in_addr_prefix_covers(family, &a->in_addr, a->prefixlen, address) > 0)
+                if (in_addr_prefix_covers(a->family,
+                                          in_addr_is_set(a->family, &a->in_addr_peer) ? &a->in_addr_peer : &a->in_addr,
+                                          a->prefixlen, gw) > 0)
                         return true;
         }
 
         return false;
 }
 
-bool gateway_is_ready(Link *link, bool onlink, int family, const union in_addr_union *gw) {
+static int link_address_is_reachable_internal(
+                Link *link,
+                int family,
+                const union in_addr_union *address,
+                const union in_addr_union *prefsrc, /* optional */
+                Route **ret) {
+
+        Route *route, *found = NULL;
+
         assert(link);
-        assert(gw);
+        assert(link->manager);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+        assert(address);
 
-        if (onlink)
-                return true;
+        SET_FOREACH(route, link->manager->routes) {
+                if (route->nexthop.ifindex != link->ifindex)
+                        continue;
 
-        if (!in_addr_is_set(family, gw))
-                return true;
+                if (!route_exists(route))
+                        continue;
 
-        if (family == AF_INET6 && in6_addr_is_link_local(&gw->in6))
-                return true;
+                if (!route_lifetime_is_valid(route))
+                        continue;
 
-        return link_address_is_reachable(link, family, gw);
+                if (route->type != RTN_UNICAST)
+                        continue;
+
+                if (route->family != family)
+                        continue;
+
+                if (in_addr_prefix_covers(family, &route->dst, route->dst_prefixlen, address) <= 0)
+                        continue;
+
+                if (prefsrc &&
+                    in_addr_is_set(family, prefsrc) &&
+                    in_addr_is_set(family, &route->prefsrc) &&
+                    !in_addr_equal(family, prefsrc, &route->prefsrc))
+                        continue;
+
+                if (found && found->priority <= route->priority)
+                        continue;
+
+                found = route;
+        }
+
+        if (!found)
+                return -ENOENT;
+
+        if (ret)
+                *ret = found;
+
+        return 0;
+}
+
+int link_address_is_reachable(
+                Link *link,
+                int family,
+                const union in_addr_union *address,
+                const union in_addr_union *prefsrc, /* optional */
+                Address **ret) {
+
+        Route *route;
+        Address *a;
+        int r;
+
+        assert(link);
+        assert(IN_SET(family, AF_INET, AF_INET6));
+        assert(address);
+
+        /* This checks if the address is reachable, and optionally return the Address object of the
+         * preferred source to access the address. */
+
+        r = link_address_is_reachable_internal(link, family, address, prefsrc, &route);
+        if (r < 0)
+                return r;
+
+        if (!in_addr_is_set(route->family, &route->prefsrc)) {
+                if (ret)
+                        *ret = NULL;
+                return 0;
+        }
+
+        r = link_get_address(link, route->family, &route->prefsrc, &a);
+        if (r < 0)
+                return r;
+
+        if (!address_is_ready(a))
+                return -EBUSY;
+
+        if (ret)
+                *ret = a;
+
+        return 0;
+}
+
+int manager_address_is_reachable(
+                Manager *manager,
+                int family,
+                const union in_addr_union *address,
+                const union in_addr_union *prefsrc, /* optional */
+                Address **ret) {
+
+        Route *route, *found = NULL;
+        Address *a;
+        Link *link;
+        int r;
+
+        assert(manager);
+
+        HASHMAP_FOREACH(link, manager->links_by_index) {
+                if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED))
+                        continue;
+
+                if (link_address_is_reachable_internal(link, family, address, prefsrc, &route) < 0)
+                        continue;
+
+                if (found && found->priority <= route->priority)
+                        continue;
+
+                found = route;
+        }
+
+        if (!found)
+                return -ENOENT;
+
+        if (!in_addr_is_set(found->family, &found->prefsrc)) {
+                if (ret)
+                        *ret = NULL;
+                return 0;
+        }
+
+        r = link_get_by_index(manager, found->nexthop.ifindex, &link);
+        if (r < 0)
+                return r;
+
+        r = link_get_address(link, found->family, &found->prefsrc, &a);
+        if (r < 0)
+                return r;
+
+        if (!address_is_ready(a))
+                return -EBUSY;
+
+        if (ret)
+                *ret = a;
+
+        return 0;
 }
 
 static const char * const route_type_table[__RTN_MAX] = {
@@ -221,25 +393,22 @@ DEFINE_STRING_TABLE_LOOKUP_WITH_FALLBACK(route_protocol_full, int, UINT8_MAX);
 
 int route_flags_to_string_alloc(uint32_t flags, char **ret) {
         _cleanup_free_ char *str = NULL;
-        static const struct {
-                uint32_t flag;
-                const char *name;
-        } map[] = {
-                { RTNH_F_DEAD,       "dead"       }, /* Nexthop is dead (used by multipath) */
-                { RTNH_F_PERVASIVE,  "pervasive"  }, /* Do recursive gateway lookup */
-                { RTNH_F_ONLINK,     "onlink"     }, /* Gateway is forced on link */
-                { RTNH_F_OFFLOAD,    "offload"    }, /* Nexthop is offloaded */
-                { RTNH_F_LINKDOWN,   "linkdown"   }, /* carrier-down on nexthop */
-                { RTNH_F_UNRESOLVED, "unresolved" }, /* The entry is unresolved (ipmr) */
-                { RTNH_F_TRAP,       "trap"       }, /* Nexthop is trapping packets */
+        static const char* map[] = {
+                [LOG2U(RTNH_F_DEAD)]       = "dead",       /* Nexthop is dead (used by multipath) */
+                [LOG2U(RTNH_F_PERVASIVE)]  = "pervasive",  /* Do recursive gateway lookup */
+                [LOG2U(RTNH_F_ONLINK)]     = "onlink" ,    /* Gateway is forced on link */
+                [LOG2U(RTNH_F_OFFLOAD)]    = "offload",    /* Nexthop is offloaded */
+                [LOG2U(RTNH_F_LINKDOWN)]   = "linkdown",   /* carrier-down on nexthop */
+                [LOG2U(RTNH_F_UNRESOLVED)] = "unresolved", /* The entry is unresolved (ipmr) */
+                [LOG2U(RTNH_F_TRAP)]       = "trap",       /* Nexthop is trapping packets */
         };
 
         assert(ret);
 
         for (size_t i = 0; i < ELEMENTSOF(map); i++)
-                if (flags & map[i].flag &&
-                    !strextend_with_separator(&str, ",", map[i].name))
-                        return -ENOMEM;
+                if (BIT_SET(flags, i) && map[i])
+                        if (!strextend_with_separator(&str, ",", map[i]))
+                                return -ENOMEM;
 
         *ret = TAKE_PTR(str);
         return 0;
@@ -284,28 +453,30 @@ int manager_get_route_table_from_string(const Manager *m, const char *s, uint32_
         return 0;
 }
 
-int manager_get_route_table_to_string(const Manager *m, uint32_t table, char **ret) {
+int manager_get_route_table_to_string(const Manager *m, uint32_t table, bool append_num, char **ret) {
         _cleanup_free_ char *str = NULL;
         const char *s;
-        int r;
 
         assert(m);
         assert(ret);
 
-        if (table == 0)
-                return -EINVAL;
+        /* Unlike manager_get_route_table_from_string(), this accepts 0, as the kernel may create routes with
+         * table 0. See issue #25089. */
 
         s = route_table_to_string(table);
         if (!s)
                 s = hashmap_get(m->route_table_names_by_number, UINT32_TO_PTR(table));
 
-        if (s)
-                /* Currently, this is only used in debugging logs. To not confuse any bug
-                 * reports, let's include the table number. */
-                r = asprintf(&str, "%s(%" PRIu32 ")", s, table);
-        else
-                r = asprintf(&str, "%" PRIu32, table);
-        if (r < 0)
+        if (s && !append_num) {
+                str = strdup(s);
+                if (!str)
+                        return -ENOMEM;
+
+        } else if (asprintf(&str, "%s%s%" PRIu32 "%s",
+                            strempty(s),
+                            s ? "(" : "",
+                            table,
+                            s ? ")" : "") < 0)
                 return -ENOMEM;
 
         *ret = TAKE_PTR(str);
@@ -324,13 +495,12 @@ int config_parse_route_table_names(
                 void *data,
                 void *userdata) {
 
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(userdata);
 
         if (isempty(rvalue)) {
                 m->route_table_names_by_number = hashmap_free(m->route_table_names_by_number);
@@ -363,9 +533,20 @@ int config_parse_route_table_names(
 
                 *num++ = '\0';
 
-                if (STR_IN_SET(name, "default", "main", "local")) {
+                if (isempty(name)) {
                         log_syntax(unit, LOG_WARNING, filename, line, 0,
-                                   "Route table name %s already predefined. Ignoring assignment: %s:%s", name, name, num);
+                                   "Route table name cannot be empty. Ignoring assignment: %s:%s", name, num);
+                        continue;
+                }
+                if (in_charset(name, DIGITS)) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                                   "Route table name cannot be numeric. Ignoring assignment: %s:%s", name, num);
+                        continue;
+                }
+                if (route_table_from_string(name) >= 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                                   "Route table name %s is predefined for %i. Ignoring assignment: %s:%s",
+                                   name, route_table_from_string(name), name, num);
                         continue;
                 }
 
@@ -378,6 +559,12 @@ int config_parse_route_table_names(
                 if (table == 0) {
                         log_syntax(unit, LOG_WARNING, filename, line, 0,
                                    "Invalid route table number, ignoring assignment: %s:%s", name, num);
+                        continue;
+                }
+                if (route_table_to_string(table)) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                                   "Route table name for %s is predefined (%s). Ignoring assignment: %s:%s",
+                                   num, route_table_to_string(table), name, num);
                         continue;
                 }
 

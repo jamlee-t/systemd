@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "pidref.h"
+
 typedef struct Inhibitor Inhibitor;
 
 typedef enum InhibitWhat {
@@ -18,6 +20,7 @@ typedef enum InhibitWhat {
 
 typedef enum InhibitMode {
         INHIBIT_BLOCK,
+        INHIBIT_BLOCK_WEAK,
         INHIBIT_DELAY,
         _INHIBIT_MODE_MAX,
         _INHIBIT_MODE_INVALID = -EINVAL,
@@ -30,7 +33,7 @@ struct Inhibitor {
 
         sd_event_source *event_source;
 
-        const char *id;
+        char *id;
         char *state_file;
 
         bool started;
@@ -40,7 +43,7 @@ struct Inhibitor {
         char *why;
         InhibitMode mode;
 
-        pid_t pid;
+        PidRef pid;
         uid_t uid;
 
         dual_timestamp since;
@@ -49,7 +52,7 @@ struct Inhibitor {
         int fifo_fd;
 };
 
-int inhibitor_new(Inhibitor **ret, Manager *m, const char* id);
+int inhibitor_new(Manager *m, const char* id, Inhibitor **ret);
 Inhibitor* inhibitor_free(Inhibitor *i);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Inhibitor*, inhibitor_free);
@@ -63,11 +66,28 @@ int inhibitor_create_fifo(Inhibitor *i);
 
 bool inhibitor_is_orphan(Inhibitor *i);
 
-InhibitWhat manager_inhibit_what(Manager *m, InhibitMode mm);
-bool manager_is_inhibited(Manager *m, InhibitWhat w, InhibitMode mm, dual_timestamp *since, bool ignore_inactive, bool ignore_uid, uid_t uid, Inhibitor **offending);
+InhibitWhat manager_inhibit_what(Manager *m, InhibitMode mode);
 
-const char *inhibit_what_to_string(InhibitWhat k);
+typedef enum ManagerIsInhibitedFlags {
+        MANAGER_IS_INHIBITED_CHECK_DELAY     = 1 << 0,  /* When set, we only check delay inhibitors.
+                                                         * Otherwise, we only check block inhibitors. */
+        MANAGER_IS_INHIBITED_IGNORE_INACTIVE = 1 << 1,  /* When set, ignore inactive sessions. */
+} ManagerIsInhibitedFlags;
+
+bool manager_is_inhibited(
+                Manager *m,
+                InhibitWhat w,
+                dual_timestamp *since,
+                ManagerIsInhibitedFlags flags,
+                uid_t uid_to_ignore,
+                Inhibitor **ret_offending);
+
+static inline bool inhibit_what_is_valid(InhibitWhat w) {
+        return w > 0 && w < _INHIBIT_WHAT_MAX;
+}
+
+const char* inhibit_what_to_string(InhibitWhat k);
 int inhibit_what_from_string(const char *s);
 
-const char *inhibit_mode_to_string(InhibitMode k);
+const char* inhibit_mode_to_string(InhibitMode k);
 InhibitMode inhibit_mode_from_string(const char *s);

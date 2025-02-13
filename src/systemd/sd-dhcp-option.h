@@ -3,7 +3,6 @@
 #define foosddhcpoptionhfoo
 
 /***
-  Copyright © 2013 Intel Corporation. All rights reserved.
   systemd is free software; you can redistribute it and/or modify it
   under the terms of the GNU Lesser General Public License as published by
   the Free Software Foundation; either version 2.1 of the License, or
@@ -15,11 +14,13 @@
   Lesser General Public License for more details.
 
   You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
 #include <inttypes.h>
 #include <sys/types.h>
+
+#include "sd-dhcp-protocol.h"
 
 #include "_sd-common.h"
 

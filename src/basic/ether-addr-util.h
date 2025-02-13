@@ -36,11 +36,11 @@ typedef enum HardwareAddressToStringFlags {
 } HardwareAddressToStringFlags;
 
 #define HW_ADDR_TO_STRING_MAX (3*HW_ADDR_MAX_SIZE)
-char *hw_addr_to_string_full(
+char* hw_addr_to_string_full(
                 const struct hw_addr_data *addr,
                 HardwareAddressToStringFlags flags,
                 char buffer[static HW_ADDR_TO_STRING_MAX]);
-static inline char *hw_addr_to_string(const struct hw_addr_data *addr, char buffer[static HW_ADDR_TO_STRING_MAX]) {
+static inline char* hw_addr_to_string(const struct hw_addr_data *addr, char buffer[static HW_ADDR_TO_STRING_MAX]) {
         return hw_addr_to_string_full(addr, 0, buffer);
 }
 
@@ -51,6 +51,8 @@ static inline char *hw_addr_to_string(const struct hw_addr_data *addr, char buff
 #define HW_ADDR_TO_STR(hw_addr) HW_ADDR_TO_STR_FULL(hw_addr, 0)
 
 #define HW_ADDR_NULL ((const struct hw_addr_data){})
+
+struct hw_addr_data *hw_addr_set(struct hw_addr_data *addr, const uint8_t *bytes, size_t length);
 
 void hw_addr_hash_func(const struct hw_addr_data *p, struct siphash *state);
 int hw_addr_compare(const struct hw_addr_data *a, const struct hw_addr_data *b);
@@ -111,3 +113,5 @@ static inline bool ether_addr_is_global(const struct ether_addr *addr) {
 
 extern const struct hash_ops ether_addr_hash_ops;
 extern const struct hash_ops ether_addr_hash_ops_free;
+
+void ether_addr_mark_random(struct ether_addr *addr);

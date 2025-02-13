@@ -9,8 +9,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include "build.h"
 #include "conf-files.h"
-#include "def.h"
+#include "constants.h"
+#include "creds-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -26,7 +28,8 @@
 #include "sysctl-util.h"
 
 static char **arg_prefixes = NULL;
-static bool arg_cat_config = false;
+static CatFlags arg_cat_flags = CAT_CONFIG_OFF;
+static bool arg_strict = false;
 static PagerFlags arg_pager_flags = 0;
 
 STATIC_DESTRUCTOR_REGISTER(arg_prefixes, strv_freep);
@@ -51,23 +54,10 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(Option*, option_free);
 DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(option_hash_ops, char, string_hash_func, string_compare_func, Option, option_free);
 
 static bool test_prefix(const char *p) {
-        char **i;
-
         if (strv_isempty(arg_prefixes))
                 return true;
 
-        STRV_FOREACH(i, arg_prefixes) {
-                const char *t;
-
-                t = path_startswith(*i, "/proc/sys/");
-                if (!t)
-                        t = *i;
-
-                if (path_startswith(p, t))
-                        return true;
-        }
-
-        return false;
+        return path_startswith_strv(p, arg_prefixes);
 }
 
 static Option *option_new(
@@ -97,24 +87,110 @@ static Option *option_new(
         return TAKE_PTR(o);
 }
 
-static int sysctl_write_or_warn(const char *key, const char *value, bool ignore_failure) {
+static int sysctl_write_or_warn(const char *key, const char *value, bool ignore_failure, bool ignore_enoent) {
         int r;
 
         r = sysctl_write(key, value);
         if (r < 0) {
-                /* If the sysctl is not available in the kernel or we are running with reduced privileges and
-                 * cannot write it, then log about the issue, and proceed without failing. (EROFS is treated
-                 * as a permission problem here, since that's how container managers usually protected their
-                 * sysctls.) In all other cases log an error and make the tool fail. */
-                if (ignore_failure || r == -EROFS || ERRNO_IS_PRIVILEGE(r))
+                /* Proceed without failing if ignore_failure is true.
+                 * If the sysctl is not available in the kernel or we are running with reduced privileges and
+                 * cannot write it, then log about the issue, and proceed without failing. Unless strict mode
+                 * (arg_strict = true) is enabled, in which case we should fail. (EROFS is treated as a
+                 * permission problem here, since that's how container managers usually protected their
+                 * sysctls.)
+                 * In all other cases log an error and make the tool fail. */
+                if (ignore_failure || (!arg_strict && (r == -EROFS || ERRNO_IS_PRIVILEGE(r))))
                         log_debug_errno(r, "Couldn't write '%s' to '%s', ignoring: %m", value, key);
-                else if (r == -ENOENT)
-                        log_info_errno(r, "Couldn't write '%s' to '%s', ignoring: %m", value, key);
+                else if (ignore_enoent && r == -ENOENT)
+                        log_warning_errno(r, "Couldn't write '%s' to '%s', ignoring: %m", value, key);
                 else
                         return log_error_errno(r, "Couldn't write '%s' to '%s': %m", value, key);
         }
 
         return 0;
+}
+
+static int apply_glob_option_with_prefix(OrderedHashmap *sysctl_options, Option *option, const char *prefix) {
+        _cleanup_strv_free_ char **paths = NULL;
+        _cleanup_free_ char *pattern = NULL;
+        int r;
+
+        assert(sysctl_options);
+        assert(option);
+
+        if (prefix) {
+                _cleanup_free_ char *key = NULL;
+
+                r = path_glob_can_match(option->key, prefix, &key);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to check if the glob '%s' matches prefix '%s': %m",
+                                               option->key, prefix);
+                if (r == 0) {
+                        log_debug("The glob '%s' does not match prefix '%s'.", option->key, prefix);
+                        return 0;
+                }
+
+                log_debug("The glob '%s' is prefixed with '%s': '%s'", option->key, prefix, key);
+
+                if (!string_is_glob(key)) {
+                        /* The prefixed pattern is not glob anymore. Let's skip to call glob(). */
+                        if (ordered_hashmap_contains(sysctl_options, key)) {
+                                log_debug("Not setting %s (explicit setting exists).", key);
+                                return 0;
+                        }
+
+                        return sysctl_write_or_warn(key, option->value,
+                                                    /* ignore_failure = */ option->ignore_failure,
+                                                    /* ignore_enoent = */ true);
+                }
+
+                pattern = path_join("/proc/sys", key);
+        } else
+                pattern = path_join("/proc/sys", option->key);
+        if (!pattern)
+                return log_oom();
+
+        r = glob_extend(&paths, pattern, GLOB_NOCHECK);
+        if (r < 0) {
+                if (r == -ENOENT) {
+                        log_debug("No match for glob: %s", option->key);
+                        return 0;
+                }
+                if (option->ignore_failure || ERRNO_IS_PRIVILEGE(r)) {
+                        log_debug_errno(r, "Failed to resolve glob '%s', ignoring: %m", option->key);
+                        return 0;
+                } else
+                        return log_error_errno(r, "Couldn't resolve glob '%s': %m", option->key);
+        }
+
+        STRV_FOREACH(s, paths) {
+                const char *key;
+
+                assert_se(key = path_startswith(*s, "/proc/sys"));
+
+                if (ordered_hashmap_contains(sysctl_options, key)) {
+                        log_debug("Not setting %s (explicit setting exists).", key);
+                        continue;
+                }
+
+                RET_GATHER(r,
+                           sysctl_write_or_warn(key, option->value,
+                                                /* ignore_failure = */ option->ignore_failure,
+                                                /* ignore_enoent = */ !arg_strict));
+        }
+
+        return r;
+}
+
+static int apply_glob_option(OrderedHashmap *sysctl_options, Option *option) {
+        int r = 0;
+
+        if (strv_isempty(arg_prefixes))
+                return apply_glob_option_with_prefix(sysctl_options, option, NULL);
+
+        STRV_FOREACH(i, arg_prefixes)
+                RET_GATHER(r, apply_glob_option_with_prefix(sysctl_options, option, *i));
+        return r;
 }
 
 static int apply_all(OrderedHashmap *sysctl_options) {
@@ -128,53 +204,13 @@ static int apply_all(OrderedHashmap *sysctl_options) {
                 if (!option->value)
                         continue;
 
-                if (string_is_glob(option->key)) {
-                        _cleanup_strv_free_ char **paths = NULL;
-                        _cleanup_free_ char *pattern = NULL;
-                        char **s;
-
-                        pattern = path_join("/proc/sys", option->key);
-                        if (!pattern)
-                                return log_oom();
-
-                        k = glob_extend(&paths, pattern, GLOB_NOCHECK);
-                        if (k < 0) {
-                                if (option->ignore_failure || ERRNO_IS_PRIVILEGE(k))
-                                        log_debug_errno(k, "Failed to resolve glob '%s', ignoring: %m",
-                                                        option->key);
-                                else {
-                                        log_error_errno(k, "Couldn't resolve glob '%s': %m",
-                                                        option->key);
-                                        if (r == 0)
-                                                r = k;
-                                }
-
-                        } else if (strv_isempty(paths))
-                                log_debug("No match for glob: %s", option->key);
-
-                        STRV_FOREACH(s, paths) {
-                                const char *key;
-
-                                assert_se(key = path_startswith(*s, "/proc/sys"));
-
-                                if (!test_prefix(key))
-                                        continue;
-
-                                if (ordered_hashmap_contains(sysctl_options, key)) {
-                                        log_debug("Not setting %s (explicit setting exists).", key);
-                                        continue;
-                                }
-
-                                k = sysctl_write_or_warn(key, option->value, option->ignore_failure);
-                                if (r == 0)
-                                        r = k;
-                        }
-
-                } else {
-                        k = sysctl_write_or_warn(option->key, option->value, option->ignore_failure);
-                        if (r == 0)
-                                r = k;
-                }
+                if (string_is_glob(option->key))
+                        k = apply_glob_option(sysctl_options, option);
+                else
+                        k = sysctl_write_or_warn(option->key, option->value,
+                                                 /* ignore_failure = */ option->ignore_failure,
+                                                 /* ignore_enoent = */ !arg_strict);
+                RET_GATHER(r, k);
         }
 
         return r;
@@ -202,10 +238,10 @@ static int parse_file(OrderedHashmap **sysctl_options, const char *path, bool ig
                 _cleanup_free_ char *l = NULL;
                 bool ignore_failure = false;
                 Option *existing;
-                char *p, *value;
+                char *value;
                 int k;
 
-                k = read_line(f, LONG_LINE_MAX, &l);
+                k = read_stripped_line(f, LONG_LINE_MAX, &l);
                 if (k == 0)
                         break;
                 if (k < 0)
@@ -213,13 +249,12 @@ static int parse_file(OrderedHashmap **sysctl_options, const char *path, bool ig
 
                 c++;
 
-                p = strstrip(l);
-
-                if (isempty(p))
+                if (isempty(l))
                         continue;
-                if (strchr(COMMENTS "\n", *p))
+                if (strchr(COMMENTS, l[0]))
                         continue;
 
+                char *p = l;
                 value = strchr(p, '=');
                 if (value) {
                         if (p[0] == '-') {
@@ -252,9 +287,6 @@ static int parse_file(OrderedHashmap **sysctl_options, const char *path, bool ig
                     !test_prefix(p))
                         continue;
 
-                if (ordered_hashmap_ensure_allocated(sysctl_options, &option_hash_ops) < 0)
-                        return log_oom();
-
                 existing = ordered_hashmap_get(*sysctl_options, p);
                 if (existing) {
                         if (streq_ptr(value, existing->value)) {
@@ -270,7 +302,7 @@ static int parse_file(OrderedHashmap **sysctl_options, const char *path, bool ig
                 if (!new_option)
                         return log_oom();
 
-                k = ordered_hashmap_put(*sysctl_options, new_option->key, new_option);
+                k = ordered_hashmap_ensure_put(sysctl_options, &option_hash_ops, new_option->key, new_option);
                 if (k < 0)
                         return log_error_errno(k, "Failed to add sysctl variable %s to hashmap: %m", p);
 
@@ -278,6 +310,31 @@ static int parse_file(OrderedHashmap **sysctl_options, const char *path, bool ig
         }
 
         return r;
+}
+
+static int read_credential_lines(OrderedHashmap **sysctl_options) {
+        _cleanup_free_ char *j = NULL;
+        const char *d;
+        int r;
+
+        r = get_credentials_dir(&d);
+        if (r == -ENXIO)
+                return 0;
+        if (r < 0)
+                return log_error_errno(r, "Failed to get credentials directory: %m");
+
+        j = path_join(d, "sysctl.extra");
+        if (!j)
+                return log_oom();
+
+        (void) parse_file(sysctl_options, j, /* ignore_enoent= */ true);
+        return 0;
+}
+
+static int cat_config(char **files) {
+        pager_open(arg_pager_flags);
+
+        return cat_files(NULL, files, arg_cat_flags);
 }
 
 static int help(void) {
@@ -293,6 +350,7 @@ static int help(void) {
                "  -h --help             Show this help\n"
                "     --version          Show package version\n"
                "     --cat-config       Show configuration files\n"
+               "     --tldr             Show non-comment parts of configuration\n"
                "     --prefix=PATH      Only apply rules with the specified prefix\n"
                "     --no-pager         Do not pipe output into a pager\n"
                "\nSee the %s for details.\n",
@@ -307,16 +365,20 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_VERSION = 0x100,
                 ARG_CAT_CONFIG,
+                ARG_TLDR,
                 ARG_PREFIX,
                 ARG_NO_PAGER,
+                ARG_STRICT,
         };
 
         static const struct option options[] = {
                 { "help",       no_argument,       NULL, 'h'            },
                 { "version",    no_argument,       NULL, ARG_VERSION    },
                 { "cat-config", no_argument,       NULL, ARG_CAT_CONFIG },
+                { "tldr",       no_argument,       NULL, ARG_TLDR       },
                 { "prefix",     required_argument, NULL, ARG_PREFIX     },
                 { "no-pager",   no_argument,       NULL, ARG_NO_PAGER   },
+                { "strict",     no_argument,       NULL, ARG_STRICT     },
                 {}
         };
 
@@ -336,10 +398,15 @@ static int parse_argv(int argc, char *argv[]) {
                         return version();
 
                 case ARG_CAT_CONFIG:
-                        arg_cat_config = true;
+                        arg_cat_flags = CAT_CONFIG_ON;
+                        break;
+
+                case ARG_TLDR:
+                        arg_cat_flags = CAT_TLDR;
                         break;
 
                 case ARG_PREFIX: {
+                        const char *s;
                         char *p;
 
                         /* We used to require people to specify absolute paths
@@ -348,10 +415,8 @@ static int parse_argv(int argc, char *argv[]) {
                          * sysctl name available. */
                         sysctl_normalize(optarg);
 
-                        if (path_startswith(optarg, "/proc/sys"))
-                                p = strdup(optarg);
-                        else
-                                p = path_join("/proc/sys", optarg);
+                        s = path_startswith(optarg, "/proc/sys");
+                        p = strdup(s ?: optarg);
                         if (!p)
                                 return log_oom();
 
@@ -365,6 +430,10 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
+                case ARG_STRICT:
+                        arg_strict = true;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -372,16 +441,16 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached();
                 }
 
-        if (arg_cat_config && argc > optind)
+        if (arg_cat_flags != CAT_CONFIG_OFF && argc > optind)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Positional arguments are not allowed with --cat-config");
+                                       "Positional arguments are not allowed with --cat-config/--tldr.");
 
         return 1;
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(ordered_hashmap_freep) OrderedHashmap *sysctl_options = NULL;
-        int r, k;
+        _cleanup_ordered_hashmap_free_ OrderedHashmap *sysctl_options = NULL;
+        int r;
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -392,39 +461,28 @@ static int run(int argc, char *argv[]) {
         umask(0022);
 
         if (argc > optind) {
-                int i;
-
                 r = 0;
 
-                for (i = optind; i < argc; i++) {
-                        k = parse_file(&sysctl_options, argv[i], false);
-                        if (k < 0 && r == 0)
-                                r = k;
-                }
+                for (int i = optind; i < argc; i++)
+                        RET_GATHER(r, parse_file(&sysctl_options, argv[i], false));
+
         } else {
                 _cleanup_strv_free_ char **files = NULL;
-                char **f;
 
                 r = conf_files_list_strv(&files, ".conf", NULL, 0, (const char**) CONF_PATHS_STRV("sysctl.d"));
                 if (r < 0)
                         return log_error_errno(r, "Failed to enumerate sysctl.d files: %m");
 
-                if (arg_cat_config) {
-                        pager_open(arg_pager_flags);
+                if (arg_cat_flags != CAT_CONFIG_OFF)
+                        return cat_config(files);
 
-                        return cat_files(NULL, files, 0);
-                }
+                STRV_FOREACH(f, files)
+                        RET_GATHER(r, parse_file(&sysctl_options, *f, true));
 
-                STRV_FOREACH(f, files) {
-                        k = parse_file(&sysctl_options, *f, true);
-                        if (k < 0 && r == 0)
-                                r = k;
-                }
+                RET_GATHER(r, read_credential_lines(&sysctl_options));
         }
 
-        k = apply_all(sysctl_options);
-        if (k < 0 && r == 0)
-                r = k;
+        RET_GATHER(r, apply_all(sysctl_options));
 
         return r;
 }

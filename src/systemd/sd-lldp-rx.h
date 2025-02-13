@@ -14,7 +14,7 @@
   Lesser General Public License for more details.
 
   You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
 #include <errno.h>
@@ -32,14 +32,14 @@ _SD_BEGIN_DECLARATIONS;
 typedef struct sd_lldp_rx sd_lldp_rx;
 typedef struct sd_lldp_neighbor sd_lldp_neighbor;
 
-typedef enum sd_lldp_rx_event_t {
+__extension__ typedef enum _SD_ENUM_TYPE_S64(sd_lldp_rx_event_t) {
         SD_LLDP_RX_EVENT_ADDED,
         SD_LLDP_RX_EVENT_REMOVED,
         SD_LLDP_RX_EVENT_UPDATED,
         SD_LLDP_RX_EVENT_REFRESHED,
         _SD_LLDP_RX_EVENT_MAX,
         _SD_LLDP_RX_EVENT_INVALID = -EINVAL,
-        _SD_ENUM_FORCE_S64(LLDP_RX_EVENT),
+        _SD_ENUM_FORCE_S64(LLDP_RX_EVENT)
 } sd_lldp_rx_event_t;
 
 typedef void (*sd_lldp_rx_callback_t)(sd_lldp_rx *lldp_rx, sd_lldp_rx_event_t event, sd_lldp_neighbor *n, void *userdata);
@@ -68,7 +68,6 @@ int sd_lldp_rx_set_filter_address(sd_lldp_rx *lldp_rx, const struct ether_addr *
 
 int sd_lldp_rx_get_neighbors(sd_lldp_rx *lldp_rx, sd_lldp_neighbor ***neighbors);
 
-int sd_lldp_neighbor_from_raw(sd_lldp_neighbor **ret, const void *raw, size_t raw_size);
 sd_lldp_neighbor *sd_lldp_neighbor_ref(sd_lldp_neighbor *n);
 sd_lldp_neighbor *sd_lldp_neighbor_unref(sd_lldp_neighbor *n);
 
@@ -76,7 +75,6 @@ sd_lldp_neighbor *sd_lldp_neighbor_unref(sd_lldp_neighbor *n);
 int sd_lldp_neighbor_get_source_address(sd_lldp_neighbor *n, struct ether_addr* address);
 int sd_lldp_neighbor_get_destination_address(sd_lldp_neighbor *n, struct ether_addr* address);
 int sd_lldp_neighbor_get_timestamp(sd_lldp_neighbor *n, clockid_t clock, uint64_t *ret);
-int sd_lldp_neighbor_get_raw(sd_lldp_neighbor *n, const void **ret, size_t *size);
 
 /* High-level, direct, parsed out field access. These fields exist at most once, hence may be queried directly. */
 int sd_lldp_neighbor_get_chassis_id(sd_lldp_neighbor *n, uint8_t *type, const void **ret, size_t *size);

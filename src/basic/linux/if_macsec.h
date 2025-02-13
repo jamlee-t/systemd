@@ -10,8 +10,8 @@
  * (at your option) any later version.
  */
 
-#ifndef _UAPI_MACSEC_H
-#define _UAPI_MACSEC_H
+#ifndef _MACSEC_H
+#define _MACSEC_H
 
 #include <linux/types.h>
 
@@ -21,6 +21,8 @@
 #define MACSEC_MAX_KEY_LEN 128
 
 #define MACSEC_KEYID_LEN 16
+
+#define MACSEC_SALT_LEN 12
 
 /* cipher IDs as per IEEE802.1AE-2018 (Table 14-1) */
 #define MACSEC_CIPHER_ID_GCM_AES_128 0x0080C20001000001ULL
@@ -189,4 +191,4 @@ enum macsec_secy_stats_attr {
 	MACSEC_SECY_STATS_ATTR_MAX = __MACSEC_SECY_STATS_ATTR_END - 1,
 };
 
-#endif /* _UAPI_MACSEC_H */
+#endif /* _MACSEC_H */

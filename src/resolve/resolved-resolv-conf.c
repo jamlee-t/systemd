@@ -10,8 +10,9 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "label.h"
+#include "label-util.h"
 #include "ordered-set.h"
+#include "path-util.h"
 #include "resolved-conf.h"
 #include "resolved-dns-server.h"
 #include "resolved-resolv-conf.h"
@@ -41,8 +42,7 @@ int manager_check_resolv_conf(const Manager *m) {
 
         /* Is it symlinked to our own uplink file? */
         if (stat(PRIVATE_STATIC_RESOLV_CONF, &own) >= 0 &&
-            st.st_dev == own.st_dev &&
-            st.st_ino == own.st_ino)
+            stat_inode_same(&st, &own))
                 return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
                                          "DNSStubListener= is disabled, but /etc/resolv.conf is a symlink to "
                                          PRIVATE_STATIC_RESOLV_CONF " which expects DNSStubListener= to be enabled.");
@@ -51,8 +51,6 @@ int manager_check_resolv_conf(const Manager *m) {
 }
 
 static bool file_is_our_own(const struct stat *st) {
-        const char *path;
-
         assert(st);
 
         FOREACH_STRING(path,
@@ -64,8 +62,7 @@ static bool file_is_our_own(const struct stat *st) {
 
                 /* Is it symlinked to our own uplink file? */
                 if (stat(path, &own) >= 0 &&
-                    st->st_dev == own.st_dev &&
-                    st->st_ino == own.st_ino)
+                    stat_inode_same(st, &own))
                         return true;
         }
 
@@ -125,9 +122,8 @@ int manager_read_resolv_conf(Manager *m) {
         for (;;) {
                 _cleanup_free_ char *line = NULL;
                 const char *a;
-                char *l;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = read_stripped_line(f, LONG_LINE_MAX, &line);
                 if (r < 0) {
                         log_error_errno(r, "Failed to read /etc/resolv.conf: %m");
                         goto clear;
@@ -137,11 +133,10 @@ int manager_read_resolv_conf(Manager *m) {
 
                 n++;
 
-                l = strstrip(line);
-                if (IN_SET(*l, '#', ';', 0))
+                if (IN_SET(*line, '#', ';', 0))
                         continue;
 
-                a = first_word(l, "nameserver");
+                a = first_word(line, "nameserver");
                 if (a) {
                         r = manager_parse_dns_server_string_and_warn(m, DNS_SERVER_SYSTEM, a);
                         if (r < 0)
@@ -150,9 +145,9 @@ int manager_read_resolv_conf(Manager *m) {
                         continue;
                 }
 
-                a = first_word(l, "domain");
+                a = first_word(line, "domain");
                 if (!a) /* We treat "domain" lines, and "search" lines as equivalent, and add both to our list. */
-                        a = first_word(l, "search");
+                        a = first_word(line, "search");
                 if (a) {
                         r = manager_parse_search_domains_and_warn(m, a);
                         if (r < 0)
@@ -161,7 +156,7 @@ int manager_read_resolv_conf(Manager *m) {
                         continue;
                 }
 
-                log_syntax(NULL, LOG_DEBUG, "/etc/resolv.conf", n, 0, "Ignoring resolv.conf line: %s", l);
+                log_syntax(NULL, LOG_DEBUG, "/etc/resolv.conf", n, 0, "Ignoring resolv.conf line: %s", line);
         }
 
         m->resolv_conf_stat = st;
@@ -330,7 +325,7 @@ static int write_stub_resolv_conf_contents(FILE *f, OrderedSet *dns, OrderedSet 
 
 int manager_write_resolv_conf(Manager *m) {
         _cleanup_ordered_set_free_ OrderedSet *dns = NULL, *domains = NULL;
-        _cleanup_free_ char *temp_path_uplink = NULL, *temp_path_stub = NULL;
+        _cleanup_(unlink_and_freep) char *temp_path_uplink = NULL, *temp_path_stub = NULL;
         _cleanup_fclose_ FILE *f_uplink = NULL, *f_stub = NULL;
         int r;
 
@@ -342,60 +337,54 @@ int manager_write_resolv_conf(Manager *m) {
         /* Add the full list to a set, to filter out duplicates */
         r = manager_compile_dns_servers(m, &dns);
         if (r < 0)
-                return log_warning_errno(r, "Failed to compile list of DNS servers: %m");
+                return log_warning_errno(r, "Failed to compile list of DNS servers, ignoring: %m");
 
         r = manager_compile_search_domains(m, &domains, false);
         if (r < 0)
-                return log_warning_errno(r, "Failed to compile list of search domains: %m");
+                return log_warning_errno(r, "Failed to compile list of search domains, ignoring: %m");
 
         r = fopen_temporary_label(PRIVATE_UPLINK_RESOLV_CONF, PRIVATE_UPLINK_RESOLV_CONF, &f_uplink, &temp_path_uplink);
         if (r < 0)
-                return log_warning_errno(r, "Failed to open new %s for writing: %m", PRIVATE_UPLINK_RESOLV_CONF);
+                return log_warning_errno(r, "Failed to open new %s for writing, ignoring: %m", PRIVATE_UPLINK_RESOLV_CONF);
 
         (void) fchmod(fileno(f_uplink), 0644);
 
         r = write_uplink_resolv_conf_contents(f_uplink, dns, domains);
-        if (r < 0) {
-                log_error_errno(r, "Failed to write new %s: %m", PRIVATE_UPLINK_RESOLV_CONF);
-                goto fail;
-        }
+        if (r < 0)
+                return log_warning_errno(r, "Failed to write new %s, ignoring: %m", PRIVATE_UPLINK_RESOLV_CONF);
 
         if (m->dns_stub_listener_mode != DNS_STUB_LISTENER_NO) {
                 r = fopen_temporary_label(PRIVATE_STUB_RESOLV_CONF, PRIVATE_STUB_RESOLV_CONF, &f_stub, &temp_path_stub);
-                if (r < 0) {
-                        log_warning_errno(r, "Failed to open new %s for writing: %m", PRIVATE_STUB_RESOLV_CONF);
-                        goto fail;
-                }
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to open new %s for writing, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
 
                 (void) fchmod(fileno(f_stub), 0644);
 
                 r = write_stub_resolv_conf_contents(f_stub, dns, domains);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to write new %s: %m", PRIVATE_STUB_RESOLV_CONF);
-                        goto fail;
-                }
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to write new %s, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
 
                 r = conservative_rename(temp_path_stub, PRIVATE_STUB_RESOLV_CONF);
                 if (r < 0)
-                        log_error_errno(r, "Failed to move new %s into place: %m", PRIVATE_STUB_RESOLV_CONF);
+                        log_warning_errno(r, "Failed to move new %s into place, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
 
+                temp_path_stub = mfree(temp_path_stub); /* free the string explicitly, so that we don't unlink anymore */
         } else {
-                r = symlink_atomic_label(basename(PRIVATE_UPLINK_RESOLV_CONF), PRIVATE_STUB_RESOLV_CONF);
+                _cleanup_free_ char *fname = NULL;
+                r = path_extract_filename(PRIVATE_UPLINK_RESOLV_CONF, &fname);
                 if (r < 0)
-                        log_error_errno(r, "Failed to symlink %s: %m", PRIVATE_STUB_RESOLV_CONF);
+                        return log_warning_errno(r, "Failed to extract filename from path '" PRIVATE_UPLINK_RESOLV_CONF "', ignoring: %m");
+
+                r = symlink_atomic_label(fname, PRIVATE_STUB_RESOLV_CONF);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to symlink %s, ignoring: %m", PRIVATE_STUB_RESOLV_CONF);
         }
 
         r = conservative_rename(temp_path_uplink, PRIVATE_UPLINK_RESOLV_CONF);
         if (r < 0)
-                log_error_errno(r, "Failed to move new %s into place: %m", PRIVATE_UPLINK_RESOLV_CONF);
+                log_warning_errno(r, "Failed to move new %s into place: %m", PRIVATE_UPLINK_RESOLV_CONF);
 
- fail:
-        if (r < 0) {
-                /* Something went wrong, perform cleanup... */
-                (void) unlink(temp_path_uplink);
-                (void) unlink(temp_path_stub);
-        }
-
+        temp_path_uplink = mfree(temp_path_uplink); /* free the string explicitly, so that we don't unlink anymore */
         return r;
 }
 
@@ -428,8 +417,7 @@ int resolv_conf_mode(void) {
                         continue;
                 }
 
-                if (system_st.st_dev == our_st.st_dev &&
-                    system_st.st_ino == our_st.st_ino)
+                if (stat_inode_same(&system_st, &our_st))
                         return m;
         }
 

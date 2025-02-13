@@ -10,45 +10,39 @@
 #include "sd-id128.h"
 
 #include "alloc-util.h"
-#include "dhcp-internal.h"
+#include "dhcp-network.h"
+#include "dhcp-option.h"
+#include "dhcp-packet.h"
 #include "dhcp-server-internal.h"
+#include "dhcp-server-lease-internal.h"
+#include "dns-domain.h"
 #include "fd-util.h"
 #include "in-addr-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
+#include "memory-util.h"
 #include "network-common.h"
 #include "ordered-set.h"
+#include "path-util.h"
 #include "siphash24.h"
 #include "string-util.h"
 #include "unaligned.h"
+#include "utf8.h"
 
 #define DHCP_DEFAULT_LEASE_TIME_USEC USEC_PER_HOUR
 #define DHCP_MAX_LEASE_TIME_USEC (USEC_PER_HOUR*12)
 
-static DHCPLease *dhcp_lease_free(DHCPLease *lease) {
-        if (!lease)
-                return NULL;
+static void server_on_lease_change(sd_dhcp_server *server) {
+        int r;
 
-        if (lease->server) {
-                DHCPLease *e;
+        assert(server);
 
-                e = hashmap_get(lease->server->bound_leases_by_client_id, &lease->client_id);
-                if (e == lease) {
-                        hashmap_remove(lease->server->bound_leases_by_address, UINT32_TO_PTR(lease->address));
-                        hashmap_remove(lease->server->bound_leases_by_client_id, &lease->client_id);
-                }
+        r = dhcp_server_save_leases(server);
+        if (r < 0)
+                log_dhcp_server_errno(server, r, "Failed to save leases, ignoring: %m");
 
-                e = hashmap_get(lease->server->static_leases_by_client_id, &lease->client_id);
-                if (e == lease) {
-                        hashmap_remove(lease->server->static_leases_by_address, UINT32_TO_PTR(lease->address));
-                        hashmap_remove(lease->server->static_leases_by_client_id, &lease->client_id);
-                }
-        }
-
-        free(lease->client_id.data);
-        return mfree(lease);
+        if (server->callback)
+                server->callback(server, SD_DHCP_SERVER_EVENT_LEASE_CHANGED, server->callback_userdata);
 }
-
-DEFINE_TRIVIAL_CLEANUP_FUNC(DHCPLease*, dhcp_lease_free);
 
 /* configures the server's address and subnet, and optionally the pool's size and offset into the subnet
  * the whole pool must fit into the subnet, and may not contain the first (any) nor last (broadcast) address
@@ -107,20 +101,14 @@ int sd_dhcp_server_configure_pool(
                 server->address = address->s_addr;
                 server->netmask = netmask;
                 server->subnet = address->s_addr & netmask;
-
-                /* Drop any leases associated with the old address range */
-                hashmap_clear(server->bound_leases_by_address);
-                hashmap_clear(server->bound_leases_by_client_id);
-
-                if (server->callback)
-                        server->callback(server, SD_DHCP_SERVER_EVENT_LEASE_CHANGED, server->callback_userdata);
         }
 
         return 0;
 }
 
 int sd_dhcp_server_is_running(sd_dhcp_server *server) {
-        assert_return(server, false);
+        if (!server)
+                return false;
 
         return !!server->receive_message;
 }
@@ -131,45 +119,15 @@ int sd_dhcp_server_is_in_relay_mode(sd_dhcp_server *server) {
         return in4_addr_is_set(&server->relay_target);
 }
 
-void client_id_hash_func(const DHCPClientId *id, struct siphash *state) {
-        assert(id);
-        assert(id->length);
-        assert(id->data);
-
-        siphash24_compress(&id->length, sizeof(id->length), state);
-        siphash24_compress(id->data, id->length, state);
-}
-
-int client_id_compare_func(const DHCPClientId *a, const DHCPClientId *b) {
-        int r;
-
-        assert(!a->length || a->data);
-        assert(!b->length || b->data);
-
-        r = CMP(a->length, b->length);
-        if (r != 0)
-                return r;
-
-        return memcmp(a->data, b->data, a->length);
-}
-
-DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
-        dhcp_lease_hash_ops,
-        DHCPClientId,
-        client_id_hash_func,
-        client_id_compare_func,
-        DHCPLease,
-        dhcp_lease_free);
-
 static sd_dhcp_server *dhcp_server_free(sd_dhcp_server *server) {
         assert(server);
-
-        log_dhcp_server(server, "UNREF");
 
         sd_dhcp_server_stop(server);
 
         sd_event_unref(server->event);
 
+        free(server->boot_server_name);
+        free(server->boot_filename);
         free(server->timezone);
 
         for (sd_dhcp_lease_server_type_t i = 0; i < _SD_DHCP_LEASE_SERVER_TYPE_MAX; i++)
@@ -185,6 +143,9 @@ static sd_dhcp_server *dhcp_server_free(sd_dhcp_server *server) {
 
         free(server->agent_circuit_id);
         free(server->agent_remote_id);
+
+        safe_close(server->lease_dir_fd);
+        free(server->lease_file);
 
         free(server->ifname);
         return mfree(server);
@@ -204,15 +165,17 @@ int sd_dhcp_server_new(sd_dhcp_server **ret, int ifindex) {
 
         *server = (sd_dhcp_server) {
                 .n_ref = 1,
-                .fd_raw = -1,
-                .fd = -1,
-                .fd_broadcast = -1,
+                .fd_raw = -EBADF,
+                .fd = -EBADF,
+                .fd_broadcast = -EBADF,
                 .address = htobe32(INADDR_ANY),
                 .netmask = htobe32(INADDR_ANY),
                 .ifindex = ifindex,
                 .bind_to_interface = true,
-                .default_lease_time = DIV_ROUND_UP(DHCP_DEFAULT_LEASE_TIME_USEC, USEC_PER_SEC),
-                .max_lease_time = DIV_ROUND_UP(DHCP_MAX_LEASE_TIME_USEC, USEC_PER_SEC),
+                .default_lease_time = DHCP_DEFAULT_LEASE_TIME_USEC,
+                .max_lease_time = DHCP_MAX_LEASE_TIME_USEC,
+                .rapid_commit = true,
+                .lease_dir_fd = -EBADF,
         };
 
         *ret = TAKE_PTR(server);
@@ -278,9 +241,49 @@ sd_event *sd_dhcp_server_get_event(sd_dhcp_server *server) {
         return server->event;
 }
 
+int sd_dhcp_server_set_boot_server_address(sd_dhcp_server *server, const struct in_addr *address) {
+        assert_return(server, -EINVAL);
+
+        if (address)
+                server->boot_server_address = *address;
+        else
+                server->boot_server_address = (struct in_addr) {};
+
+        return 0;
+}
+
+int sd_dhcp_server_set_boot_server_name(sd_dhcp_server *server, const char *name) {
+        int r;
+
+        assert_return(server, -EINVAL);
+
+        if (name) {
+                r = dns_name_is_valid(name);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return -EINVAL;
+        }
+
+        return free_and_strdup(&server->boot_server_name, name);
+}
+
+int sd_dhcp_server_set_boot_filename(sd_dhcp_server *server, const char *filename) {
+        assert_return(server, -EINVAL);
+
+        if (filename && !string_is_safe_ascii(filename))
+                return -EINVAL;
+
+        return free_and_strdup(&server->boot_filename, filename);
+}
+
 int sd_dhcp_server_stop(sd_dhcp_server *server) {
+        bool running;
+
         if (!server)
                 return 0;
+
+        running = sd_dhcp_server_is_running(server);
 
         server->receive_message = sd_event_source_disable_unref(server->receive_message);
         server->receive_broadcast = sd_event_source_disable_unref(server->receive_broadcast);
@@ -289,27 +292,47 @@ int sd_dhcp_server_stop(sd_dhcp_server *server) {
         server->fd = safe_close(server->fd);
         server->fd_broadcast = safe_close(server->fd_broadcast);
 
-        log_dhcp_server(server, "STOPPED");
+        if (running)
+                log_dhcp_server(server, "STOPPED");
 
         return 0;
 }
 
-static int dhcp_server_send_unicast_raw(sd_dhcp_server *server,
-                                        DHCPPacket *packet, size_t len) {
+static bool dhcp_request_contains(DHCPRequest *req, uint8_t option) {
+        assert(req);
+
+        if (!req->parameter_request_list)
+                return false;
+
+        return memchr(req->parameter_request_list, option, req->parameter_request_list_len);
+}
+
+static int dhcp_server_send_unicast_raw(
+                sd_dhcp_server *server,
+                uint8_t hlen,
+                const uint8_t *chaddr,
+                DHCPPacket *packet,
+                size_t len) {
+
         union sockaddr_union link = {
                 .ll.sll_family = AF_PACKET,
                 .ll.sll_protocol = htobe16(ETH_P_IP),
                 .ll.sll_ifindex = server->ifindex,
-                .ll.sll_halen = ETH_ALEN,
+                .ll.sll_halen = hlen,
         };
 
         assert(server);
         assert(server->ifindex > 0);
-        assert(server->address);
+        assert(server->address != 0);
+        assert(hlen > 0);
+        assert(chaddr);
         assert(packet);
         assert(len > sizeof(DHCPPacket));
 
-        memcpy(&link.ll.sll_addr, &packet->dhcp.chaddr, ETH_ALEN);
+        memcpy(link.ll.sll_addr, chaddr, hlen);
+
+        if (len > UINT16_MAX)
+                return -EOVERFLOW;
 
         dhcp_packet_append_ip_headers(packet, server->address, DHCP_PORT_SERVER,
                                       packet->dhcp.yiaddr,
@@ -343,7 +366,7 @@ static int dhcp_server_send_udp(sd_dhcp_server *server, be32_t destination,
         assert(server);
         assert(server->fd >= 0);
         assert(message);
-        assert(len > sizeof(DHCPMessage));
+        assert(len >= sizeof(DHCPMessage));
 
         if (server->bind_to_interface) {
                 msg.msg_control = &control;
@@ -360,7 +383,7 @@ static int dhcp_server_send_udp(sd_dhcp_server *server, be32_t destination,
                    rather than binding the socket. This will be mostly useful
                    when we gain support for arbitrary number of server addresses
                  */
-                pktinfo = (struct in_pktinfo*) CMSG_DATA(cmsg);
+                pktinfo = CMSG_TYPED_DATA(cmsg, struct in_pktinfo);
                 assert(pktinfo);
 
                 pktinfo->ipi_ifindex = server->ifindex;
@@ -378,8 +401,16 @@ static bool requested_broadcast(DHCPMessage *message) {
         return message->flags & htobe16(0x8000);
 }
 
-static int dhcp_server_send(sd_dhcp_server *server, be32_t destination, uint16_t destination_port,
-                            DHCPPacket *packet, size_t optoffset, bool l2_broadcast) {
+static int dhcp_server_send(
+                sd_dhcp_server *server,
+                uint8_t hlen,
+                const uint8_t *chaddr,
+                be32_t destination,
+                uint16_t destination_port,
+                DHCPPacket *packet,
+                size_t optoffset,
+                bool l2_broadcast) {
+
         if (destination != INADDR_ANY)
                 return dhcp_server_send_udp(server, destination,
                                             destination_port, &packet->dhcp,
@@ -392,7 +423,7 @@ static int dhcp_server_send(sd_dhcp_server *server, be32_t destination, uint16_t
                 /* we cannot send UDP packet to specific MAC address when the
                    address is not yet configured, so must fall back to raw
                    packets */
-                return dhcp_server_send_unicast_raw(server, packet,
+                return dhcp_server_send_unicast_raw(server, hlen, chaddr, packet,
                                                     sizeof(DHCPPacket) + optoffset);
 }
 
@@ -405,7 +436,7 @@ int dhcp_server_send_packet(sd_dhcp_server *server,
 
         assert(server);
         assert(req);
-        assert(req->max_optlen);
+        assert(req->max_optlen > 0);
         assert(req->message);
         assert(optoffset <= req->max_optlen);
         assert(packet);
@@ -453,45 +484,51 @@ int dhcp_server_send_packet(sd_dhcp_server *server,
            client, because the client may not have a correct network address
            or subnet mask, and the client may not be answering ARP requests.
          */
-        if (req->message->giaddr) {
+        if (req->message->giaddr != 0) {
                 destination = req->message->giaddr;
                 destination_port = DHCP_PORT_SERVER;
                 if (type == DHCP_NAK)
                         packet->dhcp.flags = htobe16(0x8000);
-        } else if (req->message->ciaddr && type != DHCP_NAK)
+        } else if (req->message->ciaddr != 0 && type != DHCP_NAK)
                 destination = req->message->ciaddr;
 
         bool l2_broadcast = requested_broadcast(req->message) || type == DHCP_NAK;
-        return dhcp_server_send(server, destination, destination_port, packet, optoffset, l2_broadcast);
+        return dhcp_server_send(server, req->message->hlen, req->message->chaddr,
+                                destination, destination_port, packet, optoffset, l2_broadcast);
 }
 
-static int server_message_init(sd_dhcp_server *server, DHCPPacket **ret,
-                               uint8_t type, size_t *_optoffset,
-                               DHCPRequest *req) {
+static int server_message_init(
+                sd_dhcp_server *server,
+                DHCPPacket **ret,
+                uint8_t type,
+                size_t *ret_optoffset,
+                DHCPRequest *req) {
+
         _cleanup_free_ DHCPPacket *packet = NULL;
         size_t optoffset = 0;
         int r;
 
         assert(server);
         assert(ret);
-        assert(_optoffset);
+        assert(ret_optoffset);
         assert(IN_SET(type, DHCP_OFFER, DHCP_ACK, DHCP_NAK));
+        assert(req);
 
         packet = malloc0(sizeof(DHCPPacket) + req->max_optlen);
         if (!packet)
                 return -ENOMEM;
 
         r = dhcp_message_init(&packet->dhcp, BOOTREPLY,
-                              be32toh(req->message->xid), type, ARPHRD_ETHER,
+                              be32toh(req->message->xid), type,
+                              req->message->htype, req->message->hlen, req->message->chaddr,
                               req->max_optlen, &optoffset);
         if (r < 0)
                 return r;
 
         packet->dhcp.flags = req->message->flags;
         packet->dhcp.giaddr = req->message->giaddr;
-        memcpy(&packet->dhcp.chaddr, &req->message->chaddr, ETH_ALEN);
 
-        *_optoffset = optoffset;
+        *ret_optoffset = optoffset;
         *ret = TAKE_PTR(packet);
 
         return 0;
@@ -502,6 +539,15 @@ static int server_send_offer_or_ack(
                 DHCPRequest *req,
                 be32_t address,
                 uint8_t type) {
+
+        static const uint8_t option_map[_SD_DHCP_LEASE_SERVER_TYPE_MAX] = {
+                [SD_DHCP_LEASE_DNS]  = SD_DHCP_OPTION_DOMAIN_NAME_SERVER,
+                [SD_DHCP_LEASE_NTP]  = SD_DHCP_OPTION_NTP_SERVER,
+                [SD_DHCP_LEASE_SIP]  = SD_DHCP_OPTION_SIP_SERVER,
+                [SD_DHCP_LEASE_POP3] = SD_DHCP_OPTION_POP3_SERVER,
+                [SD_DHCP_LEASE_SMTP] = SD_DHCP_OPTION_SMTP_SERVER,
+                [SD_DHCP_LEASE_LPR]  = SD_DHCP_OPTION_LPR_SERVER,
+        };
 
         _cleanup_free_ DHCPPacket *packet = NULL;
         sd_dhcp_option *j;
@@ -518,8 +564,9 @@ static int server_send_offer_or_ack(
                 return r;
 
         packet->dhcp.yiaddr = address;
+        packet->dhcp.siaddr = server->boot_server_address.s_addr;
 
-        lease_time = htobe32(req->lifetime);
+        lease_time = usec_to_be32_sec(req->lifetime);
         r = dhcp_option_append(&packet->dhcp, req->max_optlen, &offset, 0,
                                SD_DHCP_OPTION_IP_ADDRESS_LEASE_TIME, 4,
                                &lease_time);
@@ -541,38 +588,57 @@ static int server_send_offer_or_ack(
                         return r;
         }
 
-        if (type == DHCP_ACK) {
-                static const uint8_t option_map[_SD_DHCP_LEASE_SERVER_TYPE_MAX] = {
-                        [SD_DHCP_LEASE_DNS] = SD_DHCP_OPTION_DOMAIN_NAME_SERVER,
-                        [SD_DHCP_LEASE_NTP] = SD_DHCP_OPTION_NTP_SERVER,
-                        [SD_DHCP_LEASE_SIP] = SD_DHCP_OPTION_SIP_SERVER,
-                        [SD_DHCP_LEASE_POP3] = SD_DHCP_OPTION_POP3_SERVER,
-                        [SD_DHCP_LEASE_SMTP] = SD_DHCP_OPTION_SMTP_SERVER,
-                        [SD_DHCP_LEASE_LPR] = SD_DHCP_OPTION_LPR_SERVER,
-                };
+        if (server->boot_server_name) {
+                r = dhcp_option_append(&packet->dhcp, req->max_optlen, &offset, 0,
+                                       SD_DHCP_OPTION_BOOT_SERVER_NAME,
+                                       strlen(server->boot_server_name), server->boot_server_name);
+                if (r < 0)
+                        return r;
+        }
 
-                for (sd_dhcp_lease_server_type_t k = 0; k < _SD_DHCP_LEASE_SERVER_TYPE_MAX; k++) {
-                        if (server->servers[k].size <= 0)
-                                continue;
+        if (server->boot_filename) {
+                r = dhcp_option_append(&packet->dhcp, req->max_optlen, &offset, 0,
+                                       SD_DHCP_OPTION_BOOT_FILENAME,
+                                       strlen(server->boot_filename), server->boot_filename);
+                if (r < 0)
+                        return r;
+        }
 
-                        r = dhcp_option_append(
-                                        &packet->dhcp, req->max_optlen, &offset, 0,
-                                        option_map[k],
-                                        sizeof(struct in_addr) * server->servers[k].size,
-                                        server->servers[k].addr);
-                        if (r < 0)
-                                return r;
-                }
+        for (sd_dhcp_lease_server_type_t k = 0; k < _SD_DHCP_LEASE_SERVER_TYPE_MAX; k++) {
+                if (server->servers[k].size <= 0)
+                        continue;
 
+                r = dhcp_option_append(
+                                &packet->dhcp, req->max_optlen, &offset, 0,
+                                option_map[k],
+                                sizeof(struct in_addr) * server->servers[k].size,
+                                server->servers[k].addr);
+                if (r < 0)
+                        return r;
+        }
 
-                if (server->timezone) {
-                        r = dhcp_option_append(
-                                        &packet->dhcp, req->max_optlen, &offset, 0,
-                                        SD_DHCP_OPTION_NEW_TZDB_TIMEZONE,
-                                        strlen(server->timezone), server->timezone);
-                        if (r < 0)
-                                return r;
-                }
+        if (server->timezone) {
+                r = dhcp_option_append(
+                                &packet->dhcp, req->max_optlen, &offset, 0,
+                                SD_DHCP_OPTION_TZDB_TIMEZONE,
+                                strlen(server->timezone), server->timezone);
+                if (r < 0)
+                        return r;
+        }
+
+        /* RFC 8925 section 3.3. DHCPv4 Server Behavior
+         * The server MUST NOT include the IPv6-Only Preferred option in the DHCPOFFER or DHCPACK message if
+         * the option was not present in the Parameter Request List sent by the client. */
+        if (dhcp_request_contains(req, SD_DHCP_OPTION_IPV6_ONLY_PREFERRED) &&
+            server->ipv6_only_preferred_usec > 0) {
+                be32_t sec = usec_to_be32_sec(server->ipv6_only_preferred_usec);
+
+                r = dhcp_option_append(
+                                &packet->dhcp, req->max_optlen, &offset, 0,
+                                SD_DHCP_OPTION_IPV6_ONLY_PREFERRED,
+                                sizeof(sec), &sec);
+                if (r < 0)
+                        return r;
         }
 
         ORDERED_SET_FOREACH(j, server->extra_options) {
@@ -591,27 +657,50 @@ static int server_send_offer_or_ack(
                         return r;
         }
 
-        r = dhcp_server_send_packet(server, req, packet, type, offset);
-        if (r < 0)
-                return r;
+        if (server->rapid_commit && req->rapid_commit && type == DHCP_ACK) {
+                r = dhcp_option_append(
+                                &packet->dhcp, req->max_optlen, &offset, 0,
+                                SD_DHCP_OPTION_RAPID_COMMIT,
+                                0, NULL);
+                if (r < 0)
+                        return r;
+        }
 
-        return 0;
+        return dhcp_server_send_packet(server, req, packet, type, offset);
 }
 
-static int server_send_nak(sd_dhcp_server *server, DHCPRequest *req) {
+static int server_send_nak_or_ignore(sd_dhcp_server *server, bool init_reboot, DHCPRequest *req) {
         _cleanup_free_ DHCPPacket *packet = NULL;
         size_t offset;
         int r;
 
+        /* When a request is refused, RFC 2131, section 4.3.2 mentioned we should send NAK when the
+         * client is in INITREBOOT. If the client is in other state, there is nothing mentioned in the
+         * RFC whether we should send NAK or not. Hence, let's silently ignore the request. */
+
+        if (!init_reboot)
+                return 0;
+
         r = server_message_init(server, &packet, DHCP_NAK, &offset, req);
         if (r < 0)
-                return r;
+                return log_dhcp_server_errno(server, r, "Failed to create NAK message: %m");
 
-        return dhcp_server_send_packet(server, req, packet, DHCP_NAK, offset);
+        r = dhcp_server_send_packet(server, req, packet, DHCP_NAK, offset);
+        if (r < 0)
+                return log_dhcp_server_errno(server, r, "Could not send NAK message: %m");
+
+        log_dhcp_server(server, "NAK (0x%x)", be32toh(req->message->xid));
+        return DHCP_NAK;
 }
 
-static int server_send_forcerenew(sd_dhcp_server *server, be32_t address,
-                                  be32_t gateway, const uint8_t chaddr[]) {
+static int server_send_forcerenew(
+                sd_dhcp_server *server,
+                be32_t address,
+                be32_t gateway,
+                uint8_t htype,
+                uint8_t hlen,
+                const uint8_t *chaddr) {
+
         _cleanup_free_ DHCPPacket *packet = NULL;
         size_t optoffset = 0;
         int r;
@@ -625,7 +714,7 @@ static int server_send_forcerenew(sd_dhcp_server *server, be32_t address,
                 return -ENOMEM;
 
         r = dhcp_message_init(&packet->dhcp, BOOTREPLY, 0,
-                              DHCP_FORCERENEW, ARPHRD_ETHER,
+                              DHCP_FORCERENEW, htype, hlen, chaddr,
                               DHCP_MIN_OPTIONS_SIZE, &optoffset);
         if (r < 0)
                 return r;
@@ -635,26 +724,19 @@ static int server_send_forcerenew(sd_dhcp_server *server, be32_t address,
         if (r < 0)
                 return r;
 
-        memcpy(&packet->dhcp.chaddr, chaddr, ETH_ALEN);
-
-        r = dhcp_server_send_udp(server, address, DHCP_PORT_CLIENT,
-                                 &packet->dhcp,
-                                 sizeof(DHCPMessage) + optoffset);
-        if (r < 0)
-                return r;
-
-        return 0;
+        return dhcp_server_send_udp(server, address, DHCP_PORT_CLIENT,
+                                    &packet->dhcp,
+                                    sizeof(DHCPMessage) + optoffset);
 }
 
 static int parse_request(uint8_t code, uint8_t len, const void *option, void *userdata) {
-        DHCPRequest *req = userdata;
+        DHCPRequest *req = ASSERT_PTR(userdata);
+        int r;
 
-        assert(req);
-
-        switch(code) {
+        switch (code) {
         case SD_DHCP_OPTION_IP_ADDRESS_LEASE_TIME:
                 if (len == 4)
-                        req->lifetime = unaligned_read_be32(option);
+                        req->lifetime = unaligned_be32_sec_to_usec(option, /* max_as_infinity = */ true);
 
                 break;
         case SD_DHCP_OPTION_REQUESTED_IP_ADDRESS:
@@ -668,17 +750,8 @@ static int parse_request(uint8_t code, uint8_t len, const void *option, void *us
 
                 break;
         case SD_DHCP_OPTION_CLIENT_IDENTIFIER:
-                if (len >= 2) {
-                        uint8_t *data;
-
-                        data = memdup(option, len);
-                        if (!data)
-                                return -ENOMEM;
-
-                        free(req->client_id.data);
-                        req->client_id.data = data;
-                        req->client_id.length = len;
-                }
+                if (client_id_size_is_valid(len))
+                        (void) sd_dhcp_client_id_set_raw(&req->client_id, option, len);
 
                 break;
         case SD_DHCP_OPTION_MAXIMUM_MESSAGE_SIZE:
@@ -691,6 +764,24 @@ static int parse_request(uint8_t code, uint8_t len, const void *option, void *us
                 req->agent_info_option = (uint8_t*)option - 2;
 
                 break;
+        case SD_DHCP_OPTION_HOST_NAME: {
+                _cleanup_free_ char *p = NULL;
+
+                r = dhcp_option_parse_hostname(option, len, &p);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to parse hostname, ignoring: %m");
+                else
+                        free_and_replace(req->hostname, p);
+                break;
+        }
+        case SD_DHCP_OPTION_PARAMETER_REQUEST_LIST:
+                req->parameter_request_list = option;
+                req->parameter_request_list_len = len;
+                break;
+
+        case SD_DHCP_OPTION_RAPID_COMMIT:
+                req->rapid_commit = true;
+                break;
         }
 
         return 0;
@@ -700,39 +791,64 @@ static DHCPRequest* dhcp_request_free(DHCPRequest *req) {
         if (!req)
                 return NULL;
 
-        free(req->client_id.data);
+        free(req->hostname);
         return mfree(req);
 }
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(DHCPRequest*, dhcp_request_free);
 
 static int ensure_sane_request(sd_dhcp_server *server, DHCPRequest *req, DHCPMessage *message) {
+        int r;
+
         assert(req);
         assert(message);
 
         req->message = message;
 
-        /* set client id based on MAC address if client did not send an explicit
-           one */
-        if (!req->client_id.data) {
-                void *data;
+        if (message->hlen > sizeof(message->chaddr))
+                return -EBADMSG;
 
-                data = malloc0(ETH_ALEN + 1);
-                if (!data)
-                        return -ENOMEM;
+        /* set client id based on MAC address if client did not send an explicit one */
+        if (!sd_dhcp_client_id_is_set(&req->client_id)) {
+                if (!client_id_data_size_is_valid(message->hlen))
+                        return -EBADMSG;
 
-                ((uint8_t*) data)[0] = 0x01;
-                memcpy((uint8_t*) data + 1, &message->chaddr, ETH_ALEN);
+                r = sd_dhcp_client_id_set(&req->client_id, /* type = */ 1, message->chaddr, message->hlen);
+                if (r < 0)
+                        return r;
+        }
 
-                req->client_id.length = ETH_ALEN + 1;
-                req->client_id.data = data;
+        if (message->hlen == 0 || memeqzero(message->chaddr, message->hlen)) {
+                uint8_t type;
+                const void *data;
+                size_t size;
+
+                /* See RFC2131 section 4.1.1.
+                 * hlen and chaddr may not be set for non-ethernet interface.
+                 * Let's try to retrieve it from the client ID. */
+
+                if (!sd_dhcp_client_id_is_set(&req->client_id))
+                        return -EBADMSG;
+
+                r = sd_dhcp_client_id_get(&req->client_id, &type, &data, &size);
+                if (r < 0)
+                        return r;
+
+                if (type != 1)
+                        return -EBADMSG;
+
+                if (size > sizeof(message->chaddr))
+                        return -EBADMSG;
+
+                memcpy(message->chaddr, data, size);
+                message->hlen = size;
         }
 
         if (req->max_optlen < DHCP_MIN_OPTIONS_SIZE)
                 req->max_optlen = DHCP_MIN_OPTIONS_SIZE;
 
         if (req->lifetime <= 0)
-                req->lifetime = MAX(1ULL, server->default_lease_time);
+                req->lifetime = MAX(USEC_PER_SEC, server->default_lease_time);
 
         if (server->max_lease_time > 0 && req->lifetime > server->max_lease_time)
                 req->lifetime = server->max_lease_time;
@@ -740,17 +856,48 @@ static int ensure_sane_request(sd_dhcp_server *server, DHCPRequest *req, DHCPMes
         return 0;
 }
 
-static int get_pool_offset(sd_dhcp_server *server, be32_t requested_ip) {
+static void request_set_timestamp(DHCPRequest *req, const triple_timestamp *timestamp) {
+        assert(req);
+
+        if (timestamp && triple_timestamp_is_set(timestamp))
+                req->timestamp = *timestamp;
+        else
+                triple_timestamp_now(&req->timestamp);
+}
+
+static int request_get_lifetime_timestamp(DHCPRequest *req, clockid_t clock, usec_t *ret) {
+        assert(req);
+        assert(TRIPLE_TIMESTAMP_HAS_CLOCK(clock));
+        assert(clock_supported(clock));
+        assert(ret);
+
+        if (req->lifetime <= 0)
+                return -ENODATA;
+
+        if (!triple_timestamp_is_set(&req->timestamp))
+                return -ENODATA;
+
+        *ret = usec_add(triple_timestamp_by_clock(&req->timestamp, clock), req->lifetime);
+        return 0;
+}
+
+static bool address_is_in_pool(sd_dhcp_server *server, be32_t address) {
         assert(server);
 
-        if (!server->pool_size)
-                return -EINVAL;
+        if (server->pool_size == 0)
+                return false;
 
-        if (be32toh(requested_ip) < (be32toh(server->subnet) | server->pool_offset) ||
-            be32toh(requested_ip) >= (be32toh(server->subnet) | (server->pool_offset + server->pool_size)))
-                return -ERANGE;
+        if (address == server->address)
+                return false;
 
-        return be32toh(requested_ip & ~server->netmask) - server->pool_offset;
+        if (be32toh(address) < (be32toh(server->subnet) | server->pool_offset) ||
+            be32toh(address) >= (be32toh(server->subnet) | (server->pool_offset + server->pool_size)))
+                return false;
+
+        if (hashmap_contains(server->static_leases_by_address, UINT32_TO_PTR(address)))
+                return false;
+
+        return true;
 }
 
 static int append_agent_information_option(sd_dhcp_server *server, DHCPMessage *message, size_t opt_length, size_t size) {
@@ -781,6 +928,10 @@ static int dhcp_server_relay_message(sd_dhcp_server *server, DHCPMessage *messag
         assert(server);
         assert(message);
         assert(sd_dhcp_server_is_in_relay_mode(server));
+
+        if (message->hlen == 0 || message->hlen > sizeof(message->chaddr) || memeqzero(message->chaddr, message->hlen))
+                return log_dhcp_server_errno(server, SYNTHETIC_ERRNO(EBADMSG),
+                                             "(relay agent) received message without/invalid hardware address, discarding.");
 
         if (message->op == BOOTREQUEST) {
                 log_dhcp_server(server, "(relay agent) BOOTREQUEST (0x%x)", be32toh(message->xid));
@@ -821,61 +972,36 @@ static int dhcp_server_relay_message(sd_dhcp_server *server, DHCPMessage *messag
 
                 bool l2_broadcast = requested_broadcast(message) || message_type == DHCP_NAK;
                 const be32_t destination = message_type == DHCP_NAK ? INADDR_ANY : message->ciaddr;
-                return dhcp_server_send(server, destination, DHCP_PORT_CLIENT, packet, opt_length, l2_broadcast);
+                return dhcp_server_send(server, message->hlen, message->chaddr, destination, DHCP_PORT_CLIENT, packet, opt_length, l2_broadcast);
         }
         return -EBADMSG;
 }
 
-static int prepare_new_lease(
-                DHCPLease **ret_lease,
-                be32_t address,
-                const DHCPClientId *client_id,
-                const uint8_t chaddr[static ETH_ALEN],
-                be32_t gateway,
-                usec_t expiration) {
-
-        _cleanup_(dhcp_lease_freep) DHCPLease *lease = NULL;
-
-        lease = new(DHCPLease, 1);
-        if (!lease)
-                return -ENOMEM;
-
-        *lease = (DHCPLease) {
-                .address = address,
-                .client_id.length = client_id->length,
-                .gateway = gateway,
-                .expiration = expiration,
-        };
-        lease->client_id.data = memdup(client_id->data, client_id->length);
-        if (!lease->client_id.data)
-                return -ENOMEM;
-
-        memcpy(&lease->chaddr, chaddr, ETH_ALEN);
-
-        *ret_lease = TAKE_PTR(lease);
-
-        return 0;
-}
-
-static int dhcp_server_cleanup_expired_leases(sd_dhcp_server *server) {
-        DHCPLease *lease;
-        usec_t time_now;
+static int server_ack_request(sd_dhcp_server *server, DHCPRequest *req, be32_t address) {
+        usec_t expiration;
         int r;
 
         assert(server);
+        assert(req);
+        assert(address != 0);
 
-        r = sd_event_now(server->event, clock_boottime_or_monotonic(), &time_now);
+        r = request_get_lifetime_timestamp(req, CLOCK_BOOTTIME, &expiration);
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(lease, server->bound_leases_by_client_id) {
-                if (lease->expiration < time_now) {
-                        log_dhcp_server(server, "CLEAN (0x%x)", be32toh(lease->address));
-                        dhcp_lease_free(lease);
-                }
-        }
+        r = dhcp_server_set_lease(server, address, req, expiration);
+        if (r < 0)
+                return log_dhcp_server_errno(server, r, "Failed to create new lease: %m");
 
-        return 0;
+        r = server_send_offer_or_ack(server, req, address, DHCP_ACK);
+        if (r < 0)
+                return log_dhcp_server_errno(server, r, "Could not send ACK: %m");
+
+        log_dhcp_server(server, "ACK (0x%x)", be32toh(req->message->xid));
+
+        server_on_lease_change(server);
+
+        return DHCP_ACK;
 }
 
 static bool address_available(sd_dhcp_server *server, be32_t address) {
@@ -891,18 +1017,16 @@ static bool address_available(sd_dhcp_server *server, be32_t address) {
 
 #define HASH_KEY SD_ID128_MAKE(0d,1d,fe,bd,f1,24,bd,b3,47,f1,dd,6e,73,21,93,30)
 
-int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, size_t length) {
+int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, size_t length, const triple_timestamp *timestamp) {
         _cleanup_(dhcp_request_freep) DHCPRequest *req = NULL;
         _cleanup_free_ char *error_message = NULL;
-        DHCPLease *existing_lease, *static_lease;
+        sd_dhcp_server_lease *existing_lease, *static_lease;
         int type, r;
 
         assert(server);
         assert(message);
 
-        if (message->op != BOOTREQUEST ||
-            message->htype != ARPHRD_ETHER ||
-            message->hlen != ETHER_ADDR_LEN)
+        if (message->op != BOOTREQUEST)
                 return 0;
 
         req = new0(DHCPRequest, 1);
@@ -911,36 +1035,46 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
 
         type = dhcp_option_parse(message, length, parse_request, req, &error_message);
         if (type < 0)
-                return 0;
+                return type;
 
         r = ensure_sane_request(server, req, message);
         if (r < 0)
-                /* this only fails on critical errors */
                 return r;
+
+        request_set_timestamp(req, timestamp);
 
         r = dhcp_server_cleanup_expired_leases(server);
         if (r < 0)
                 return r;
 
         existing_lease = hashmap_get(server->bound_leases_by_client_id, &req->client_id);
-        static_lease = hashmap_get(server->static_leases_by_client_id, &req->client_id);
+        static_lease = dhcp_server_get_static_lease(server, req);
 
-        switch(type) {
+        switch (type) {
 
         case DHCP_DISCOVER: {
                 be32_t address = INADDR_ANY;
 
                 log_dhcp_server(server, "DISCOVER (0x%x)", be32toh(req->message->xid));
 
-                if (!server->pool_size)
+                if (server->pool_size == 0)
                         /* no pool allocated */
                         return 0;
 
                 /* for now pick a random free address from the pool */
-                if (static_lease)
+                if (static_lease) {
+                        if (existing_lease != hashmap_get(server->bound_leases_by_address, UINT32_TO_PTR(static_lease->address)))
+                                /* The address is already assigned to another host. Refusing. */
+                                return 0;
+
+                        /* Found a matching static lease. */
                         address = static_lease->address;
-                else if (existing_lease)
+
+                } else if (existing_lease && address_is_in_pool(server, existing_lease->address))
+
+                        /* If we previously assigned an address to the host, then reuse it. */
                         address = existing_lease->address;
+
                 else {
                         struct siphash state;
                         uint64_t hash;
@@ -968,6 +1102,9 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
                         /* no free addresses left */
                         return 0;
 
+                if (server->rapid_commit && req->rapid_commit)
+                        return server_ack_request(server, req, address);
+
                 r = server_send_offer_or_ack(server, req, address, DHCP_OFFER);
                 if (r < 0)
                         /* this only fails on critical errors */
@@ -984,14 +1121,12 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
                 return 1;
 
         case DHCP_REQUEST: {
-                DHCPLease *existing_lease_by_address;
                 be32_t address;
                 bool init_reboot = false;
-                int pool_offset;
 
                 /* see RFC 2131, section 4.3.2 */
 
-                if (req->server_id) {
+                if (req->server_id != 0) {
                         log_dhcp_server(server, "REQUEST (selecting) (0x%x)",
                                         be32toh(req->message->xid));
 
@@ -1000,22 +1135,22 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
                                 /* client did not pick us */
                                 return 0;
 
-                        if (req->message->ciaddr)
+                        if (req->message->ciaddr != 0)
                                 /* this MUST be zero */
                                 return 0;
 
-                        if (!req->requested_ip)
+                        if (req->requested_ip == 0)
                                 /* this must be filled in with the yiaddr
                                    from the chosen OFFER */
                                 return 0;
 
                         address = req->requested_ip;
-                } else if (req->requested_ip) {
+                } else if (req->requested_ip != 0) {
                         log_dhcp_server(server, "REQUEST (init-reboot) (0x%x)",
                                         be32toh(req->message->xid));
 
                         /* INIT-REBOOT */
-                        if (req->message->ciaddr)
+                        if (req->message->ciaddr != 0)
                                 /* this MUST be zero */
                                 return 0;
 
@@ -1027,119 +1162,35 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
                                         be32toh(req->message->xid));
 
                         /* REBINDING / RENEWING */
-                        if (!req->message->ciaddr)
+                        if (req->message->ciaddr == 0)
                                 /* this MUST be filled in with clients IP address */
                                 return 0;
 
                         address = req->message->ciaddr;
                 }
 
-                /* disallow our own address */
-                if (address == server->address)
-                        return 0;
+                /* Silently ignore Rapid Commit option in REQUEST message. */
+                req->rapid_commit = false;
 
-                pool_offset = get_pool_offset(server, address);
-                existing_lease_by_address = hashmap_get(server->bound_leases_by_address, UINT32_TO_PTR(address));
+                if (static_lease) {
+                        if (static_lease->address != address)
+                                /* The client requested an address which is different from the static lease. Refusing. */
+                                return server_send_nak_or_ignore(server, init_reboot, req);
 
-                /* verify that the requested address is from the pool, and either
-                   owned by the current client or free */
-                if (static_lease && static_lease->address == address) {
-                        _cleanup_(dhcp_lease_freep) DHCPLease *lease = NULL;
-                        usec_t time_now, expiration;
+                        if (existing_lease != hashmap_get(server->bound_leases_by_address, UINT32_TO_PTR(address)))
+                                /* The requested address is already assigned to another host. Refusing. */
+                                return server_send_nak_or_ignore(server, init_reboot, req);
 
-                        r = sd_event_now(server->event, clock_boottime_or_monotonic(), &time_now);
-                        if (r < 0)
-                                return r;
-
-                        expiration = usec_add(req->lifetime * USEC_PER_SEC, time_now);
-
-                        r = prepare_new_lease(&lease, static_lease->address, &req->client_id,
-                                              req->message->chaddr, req->message->giaddr, expiration);
-                        if (r < 0)
-                                return r;
-
-                        r = server_send_offer_or_ack(server, req, address, DHCP_ACK);
-                        if (r < 0)
-                                /* this only fails on critical errors */
-                                return log_dhcp_server_errno(server, r, "Could not send ack: %m");
-
-                        log_dhcp_server(server, "ACK (0x%x)", be32toh(req->message->xid));
-
-                        dhcp_lease_free(hashmap_remove(server->bound_leases_by_client_id, &lease->client_id));
-                        r = hashmap_ensure_put(&server->bound_leases_by_client_id, &dhcp_lease_hash_ops, &lease->client_id, lease);
-                        if (r < 0)
-                                return log_dhcp_server_errno(server, r, "Could not save lease: %m");
-
-                        r = hashmap_ensure_put(&server->bound_leases_by_address, NULL, UINT32_TO_PTR(lease->address), lease);
-                        if (r < 0)
-                                return log_dhcp_server_errno(server, r, "Could not save lease: %m");
-
-                        lease->server = server;
-                        TAKE_PTR(lease);
-
-                        if (server->callback)
-                                server->callback(server, SD_DHCP_SERVER_EVENT_LEASE_CHANGED, server->callback_userdata);
-
-                        return DHCP_ACK;
-
-                } else if (pool_offset >= 0 && existing_lease_by_address == existing_lease) {
-                        _cleanup_(dhcp_lease_freep) DHCPLease *new_lease = NULL;
-                        usec_t time_now, expiration;
-                        DHCPLease *lease;
-
-                        /* Note that in the above condition we accept the case that both leases are NULL. */
-
-                        r = sd_event_now(server->event, clock_boottime_or_monotonic(), &time_now);
-                        if (r < 0)
-                                return r;
-
-                        expiration = usec_add(req->lifetime * USEC_PER_SEC, time_now);
-
-                        if (!existing_lease) {
-                                r = prepare_new_lease(&new_lease, address, &req->client_id,
-                                                      req->message->chaddr, req->message->giaddr, expiration);
-                                if (r < 0)
-                                        return r;
-
-                                lease = new_lease;
-                        } else {
-                                existing_lease->expiration = expiration;
-                                lease = existing_lease;
-                        }
-
-                        r = server_send_offer_or_ack(server, req, address, DHCP_ACK);
-                        if (r < 0)
-                                /* this only fails on critical errors */
-                                return log_dhcp_server_errno(server, r, "Could not send ack: %m");
-
-                        log_dhcp_server(server, "ACK (0x%x)", be32toh(req->message->xid));
-
-                        r = hashmap_ensure_put(&server->bound_leases_by_client_id, &dhcp_lease_hash_ops, &lease->client_id, lease);
-                        if (r < 0)
-                                return log_dhcp_server_errno(server, r, "Could not save lease: %m");
-                        r = hashmap_ensure_put(&server->bound_leases_by_address, NULL, UINT32_TO_PTR(lease->address), lease);
-                        if (r < 0)
-                                return log_dhcp_server_errno(server, r, "Could not save lease: %m");
-
-                        lease->server = server;
-                        TAKE_PTR(new_lease);
-
-                        if (server->callback)
-                                server->callback(server, SD_DHCP_SERVER_EVENT_LEASE_CHANGED, server->callback_userdata);
-
-                        return DHCP_ACK;
-
-                } else if (init_reboot) {
-                        r = server_send_nak(server, req);
-                        if (r < 0)
-                                /* this only fails on critical errors */
-                                return log_dhcp_server_errno(server, r, "Could not send nak: %m");
-
-                        log_dhcp_server(server, "NAK (0x%x)", be32toh(req->message->xid));
-                        return DHCP_NAK;
+                        /* Found a static lease for the client ID. */
+                        return server_ack_request(server, req, address);
                 }
 
-                break;
+                if (address_is_in_pool(server, address))
+                        /* The requested address is in the pool. */
+                        return server_ack_request(server, req, address);
+
+                /* Refuse otherwise. */
+                return server_send_nak_or_ignore(server, init_reboot, req);
         }
 
         case DHCP_RELEASE: {
@@ -1152,10 +1203,9 @@ int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message, siz
                 if (existing_lease->address != req->message->ciaddr)
                         return 0;
 
-                dhcp_lease_free(existing_lease);
+                sd_dhcp_server_lease_unref(existing_lease);
 
-                if (server->callback)
-                        server->callback(server, SD_DHCP_SERVER_EVENT_LEASE_CHANGED, server->callback_userdata);
+                server_on_lease_change(server);
 
                 return 0;
         }}
@@ -1175,8 +1225,10 @@ static size_t relay_agent_information_length(const char* agent_circuit_id, const
 static int server_receive_message(sd_event_source *s, int fd,
                                   uint32_t revents, void *userdata) {
         _cleanup_free_ DHCPMessage *message = NULL;
-        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct in_pktinfo))) control;
-        sd_dhcp_server *server = userdata;
+        /* This needs to be initialized with zero. See #20741. */
+        CMSG_BUFFER_TYPE(CMSG_SPACE_TIMEVAL +
+                         CMSG_SPACE(sizeof(struct in_pktinfo))) control = {};
+        sd_dhcp_server *server = ASSERT_PTR(userdata);
         struct iovec iov = {};
         struct msghdr msg = {
                 .msg_iov = &iov,
@@ -1184,60 +1236,66 @@ static int server_receive_message(sd_event_source *s, int fd,
                 .msg_control = &control,
                 .msg_controllen = sizeof(control),
         };
-        struct cmsghdr *cmsg;
         ssize_t datagram_size, len;
         int r;
 
-        assert(server);
-
         datagram_size = next_datagram_size_fd(fd);
-        if (datagram_size < 0)
-                return datagram_size;
+        if (ERRNO_IS_NEG_TRANSIENT(datagram_size) || ERRNO_IS_NEG_DISCONNECT(datagram_size))
+                return 0;
+        if (datagram_size < 0) {
+                log_dhcp_server_errno(server, datagram_size, "Failed to determine datagram size to read, ignoring: %m");
+                return 0;
+        }
 
         size_t buflen = datagram_size;
         if (sd_dhcp_server_is_in_relay_mode(server))
                 /* Preallocate the additional size for DHCP Relay Agent Information Option if needed */
                 buflen += relay_agent_information_length(server->agent_circuit_id, server->agent_remote_id) + 2;
 
-        message = malloc(buflen);
+        message = malloc0(buflen);
         if (!message)
                 return -ENOMEM;
 
         iov = IOVEC_MAKE(message, datagram_size);
 
         len = recvmsg_safe(fd, &msg, 0);
-        if (IN_SET(len, -EAGAIN, -EINTR))
+        if (ERRNO_IS_NEG_TRANSIENT(len) || ERRNO_IS_NEG_DISCONNECT(len))
                 return 0;
-        if (len < 0)
-                return len;
+        if (len < 0) {
+                log_dhcp_server_errno(server, len, "Could not receive message, ignoring: %m");
+                return 0;
+        }
+
         if ((size_t) len < sizeof(DHCPMessage))
                 return 0;
 
-        CMSG_FOREACH(cmsg, &msg) {
-                if (cmsg->cmsg_level == IPPROTO_IP &&
-                    cmsg->cmsg_type == IP_PKTINFO &&
-                    cmsg->cmsg_len == CMSG_LEN(sizeof(struct in_pktinfo))) {
-                        struct in_pktinfo *info = (struct in_pktinfo*)CMSG_DATA(cmsg);
-
-                        /* TODO figure out if this can be done as a filter on
-                         * the socket, like for IPv6 */
-                        if (server->ifindex != info->ipi_ifindex)
-                                return 0;
-
-                        break;
-                }
-        }
+        /* TODO figure out if this can be done as a filter on the socket, like for IPv6 */
+        struct in_pktinfo *info = CMSG_FIND_DATA(&msg, IPPROTO_IP, IP_PKTINFO, struct in_pktinfo);
+        if (info && info->ipi_ifindex != server->ifindex)
+                return 0;
 
         if (sd_dhcp_server_is_in_relay_mode(server)) {
                 r = dhcp_server_relay_message(server, message, len - sizeof(DHCPMessage), buflen);
                 if (r < 0)
-                        log_dhcp_server_errno(server, r, "Couldn't relay message: %m");
+                        log_dhcp_server_errno(server, r, "Couldn't relay message, ignoring: %m");
         } else {
-                r = dhcp_server_handle_message(server, message, (size_t) len);
+                r = dhcp_server_handle_message(server, message, (size_t) len, TRIPLE_TIMESTAMP_FROM_CMSG(&msg));
                 if (r < 0)
-                        log_dhcp_server_errno(server, r, "Couldn't process incoming message: %m");
+                        log_dhcp_server_errno(server, r, "Couldn't process incoming message, ignoring: %m");
         }
         return 0;
+}
+
+static void dhcp_server_update_lease_servers(sd_dhcp_server *server) {
+        assert(server);
+        assert(server->address != 0);
+
+        /* Convert null address -> server address */
+
+        for (sd_dhcp_lease_server_type_t k = 0; k < _SD_DHCP_LEASE_SERVER_TYPE_MAX; k++)
+                for (size_t i = 0; i < server->servers[k].size; i++)
+                        if (in4_addr_is_null(&server->servers[k].addr[i]))
+                                server->servers[k].addr[i].s_addr = server->address;
 }
 
 int sd_dhcp_server_start(sd_dhcp_server *server) {
@@ -1253,6 +1311,8 @@ int sd_dhcp_server_start(sd_dhcp_server *server) {
         assert_return(server->fd_raw < 0, -EBUSY);
         assert_return(server->fd < 0, -EBUSY);
         assert_return(server->address != htobe32(INADDR_ANY), -EUNATCH);
+
+        dhcp_server_update_lease_servers(server);
 
         r = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (r < 0) {
@@ -1299,29 +1359,31 @@ int sd_dhcp_server_start(sd_dhcp_server *server) {
                         goto on_error;
         }
 
+        r = dhcp_server_load_leases(server);
+        if (r < 0)
+                log_dhcp_server_errno(server, r, "Failed to load lease file %s, ignoring: %m", strna(server->lease_file));
+
         log_dhcp_server(server, "STARTED");
 
         return 0;
 
 on_error:
-    sd_dhcp_server_stop(server);
-    return r;
+        sd_dhcp_server_stop(server);
+        return r;
 }
 
 int sd_dhcp_server_forcerenew(sd_dhcp_server *server) {
-        DHCPLease *lease;
-        int k, r = 0;
+        sd_dhcp_server_lease *lease;
+        int r = 0;
 
         assert_return(server, -EINVAL);
 
         log_dhcp_server(server, "FORCERENEW");
 
-        HASHMAP_FOREACH(lease, server->bound_leases_by_client_id) {
-                k = server_send_forcerenew(server, lease->address, lease->gateway, lease->chaddr);
-                if (k < 0)
-                        r = k;
-        }
-
+        HASHMAP_FOREACH(lease, server->bound_leases_by_client_id)
+                RET_GATHER(r,
+                           server_send_forcerenew(server, lease->address, lease->gateway,
+                                                  lease->htype, lease->hlen, lease->chaddr));
         return r;
 }
 
@@ -1353,24 +1415,38 @@ int sd_dhcp_server_set_timezone(sd_dhcp_server *server, const char *tz) {
         return 1;
 }
 
-int sd_dhcp_server_set_max_lease_time(sd_dhcp_server *server, uint32_t t) {
+int sd_dhcp_server_set_max_lease_time(sd_dhcp_server *server, uint64_t t) {
         assert_return(server, -EINVAL);
-
-        if (t == server->max_lease_time)
-                return 0;
 
         server->max_lease_time = t;
-        return 1;
+        return 0;
 }
 
-int sd_dhcp_server_set_default_lease_time(sd_dhcp_server *server, uint32_t t) {
+int sd_dhcp_server_set_default_lease_time(sd_dhcp_server *server, uint64_t t) {
         assert_return(server, -EINVAL);
 
-        if (t == server->default_lease_time)
-                return 0;
-
         server->default_lease_time = t;
-        return 1;
+        return 0;
+}
+
+int sd_dhcp_server_set_ipv6_only_preferred_usec(sd_dhcp_server *server, uint64_t t) {
+        assert_return(server, -EINVAL);
+
+        /* When 0 is set, disables the IPv6 only mode. */
+
+        /* Refuse too short timespan unless test mode is enabled. */
+        if (t > 0 && t < MIN_V6ONLY_WAIT_USEC && !network_test_mode_enabled())
+                 return -EINVAL;
+
+        server->ipv6_only_preferred_usec = t;
+        return 0;
+}
+
+int sd_dhcp_server_set_rapid_commit(sd_dhcp_server *server, int enabled) {
+        assert_return(server, -EINVAL);
+
+        server->rapid_commit = enabled;
+        return 0;
 }
 
 int sd_dhcp_server_set_servers(
@@ -1382,6 +1458,7 @@ int sd_dhcp_server_set_servers(
         struct in_addr *c = NULL;
 
         assert_return(server, -EINVAL);
+        assert_return(!sd_dhcp_server_is_running(server), -EBUSY);
         assert_return(addresses || n_addresses == 0, -EINVAL);
         assert_return(what >= 0, -EINVAL);
         assert_return(what < _SD_DHCP_LEASE_SERVER_TYPE_MAX, -EINVAL);
@@ -1396,8 +1473,7 @@ int sd_dhcp_server_set_servers(
                         return -ENOMEM;
         }
 
-        free(server->servers[what].addr);
-        server->servers[what].addr = c;
+        free_and_replace(server->servers[what].addr, c);
         server->servers[what].size = n_addresses;
         return 1;
 }
@@ -1426,7 +1502,7 @@ int sd_dhcp_server_set_router(sd_dhcp_server *server, const struct in_addr *rout
 
         /* router is NULL: router option will not be appended.
          * router is null address (0.0.0.0): the server address will be used as the router address.
-         * otherwise: the specified address will be used as the router address.*/
+         * otherwise: the specified address will be used as the router address. */
 
         server->emit_router = router;
         if (router)
@@ -1512,64 +1588,32 @@ int sd_dhcp_server_set_relay_agent_information(
         return 0;
 }
 
-int sd_dhcp_server_set_static_lease(
-                sd_dhcp_server *server,
-                const struct in_addr *address,
-                uint8_t *client_id,
-                size_t client_id_size) {
-
-        _cleanup_(dhcp_lease_freep) DHCPLease *lease = NULL;
+int sd_dhcp_server_set_lease_file(sd_dhcp_server *server, int dir_fd, const char *path) {
         int r;
 
         assert_return(server, -EINVAL);
-        assert_return(client_id, -EINVAL);
-        assert_return(client_id_size == ETH_ALEN + 1, -EINVAL);
+        assert_return(!path || (dir_fd >= 0 || dir_fd == AT_FDCWD), -EBADF);
         assert_return(!sd_dhcp_server_is_running(server), -EBUSY);
 
-        /* Static lease with an empty or omitted address is a valid entry,
-        * the server removes any static lease with the specified mac address. */
-        if (!address || address->s_addr == 0) {
-                _cleanup_free_ void *data = NULL;
-                DHCPClientId c;
-
-                data = memdup(client_id, client_id_size);
-                if (!data)
-                        return -ENOMEM;
-
-                c = (DHCPClientId) {
-                        .length = client_id_size,
-                        .data = data,
-                };
-
-                dhcp_lease_free(hashmap_remove(server->static_leases_by_client_id, &c));
+        if (!path) {
+                /* When NULL, clear the previous assignment. */
+                server->lease_file = mfree(server->lease_file);
+                server->lease_dir_fd = safe_close(server->lease_dir_fd);
                 return 0;
         }
 
-        if (hashmap_contains(server->static_leases_by_address, UINT32_TO_PTR(address->s_addr)))
-                return -EEXIST;
+        if (!path_is_safe(path))
+                return -EINVAL;
 
-        lease = new(DHCPLease, 1);
-        if (!lease)
-                return -ENOMEM;
+        _cleanup_close_ int fd = fd_reopen(dir_fd, O_CLOEXEC | O_DIRECTORY | O_PATH);
+        if (fd < 0)
+                return fd;
 
-        *lease = (DHCPLease) {
-                .address = address->s_addr,
-                .client_id.length = client_id_size,
-                .gateway = 0,
-                .expiration = 0,
-        };
-        lease->client_id.data = memdup(client_id, client_id_size);
-        if (!lease->client_id.data)
-                return -ENOMEM;
-
-        r = hashmap_ensure_put(&server->static_leases_by_client_id, &dhcp_lease_hash_ops, &lease->client_id, lease);
-        if (r < 0)
-                return r;
-        r = hashmap_ensure_put(&server->static_leases_by_address, NULL, UINT32_TO_PTR(lease->address), lease);
+        r = free_and_strdup(&server->lease_file, path);
         if (r < 0)
                 return r;
 
-        lease->server = server;
-        TAKE_PTR(lease);
+        close_and_replace(server->lease_dir_fd, fd);
+
         return 0;
 }

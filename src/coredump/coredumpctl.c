@@ -8,22 +8,31 @@
 
 #include "sd-bus.h"
 #include "sd-journal.h"
+#include "sd-json.h"
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "build.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-util.h"
+#include "chase.h"
 #include "compress.h"
-#include "def.h"
+#include "constants.h"
+#include "dissect-image.h"
+#include "escape.h"
 #include "fd-util.h"
 #include "format-table.h"
 #include "fs-util.h"
 #include "glob-util.h"
 #include "journal-internal.h"
 #include "journal-util.h"
+#include "json-util.h"
 #include "log.h"
+#include "logs-show.h"
 #include "macro.h"
 #include "main-func.h"
+#include "mount-util.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -31,14 +40,12 @@
 #include "pretty-print.h"
 #include "process-util.h"
 #include "rlimit-util.h"
-#include "sigbus.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "tmpfile-util.h"
 #include "user-util.h"
-#include "util.h"
 #include "verbs.h"
 
 #define SHORT_BUS_CALL_TIMEOUT_USEC (3 * USEC_PER_SEC)
@@ -48,8 +55,10 @@ static const char* arg_field = NULL;
 static const char *arg_debugger = NULL;
 static char **arg_debugger_args = NULL;
 static const char *arg_directory = NULL;
+static char *arg_root = NULL;
+static char *arg_image = NULL;
 static char **arg_file = NULL;
-static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static PagerFlags arg_pager_flags = 0;
 static int arg_legend = true;
 static size_t arg_rows_max = SIZE_MAX;
@@ -57,48 +66,53 @@ static const char* arg_output = NULL;
 static bool arg_reverse = false;
 static bool arg_quiet = false;
 static bool arg_all = false;
+static ImagePolicy *arg_image_policy = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_debugger_args, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_file, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 
 static int add_match(sd_journal *j, const char *match) {
         _cleanup_free_ char *p = NULL;
-        const char* prefix, *pattern;
-        pid_t pid;
+        const char *field;
         int r;
 
         if (strchr(match, '='))
-                prefix = "";
-        else if (strchr(match, '/')) {
+                field = NULL;
+        else if (is_path(match)) {
                 r = path_make_absolute_cwd(match, &p);
                 if (r < 0)
                         return log_error_errno(r, "path_make_absolute_cwd(\"%s\"): %m", match);
 
                 match = p;
-                prefix = "COREDUMP_EXE=";
-        } else if (parse_pid(match, &pid) >= 0)
-                prefix = "COREDUMP_PID=";
+                field = "COREDUMP_EXE";
+        } else if (parse_pid(match, NULL) >= 0)
+                field = "COREDUMP_PID";
         else
-                prefix = "COREDUMP_COMM=";
+                field = "COREDUMP_COMM";
 
-        pattern = strjoina(prefix, match);
-        log_debug("Adding match: %s", pattern);
-        r = sd_journal_add_match(j, pattern, 0);
+        log_debug("Adding match: %s%s%s", strempty(field), field ? "=" : "", match);
+        if (field)
+                r = journal_add_match_pair(j, field, match);
+        else
+                r = sd_journal_add_match(j, match, SIZE_MAX);
         if (r < 0)
-                return log_error_errno(r, "Failed to add match \"%s\": %m", match);
+                return log_error_errno(r, "Failed to add match \"%s%s%s\": %m",
+                                       strempty(field), field ? "=" : "", match);
 
         return 0;
 }
 
 static int add_matches(sd_journal *j, char **matches) {
-        char **match;
         int r;
 
-        r = sd_journal_add_match(j, "MESSAGE_ID=" SD_MESSAGE_COREDUMP_STR, 0);
+        r = sd_journal_add_match(j, "MESSAGE_ID=" SD_MESSAGE_COREDUMP_STR, SIZE_MAX);
         if (r < 0)
                 return log_error_errno(r, "Failed to add match \"%s\": %m", "MESSAGE_ID=" SD_MESSAGE_COREDUMP_STR);
 
-        r = sd_journal_add_match(j, "MESSAGE_ID=" SD_MESSAGE_BACKTRACE_STR, 0);
+        r = sd_journal_add_match(j, "MESSAGE_ID=" SD_MESSAGE_BACKTRACE_STR, SIZE_MAX);
         if (r < 0)
                 return log_error_errno(r, "Failed to add match \"%s\": %m", "MESSAGE_ID=" SD_MESSAGE_BACKTRACE_STR);
 
@@ -118,15 +132,19 @@ static int acquire_journal(sd_journal **ret, char **matches) {
         assert(ret);
 
         if (arg_directory) {
-                r = sd_journal_open_directory(&j, arg_directory, 0);
+                r = sd_journal_open_directory(&j, arg_directory, SD_JOURNAL_ASSUME_IMMUTABLE);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open journals in directory: %s: %m", arg_directory);
+        } else if (arg_root) {
+                r = sd_journal_open_directory(&j, arg_root, SD_JOURNAL_OS_ROOT | SD_JOURNAL_ASSUME_IMMUTABLE);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to open journals in root directory: %s: %m", arg_root);
         } else if (arg_file) {
-                r = sd_journal_open_files(&j, (const char**)arg_file, 0);
+                r = sd_journal_open_files(&j, (const char**)arg_file, SD_JOURNAL_ASSUME_IMMUTABLE);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open journal files: %m");
         } else {
-                r = sd_journal_open(&j, arg_all ? 0 : SD_JOURNAL_LOCAL_ONLY);
+                r = sd_journal_open(&j, arg_all ? 0 : SD_JOURNAL_LOCAL_ONLY | SD_JOURNAL_ASSUME_IMMUTABLE);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open journal: %m");
         }
@@ -186,6 +204,9 @@ static int verb_help(int argc, char **argv, void *userdata) {
                "  -D --directory=DIR           Use journal files from directory\n\n"
                "  -q --quiet                   Do not show info messages and privilege warning\n"
                "     --all                     Look at all journal files instead of local ones\n"
+               "     --root=PATH               Operate on an alternate filesystem root\n"
+               "     --image=PATH              Operate on disk image as filesystem root\n"
+               "     --image-policy=POLICY     Specify disk image dissection policy\n"
                "\nSee the %2$s for details.\n",
                program_invocation_short_name,
                link,
@@ -205,28 +226,34 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_JSON,
                 ARG_DEBUGGER,
                 ARG_FILE,
+                ARG_ROOT,
+                ARG_IMAGE,
+                ARG_IMAGE_POLICY,
                 ARG_ALL,
         };
 
         int c, r;
 
         static const struct option options[] = {
-                { "help",               no_argument,       NULL, 'h'           },
-                { "version" ,           no_argument,       NULL, ARG_VERSION   },
-                { "no-pager",           no_argument,       NULL, ARG_NO_PAGER  },
-                { "no-legend",          no_argument,       NULL, ARG_NO_LEGEND },
-                { "debugger",           required_argument, NULL, ARG_DEBUGGER  },
-                { "debugger-arguments", required_argument, NULL, 'A'           },
-                { "output",             required_argument, NULL, 'o'           },
-                { "field",              required_argument, NULL, 'F'           },
-                { "file",               required_argument, NULL, ARG_FILE      },
-                { "directory",          required_argument, NULL, 'D'           },
-                { "reverse",            no_argument,       NULL, 'r'           },
-                { "since",              required_argument, NULL, 'S'           },
-                { "until",              required_argument, NULL, 'U'           },
-                { "quiet",              no_argument,       NULL, 'q'           },
-                { "json",               required_argument, NULL, ARG_JSON      },
-                { "all",                no_argument,       NULL, ARG_ALL       },
+                { "help",               no_argument,       NULL, 'h'              },
+                { "version" ,           no_argument,       NULL, ARG_VERSION      },
+                { "no-pager",           no_argument,       NULL, ARG_NO_PAGER     },
+                { "no-legend",          no_argument,       NULL, ARG_NO_LEGEND    },
+                { "debugger",           required_argument, NULL, ARG_DEBUGGER     },
+                { "debugger-arguments", required_argument, NULL, 'A'              },
+                { "output",             required_argument, NULL, 'o'              },
+                { "field",              required_argument, NULL, 'F'              },
+                { "file",               required_argument, NULL, ARG_FILE         },
+                { "directory",          required_argument, NULL, 'D'              },
+                { "reverse",            no_argument,       NULL, 'r'              },
+                { "since",              required_argument, NULL, 'S'              },
+                { "until",              required_argument, NULL, 'U'              },
+                { "quiet",              no_argument,       NULL, 'q'              },
+                { "json",               required_argument, NULL, ARG_JSON         },
+                { "root",               required_argument, NULL, ARG_ROOT         },
+                { "image",              required_argument, NULL, ARG_IMAGE        },
+                { "image-policy",       required_argument, NULL, ARG_IMAGE_POLICY },
+                { "all",                no_argument,       NULL, ARG_ALL          },
                 {}
         };
 
@@ -234,7 +261,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argv);
 
         while ((c = getopt_long(argc, argv, "hA:o:F:1D:rS:U:qn:", options, NULL)) >= 0)
-                switch(c) {
+                switch (c) {
                 case 'h':
                         return verb_help(0, NULL, NULL);
 
@@ -316,6 +343,24 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_directory = optarg;
                         break;
 
+                case ARG_ROOT:
+                        r = parse_path_argument(optarg, false, &arg_root);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                case ARG_IMAGE:
+                        r = parse_path_argument(optarg, false, &arg_image);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                case ARG_IMAGE_POLICY:
+                        r = parse_image_policy_argument(optarg, &arg_image_policy);
+                        if (r < 0)
+                                return r;
+                        break;
+
                 case 'r':
                         arg_reverse = true;
                         break;
@@ -346,6 +391,9 @@ static int parse_argv(int argc, char *argv[]) {
             arg_since > arg_until)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "--since= must be before --until=.");
+
+        if ((!!arg_directory + !!arg_image + !!arg_root) > 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root=, --image= or -D/--directory=, the combination of these options is not supported.");
 
         return 1;
 }
@@ -420,7 +468,7 @@ static void analyze_coredump_file(
                 const char **ret_color,
                 uint64_t *ret_size) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct stat st;
         int r;
 
@@ -441,14 +489,15 @@ static void analyze_coredump_file(
                 r = -errno;
         } else
                 r = access_fd(fd, R_OK);
-        if (ERRNO_IS_PRIVILEGE(r)) {
-                *ret_state = "inaccessible";
-                *ret_color = ansi_highlight_yellow();
-                *ret_size = UINT64_MAX;
-                return;
-        }
-        if (r < 0)
+        if (r < 0) {
+                if (ERRNO_IS_PRIVILEGE(r)) {
+                        *ret_state = "inaccessible";
+                        *ret_color = ansi_highlight_yellow();
+                        *ret_size = UINT64_MAX;
+                        return;
+                }
                 goto error;
+        }
 
         if (fstat(fd, &st) < 0)
                 goto error;
@@ -465,6 +514,25 @@ error:
         *ret_state = "error";
         *ret_color = ansi_highlight_red();
         *ret_size = UINT64_MAX;
+}
+
+static int resolve_filename(const char *root, char **p) {
+        char *resolved = NULL;
+        int r;
+
+        if (!*p)
+                return 0;
+
+        r = chase(*p, root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &resolved, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to resolve \"%s%s\": %m", strempty(root), *p);
+
+        free_and_replace(*p, resolved);
+
+        /* chase() with flag CHASE_NONEXISTENT will return 0 if the file doesn't exist and 1 if it does.
+         * Return that to the caller
+         */
+        return r;
 }
 
 static int print_list(FILE* file, sd_journal *j, Table *t) {
@@ -515,9 +583,13 @@ static int print_list(FILE* file, sd_journal *j, Table *t) {
 
         normal_coredump = streq_ptr(mid, SD_MESSAGE_COREDUMP_STR);
 
-        if (filename)
+        if (filename) {
+                r = resolve_filename(arg_root, &filename);
+                if (r < 0)
+                        return r;
+
                 analyze_coredump_file(filename, &present, &color, &size);
-        else if (coredump)
+        } else if (coredump)
                 present = "journal";
         else if (normal_coredump) {
                 present = "none";
@@ -701,6 +773,10 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
                 fprintf(file, "      Hostname: %s\n", hostname);
 
         if (filename) {
+                r = resolve_filename(arg_root, &filename);
+                if (r < 0)
+                        return r;
+
                 const char *state = NULL, *color = NULL;
                 uint64_t size = UINT64_MAX;
 
@@ -717,7 +793,7 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
                         ansi_normal());
 
                 if (size != UINT64_MAX)
-                        fprintf(file, "     Disk Size: %s\n", FORMAT_BYTES(size));
+                        fprintf(file, "  Size on Disk: %s\n", FORMAT_BYTES(size));
 
         } else if (coredump)
                 fprintf(file, "       Storage: journal\n");
@@ -730,25 +806,26 @@ static int print_info(FILE *file, sd_journal *j, bool need_space) {
         /* Print out the build-id of the 'main' ELF module, by matching the JSON key
          * with the 'exe' field. */
         if (exe && pkgmeta_json) {
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
 
-                r = json_parse(pkgmeta_json, 0, &v, NULL, NULL);
-                if (r < 0)
-                        log_warning_errno(r, "json_parse on %s failed, ignoring: %m", pkgmeta_json);
-                else {
+                r = sd_json_parse(pkgmeta_json, 0, &v, NULL, NULL);
+                if (r < 0) {
+                        _cleanup_free_ char *esc = cescape(pkgmeta_json);
+                        log_warning_errno(r, "json_parse on \"%s\" failed, ignoring: %m", strnull(esc));
+                } else {
                         const char *module_name;
-                        JsonVariant *module_json;
+                        sd_json_variant *module_json;
 
                         JSON_VARIANT_OBJECT_FOREACH(module_name, module_json, v) {
-                                JsonVariant *build_id;
+                                sd_json_variant *build_id;
 
                                 /* We only print the build-id for the 'main' ELF module */
                                 if (!path_equal_filename(module_name, exe))
                                         continue;
 
-                                build_id = json_variant_by_key(module_json, "buildId");
+                                build_id = sd_json_variant_by_key(module_json, "buildId");
                                 if (build_id)
-                                        fprintf(file, "      build-id: %s\n", json_variant_string(build_id));
+                                        fprintf(file, "      build-id: %s\n", sd_json_variant_string(build_id));
 
                                 break;
                         }
@@ -804,7 +881,7 @@ static int dump_list(int argc, char **argv, void *userdata) {
 
         verb_is_info = argc >= 1 && streq(argv[0], "info");
 
-        r = acquire_journal(&j, argv + 1);
+        r = acquire_journal(&j, strv_skip(argv, 1));
         if (r < 0)
                 return r;
 
@@ -822,7 +899,7 @@ static int dump_list(int argc, char **argv, void *userdata) {
                 (void) table_set_align_percent(t, TABLE_HEADER_CELL(3), 100);
                 (void) table_set_align_percent(t, TABLE_HEADER_CELL(7), 100);
 
-                (void) table_set_empty_string(t, "-");
+                table_set_ersatz_string(t, TABLE_ERSATZ_DASH);
         } else
                 pager_open(arg_pager_flags);
 
@@ -906,7 +983,7 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
         _cleanup_free_ char *filename = NULL;
         size_t len;
         int r, fd;
-        _cleanup_close_ int fdt = -1;
+        _cleanup_close_ int fdt = -EBADF;
         char *temp = NULL;
 
         assert(!(file && path));         /* At most one can be specified */
@@ -915,13 +992,18 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
         /* Look for a coredump on disk first. */
         r = sd_journal_get_data(j, "COREDUMP_FILENAME", (const void**) &data, &len);
         if (r == 0) {
+                _cleanup_free_ char *resolved = NULL;
+
                 r = retrieve(data, len, "COREDUMP_FILENAME", &filename);
                 if (r < 0)
                         return r;
                 assert(r > 0);
 
-                if (access(filename, R_OK) < 0)
-                        return log_error_errno(errno, "File \"%s\" is not readable: %m", filename);
+                r = chase_and_access(filename, arg_root, CHASE_PREFIX_ROOT, F_OK, &resolved);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot access \"%s%s\": %m", strempty(arg_root), filename);
+
+                free_and_replace(filename, resolved);
 
                 if (path && !ENDSWITH_SET(filename, ".xz", ".lz4", ".zst")) {
                         *path = TAKE_PTR(filename);
@@ -983,7 +1065,7 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
 
         if (filename) {
 #if HAVE_COMPRESSION
-                _cleanup_close_ int fdf = -1;
+                _cleanup_close_ int fdf = -EBADF;
 
                 fdf = open(filename, O_RDONLY | O_CLOEXEC);
                 if (fdf < 0) {
@@ -1050,7 +1132,7 @@ static int dump_core(int argc, char **argv, void *userdata) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --field/-F only makes sense with list");
 
-        r = acquire_journal(&j, argv + 1);
+        r = acquire_journal(&j, strv_skip(argv, 1));
         if (r < 0)
                 return r;
 
@@ -1077,7 +1159,22 @@ static int dump_core(int argc, char **argv, void *userdata) {
         return 0;
 }
 
+static void sigterm_handler(int signal, siginfo_t *info, void *ucontext) {
+        assert(signal == SIGTERM);
+        assert(info);
+
+        /* If the sender is not us, propagate the signal to all processes in
+         * the same process group */
+        if (pid_is_valid(info->si_pid) && info->si_pid != getpid_cached())
+                (void) kill(0, signal);
+}
+
 static int run_debug(int argc, char **argv, void *userdata) {
+        static const struct sigaction sa = {
+                .sa_sigaction = sigterm_handler,
+                .sa_flags = SA_SIGINFO,
+        };
+
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
         _cleanup_free_ char *exe = NULL, *path = NULL;
         _cleanup_strv_free_ char **debugger_call = NULL;
@@ -1109,7 +1206,7 @@ static int run_debug(int argc, char **argv, void *userdata) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --field/-F only makes sense with list");
 
-        r = acquire_journal(&j, argv + 1);
+        r = acquire_journal(&j, strv_skip(argv, 1));
         if (r < 0)
                 return r;
 
@@ -1142,20 +1239,43 @@ static int run_debug(int argc, char **argv, void *userdata) {
                 return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
                                        "Binary is not an absolute path.");
 
+        r = resolve_filename(arg_root, &exe);
+        if (r < 0)
+                return r;
+
         r = save_core(j, NULL, &path, &unlink_path);
         if (r < 0)
                 return r;
 
-        r = strv_extend_strv(&debugger_call, STRV_MAKE(exe, "-c", path), false);
+        r = strv_extend_many(&debugger_call, exe, "-c", path);
         if (r < 0)
                 return log_oom();
 
+        if (arg_root) {
+                if (streq(arg_debugger, "gdb")) {
+                        const char *sysroot_cmd;
+                        sysroot_cmd = strjoina("set sysroot ", arg_root);
+
+                        r = strv_extend_many(&debugger_call, "-iex", sysroot_cmd);
+                        if (r < 0)
+                                return log_oom();
+                } else if (streq(arg_debugger, "lldb")) {
+                        const char *sysroot_cmd;
+                        sysroot_cmd = strjoina("platform select --sysroot ", arg_root, " host");
+
+                        r = strv_extend_many(&debugger_call, "-O", sysroot_cmd);
+                        if (r < 0)
+                                return log_oom();
+                }
+        }
+
         /* Don't interfere with gdb and its handling of SIGINT. */
         (void) ignore_signals(SIGINT);
+        (void) sigaction(SIGTERM, &sa, NULL);
 
         fork_name = strjoina("(", debugger_call[0], ")");
 
-        r = safe_fork(fork_name, FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG|FORK_FLUSH_STDIO, &pid);
+        r = safe_fork(fork_name, FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG|FORK_FLUSH_STDIO, &pid);
         if (r < 0)
                 goto finish;
         if (r == 0) {
@@ -1168,7 +1288,7 @@ static int run_debug(int argc, char **argv, void *userdata) {
         r = wait_for_terminate_and_check(debugger_call[0], pid, WAIT_LOG_ABNORMAL);
 
 finish:
-        (void) default_signals(SIGINT);
+        (void) default_signals(SIGINT, SIGTERM);
 
         if (unlink_path) {
                 log_debug("Removed temporary file %s", path);
@@ -1197,13 +1317,7 @@ static int check_units_active(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire bus: %m");
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "ListUnitsByPatterns");
+        r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "ListUnitsByPatterns");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1258,21 +1372,42 @@ static int coredumpctl_main(int argc, char *argv[]) {
 }
 
 static int run(int argc, char *argv[]) {
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         int r, units_active;
 
         setlocale(LC_ALL, "");
         log_setup();
 
-        /* The journal merging logic potentially needs a lot of fds. */
-        (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);
-
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
 
-        sigbus_install();
+        journal_browse_prepare();
 
         units_active = check_units_active(); /* error is treated the same as 0 */
+
+        if (arg_image) {
+                assert(!arg_root);
+
+                r = mount_image_privately_interactively(
+                                arg_image,
+                                arg_image_policy,
+                                DISSECT_IMAGE_GENERIC_ROOT |
+                                DISSECT_IMAGE_REQUIRE_ROOT |
+                                DISSECT_IMAGE_RELAX_VAR_CHECK |
+                                DISSECT_IMAGE_VALIDATE_OS |
+                                DISSECT_IMAGE_ALLOW_USERSPACE_VERITY,
+                                &mounted_dir,
+                                /* ret_dir_fd= */ NULL,
+                                &loop_device);
+                if (r < 0)
+                        return r;
+
+                arg_root = strdup(mounted_dir);
+                if (!arg_root)
+                        return log_oom();
+        }
 
         r = coredumpctl_main(argc, argv);
 

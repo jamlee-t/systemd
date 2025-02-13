@@ -5,15 +5,13 @@
  * Author: James Chapman <jchapman@katalix.com>
  */
 
-#ifndef _UAPI_LINUX_L2TP_H_
-#define _UAPI_LINUX_L2TP_H_
+#ifndef _LINUX_L2TP_H_
+#define _LINUX_L2TP_H_
 
 #include <linux/types.h>
 #include <linux/socket.h>
 #include <linux/in.h>
 #include <linux/in6.h>
-
-#define IPPROTO_L2TP		115
 
 /**
  * struct sockaddr_l2tpip - the sockaddr structure for L2TP-over-IP sockets
@@ -202,4 +200,4 @@ enum l2tp_debug_flags {
 #define L2TP_GENL_VERSION	0x1
 #define L2TP_GENL_MCGROUP       "l2tp"
 
-#endif /* _UAPI_LINUX_L2TP_H_ */
+#endif /* _LINUX_L2TP_H_ */

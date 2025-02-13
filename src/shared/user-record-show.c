@@ -1,16 +1,24 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "cap-list.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "glyph-util.h"
+#include "hashmap.h"
+#include "hexdecoct.h"
+#include "path-util.h"
+#include "percent-util.h"
+#include "pretty-print.h"
 #include "process-util.h"
 #include "rlimit-util.h"
+#include "sha256.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "user-record-show.h"
 #include "user-util.h"
 #include "userdb.h"
 
-const char *user_record_state_color(const char *state) {
+const char* user_record_state_color(const char *state) {
         if (STR_IN_SET(state, "unfixated", "absent"))
                 return ansi_grey();
         else if (streq(state, "active"))
@@ -21,7 +29,54 @@ const char *user_record_state_color(const char *state) {
         return NULL;
 }
 
+static void show_self_modifiable(
+                const char *heading,
+                char **field,
+                const char **value) {
+
+        assert(heading);
+
+        /* Helper function for printing the various self_modifiable_* fields from the user record */
+
+        if (!value)
+                /* Case 1: no value is set and no default either */
+                printf("%13s %snone%s\n", heading, ansi_highlight(), ansi_normal());
+        else if (strv_isempty((char**) value))
+                /* Case 2: the array is explicitly set to empty by the administrator */
+                printf("%13s %sdisabled by administrator%s\n", heading, ansi_highlight_red(), ansi_normal());
+        else if (!field)
+                /* Case 3: we have values, but the field is NULL. This means that we're using the defaults.
+                 * We list them anyways, because they're security-sensitive to the administrator */
+                STRV_FOREACH(i, value)
+                        printf("%13s %s%s%s\n", i == value ? heading : "", ansi_grey(), *i, ansi_normal());
+        else
+                /* Case 4: we have a list provided by the administrator */
+                STRV_FOREACH(i, value)
+                        printf("%13s %s\n", i == value ? heading : "", *i);
+}
+
+static void show_tmpfs_limit(const char *tmpfs, const TmpfsLimit *limit, uint32_t scale) {
+        assert(tmpfs);
+        assert(limit);
+
+        if (!limit->is_set)
+                return;
+
+        printf("   %s Limit:", tmpfs);
+
+        if (limit->limit != UINT64_MAX)
+                printf(" %s", FORMAT_BYTES(limit->limit));
+        if (limit->limit == UINT64_MAX || limit->limit_scale != UINT32_MAX) {
+                if (limit->limit != UINT64_MAX)
+                        printf(" or");
+
+                printf(" %i%%", UINT32_SCALE_TO_PERCENT(scale));
+        }
+        printf("\n");
+}
+
 void user_record_show(UserRecord *hr, bool show_full_group_info) {
+        _cleanup_strv_free_ char **langs = NULL;
         const char *hd, *ip, *shell;
         UserStorage storage;
         usec_t t;
@@ -30,6 +85,13 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
 
         printf("   User name: %s\n",
                user_record_user_name_and_realm(hr));
+
+        if (!strv_isempty(hr->aliases)) {
+                STRV_FOREACH(i, hr->aliases)
+                        printf(i == hr->aliases ?
+                               "       Alias: %s" : ", %s", *i);
+                putchar('\n');
+        }
 
         if (hr->state) {
                 const char *color;
@@ -132,17 +194,34 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
                         break;
                 }
 
-                printf(" Password OK: %syes%s\n", ansi_highlight_green(), ansi_normal());
-                break;
+                if (strv_isempty(hr->hashed_password)) {
+                        if (hr->incomplete) /* Record might be incomplete, due to privs */
+                                break;
+                        printf(" Password OK: %sno%s (none set)\n", ansi_highlight(), ansi_normal());
+                        break;
+                }
+                if (strv_contains(hr->hashed_password, "")) {
+                        printf(" Password OK: %sno%s (empty set)\n", ansi_highlight_red(), ansi_normal());
+                        break;
+                }
+                bool has_valid_passwords = false;
+                STRV_FOREACH(p, hr->hashed_password)
+                        if (!hashed_password_is_locked_or_invalid(*p)) {
+                                has_valid_passwords = true;
+                                break;
+                        }
+                if (has_valid_passwords)
+                        printf(" Password OK: %syes%s\n", ansi_highlight_green(), ansi_normal());
+                else
+                        printf(" Password OK: %sno%s (locked)\n", ansi_highlight(), ansi_normal());
         }
-
         if (uid_is_valid(hr->uid))
                 printf("         UID: " UID_FMT "\n", hr->uid);
         if (gid_is_valid(hr->gid)) {
                 if (show_full_group_info) {
                         _cleanup_(group_record_unrefp) GroupRecord *gr = NULL;
 
-                        r = groupdb_by_gid(hr->gid, 0, &gr);
+                        r = groupdb_by_gid(hr->gid, /* match= */ NULL, /* flags= */ 0, &gr);
                         if (r < 0) {
                                 errno = -r;
                                 printf("         GID: " GID_FMT " (unresolvable: %m)\n", hr->gid);
@@ -185,8 +264,48 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
                 printf("   Real Name: %s\n", hr->real_name);
 
         hd = user_record_home_directory(hr);
-        if (hd)
-                printf("   Directory: %s\n", hd);
+        if (hd) {
+                printf("   Directory: %s", hd);
+
+                if (hr->fallback_home_directory && hr->use_fallback)
+                        printf(" %s(fallback)%s", ansi_highlight_yellow(), ansi_normal());
+
+                printf("\n");
+        }
+
+        if (hr->default_area)
+                printf("Default Area: %s\n", hr->default_area);
+
+        if (hr->blob_directory) {
+                _cleanup_free_ char **filenames = NULL;
+                size_t n_filenames = 0;
+
+                r = hashmap_dump_keys_sorted(hr->blob_manifest, (void***) &filenames, &n_filenames);
+                if (r < 0) {
+                        errno = -r;
+                        printf("   Blob Dir.: %s (can't iterate: %m)\n", hr->blob_directory);
+                } else
+                        printf("   Blob Dir.: %s\n", hr->blob_directory);
+
+                for (size_t i = 0; i < n_filenames; i++) {
+                        _cleanup_free_ char *path = NULL, *link = NULL, *hash = NULL;
+                        const char *filename = filenames[i];
+                        const uint8_t *hash_bytes = hashmap_get(hr->blob_manifest, filename);
+                        bool last = i == n_filenames - 1;
+
+                        path = path_join(hr->blob_directory, filename);
+                        if (path)
+                                (void) terminal_urlify_path(path, filename, &link);
+                        hash = hexmem(hash_bytes, SHA256_DIGEST_SIZE);
+
+                        printf("              %s %s %s(%s)%s\n",
+                               special_glyph(last ? SPECIAL_GLYPH_TREE_RIGHT : SPECIAL_GLYPH_TREE_BRANCH),
+                               link ?: filename,
+                               ansi_grey(),
+                               hash ?: "can't display hash",
+                               ansi_normal());
+                }
+        }
 
         storage = user_record_storage(hr);
         if (storage >= 0) /* Let's be political, and clarify which storage we like, and which we don't. About CIFS we don't complain. */
@@ -204,8 +323,14 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
                 printf("   Removable: %s\n", yes_no(b));
 
         shell = user_record_shell(hr);
-        if (shell)
-                printf("       Shell: %s\n", shell);
+        if (shell) {
+                printf("       Shell: %s", shell);
+
+                if (hr->fallback_shell && hr->use_fallback)
+                        printf(" %s(fallback)%s", ansi_highlight_yellow(), ansi_normal());
+
+                printf("\n");
+        }
 
         if (hr->email_address)
                 printf("       Email: %s\n", hr->email_address);
@@ -219,17 +344,14 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
         if (hr->time_zone)
                 printf("   Time Zone: %s\n", hr->time_zone);
 
-        if (hr->preferred_language)
-                printf("    Language: %s\n", hr->preferred_language);
-
-        if (!strv_isempty(hr->environment)) {
-                char **i;
-
-                STRV_FOREACH(i, hr->environment) {
-                        printf(i == hr->environment ?
-                               " Environment: %s\n" :
-                               "              %s\n", *i);
-                }
+        r = user_record_languages(hr, &langs);
+        if (r < 0) {
+                errno = -r;
+                printf("   Languages: (can't acquire: %m)\n");
+        } else if (!strv_isempty(langs)) {
+                STRV_FOREACH(i, langs)
+                        printf(i == langs ? "   Languages: %s" : ", %s", *i);
+                printf("\n");
         }
 
         if (hr->locked >= 0)
@@ -262,14 +384,35 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
         if (hr->memory_max != UINT64_MAX)
                 printf("  Memory Max: %s\n", FORMAT_BYTES(hr->memory_max));
 
-        if (hr->cpu_weight != UINT64_MAX)
+        if (hr->cpu_weight == CGROUP_WEIGHT_IDLE)
+                printf("  CPU Weight: %s\n", "idle");
+        else if (hr->cpu_weight != UINT64_MAX)
                 printf("  CPU Weight: %" PRIu64 "\n", hr->cpu_weight);
 
         if (hr->io_weight != UINT64_MAX)
                 printf("   IO Weight: %" PRIu64 "\n", hr->io_weight);
 
+        show_tmpfs_limit("TMP", &hr->tmp_limit, user_record_tmp_limit_scale(hr));
+        show_tmpfs_limit("SHM", &hr->dev_shm_limit, user_record_dev_shm_limit_scale(hr));
+
         if (hr->access_mode != MODE_INVALID)
                 printf(" Access Mode: 0%03o\n", user_record_access_mode(hr));
+
+        uint64_t caps = user_record_capability_bounding_set(hr);
+        if (caps != UINT64_MAX) {
+                _cleanup_free_ char *scaps = NULL;
+
+                (void) capability_set_to_string_negative(caps, &scaps);
+                printf(" Bound. Caps: %s\n", strna(scaps));
+        }
+
+        caps = user_record_capability_ambient_set(hr);
+        if (caps != UINT64_MAX) {
+                _cleanup_free_ char *scaps = NULL;
+
+                (void) capability_set_to_string(caps, &scaps);
+                printf("Ambient Caps: %s\n", strna(scaps));
+        }
 
         if (storage == USER_LUKS) {
                 printf("LUKS Discard: online=%s offline=%s\n", yes_no(user_record_luks_discard(hr)), yes_no(user_record_luks_offline_discard(hr)));
@@ -298,6 +441,8 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
                         printf("  PBKDF Type: %s\n", hr->luks_pbkdf_type);
                 if (hr->luks_pbkdf_hash_algorithm)
                         printf("  PBKDF Hash: %s\n", hr->luks_pbkdf_hash_algorithm);
+                if (hr->luks_pbkdf_force_iterations != UINT64_MAX)
+                        printf(" PBKDF Iters: %" PRIu64 "\n", hr->luks_pbkdf_force_iterations);
                 if (hr->luks_pbkdf_time_cost_usec != UINT64_MAX)
                         printf("  PBKDF Time: %s\n", FORMAT_TIMESPAN(hr->luks_pbkdf_time_cost_usec, 0));
                 if (hr->luks_pbkdf_memory_cost != UINT64_MAX)
@@ -305,6 +450,8 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
 
                 if (hr->luks_pbkdf_parallel_threads != UINT64_MAX)
                         printf("PBKDF Thread: %" PRIu64 "\n", hr->luks_pbkdf_parallel_threads);
+                if (hr->luks_sector_size != UINT64_MAX)
+                        printf(" Sector Size: %" PRIu64 "\n", hr->luks_sector_size);
 
         } else if (storage == USER_CIFS) {
 
@@ -444,17 +591,27 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
         if (hr->drop_caches >= 0 || user_record_drop_caches(hr))
                 printf(" Drop Caches: %s\n", yes_no(user_record_drop_caches(hr)));
 
+        if (hr->auto_resize_mode >= 0)
+                printf(" Auto Resize: %s\n", auto_resize_mode_to_string(user_record_auto_resize_mode(hr)));
+
+        if (hr->rebalance_weight != REBALANCE_WEIGHT_UNSET) {
+                uint64_t rb;
+
+                rb = user_record_rebalance_weight(hr);
+                if (rb == REBALANCE_WEIGHT_OFF)
+                        printf("   Rebalance: off\n");
+                else
+                        printf("   Rebalance: weight %" PRIu64 "\n", rb);
+        }
+
         if (!strv_isempty(hr->ssh_authorized_keys))
                 printf("SSH Pub. Key: %zu\n", strv_length(hr->ssh_authorized_keys));
 
-        if (!strv_isempty(hr->pkcs11_token_uri)) {
-                char **i;
-
+        if (!strv_isempty(hr->pkcs11_token_uri))
                 STRV_FOREACH(i, hr->pkcs11_token_uri)
                         printf(i == hr->pkcs11_token_uri ?
                                "PKCS11 Token: %s\n" :
                                "              %s\n", *i);
-        }
 
         if (hr->n_fido2_hmac_credential > 0)
                 printf(" FIDO2 Token: %zu\n", hr->n_fido2_hmac_credential);
@@ -478,11 +635,26 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
         if (hr->auto_login >= 0)
                 printf("Autom. Login: %s\n", yes_no(hr->auto_login));
 
+        if (hr->preferred_session_launcher)
+                printf("Sess. Launch: %s\n", hr->preferred_session_launcher);
+        if (hr->preferred_session_type)
+                printf("Session Type: %s\n", hr->preferred_session_type);
+
         if (hr->kill_processes >= 0)
                 printf("  Kill Proc.: %s\n", yes_no(hr->kill_processes));
 
         if (hr->service)
                 printf("     Service: %s\n", hr->service);
+
+        show_self_modifiable("Self Modify:",
+                             hr->self_modifiable_fields,
+                             user_record_self_modifiable_fields(hr));
+        show_self_modifiable("(Blobs)",
+                             hr->self_modifiable_blobs,
+                             user_record_self_modifiable_blobs(hr));
+        show_self_modifiable("(Privileged)",
+                             hr->self_modifiable_privileged,
+                             user_record_self_modifiable_privileged(hr));
 }
 
 void group_record_show(GroupRecord *gr, bool show_full_user_info) {
@@ -527,7 +699,6 @@ void group_record_show(GroupRecord *gr, bool show_full_user_info) {
                 }
         } else {
                 const char *prefix = "     Members:";
-                char **i;
 
                 STRV_FOREACH(i, gr->members) {
                         printf("%s %s\n", prefix, *i);
@@ -537,7 +708,6 @@ void group_record_show(GroupRecord *gr, bool show_full_user_info) {
 
         if (!strv_isempty(gr->administrators)) {
                 const char *prefix = "      Admins:";
-                char **i;
 
                 STRV_FOREACH(i, gr->administrators) {
                         printf("%s %s\n", prefix, *i);

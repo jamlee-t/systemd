@@ -14,6 +14,7 @@
 #include "journal-util.h"
 #include "parse-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "unaligned.h"
 
 enum {
@@ -32,11 +33,11 @@ void journal_importer_cleanup(JournalImporter *imp) {
 
         free(imp->name);
         free(imp->buf);
-        iovw_free_contents(&imp->iovw, false);
+        iovw_done(&imp->iovw);
 }
 
 static char* realloc_buffer(JournalImporter *imp, size_t size) {
-        char *b, *old = imp->buf;
+        char *b, *old = ASSERT_PTR(imp)->buf;
 
         b = GREEDY_REALLOC(imp->buf, size);
         if (!b)
@@ -92,7 +93,12 @@ static int get_line(JournalImporter *imp, char **line, size_t *size) {
                          imp->buf + imp->filled,
                          MALLOC_SIZEOF_SAFE(imp->buf) - imp->filled);
                 if (n < 0) {
-                        if (errno != EAGAIN)
+                        if (ERRNO_IS_DISCONNECT(errno)) {
+                                log_debug_errno(errno, "Got disconnect for importer %s.", strna(imp->name));
+                                return 0;
+                        }
+
+                        if (!ERRNO_IS_TRANSIENT(errno))
                                 log_error_errno(errno, "read(%d, ..., %zu): %m",
                                                 imp->fd,
                                                 MALLOC_SIZEOF_SAFE(imp->buf) - imp->filled);
@@ -121,7 +127,7 @@ static int fill_fixed_size(JournalImporter *imp, void **data, size_t size) {
         assert(data);
 
         while (imp->filled - imp->offset < size) {
-                int n;
+                ssize_t n;
 
                 if (imp->passive_fd)
                         /* we have to wait for some data to come to us */
@@ -133,7 +139,12 @@ static int fill_fixed_size(JournalImporter *imp, void **data, size_t size) {
                 n = read(imp->fd, imp->buf + imp->filled,
                          MALLOC_SIZEOF_SAFE(imp->buf) - imp->filled);
                 if (n < 0) {
-                        if (errno != EAGAIN)
+                        if (ERRNO_IS_DISCONNECT(errno)) {
+                                log_debug_errno(errno, "Got disconnect for importer %s.", strna(imp->name));
+                                return 0;
+                        }
+
+                        if (!ERRNO_IS_TRANSIENT(errno))
                                 log_error_errno(errno, "read(%d, ..., %zu): %m", imp->fd,
                                                 MALLOC_SIZEOF_SAFE(imp->buf) - imp->filled);
                         return -errno;
@@ -217,9 +228,8 @@ static int process_special_field(JournalImporter *imp, char *line) {
 
         assert(line);
 
-        value = startswith(line, "__CURSOR=");
-        if (value)
-                /* ignore __CURSOR */
+        if (STARTSWITH_SET(line, "__CURSOR=", "__SEQNUM=", "__SEQNUM_ID="))
+                /* ignore __CURSOR=, __SEQNUM=, __SEQNUM_ID= which we cannot replicate */
                 return 1;
 
         value = startswith(line, "__REALTIME_TIMESTAMP=");
@@ -281,7 +291,7 @@ static int process_special_field(JournalImporter *imp, char *line) {
 int journal_importer_process_data(JournalImporter *imp) {
         int r;
 
-        switch(imp->state) {
+        switch (imp->state) {
         case IMPORTER_STATE_LINE: {
                 char *line, *sep;
                 size_t n = 0;
@@ -426,11 +436,10 @@ int journal_importer_push_data(JournalImporter *imp, const char *data, size_t si
         assert(imp->state != IMPORTER_STATE_EOF);
 
         if (!realloc_buffer(imp, imp->filled + size))
-                return log_error_errno(SYNTHETIC_ERRNO(ENOMEM),
+                return log_error_errno(ENOMEM,
                                        "Failed to store received data of size %zu "
-                                       "(in addition to existing %zu bytes with %zu filled): %s",
-                                       size, MALLOC_SIZEOF_SAFE(imp->buf), imp->filled,
-                                       strerror_safe(ENOMEM));
+                                       "(in addition to existing %zu bytes with %zu filled): %m",
+                                       size, MALLOC_SIZEOF_SAFE(imp->buf), imp->filled);
 
         memcpy(imp->buf + imp->filled, data, size);
         imp->filled += size;
@@ -443,7 +452,7 @@ void journal_importer_drop_iovw(JournalImporter *imp) {
 
         /* This function drops processed data that along with the iovw that points at it */
 
-        iovw_free_contents(&imp->iovw, false);
+        iovw_done(&imp->iovw);
 
         /* possibly reset buffer position */
         remain = imp->filled - imp->offset;

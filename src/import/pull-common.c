@@ -7,6 +7,7 @@
 #include "capability-util.h"
 #include "copy.h"
 #include "dirent-util.h"
+#include "discover-image.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "hostname-util.h"
@@ -16,13 +17,12 @@
 #include "process-util.h"
 #include "pull-common.h"
 #include "pull-job.h"
-#include "rlimit-util.h"
 #include "rm-rf.h"
 #include "signal-util.h"
 #include "siphash24.h"
 #include "string-util.h"
 #include "strv.h"
-#include "util.h"
+#include "tmpfile-util.h"
 #include "web-util.h"
 
 #define FILENAME_ESCAPE "/.#\"\'"
@@ -39,10 +39,8 @@ int pull_find_old_etags(
         int r;
 
         assert(url);
+        assert(image_root);
         assert(etags);
-
-        if (!image_root)
-                image_root = "/var/lib/machines";
 
         _cleanup_free_ char *escaped_url = xescape(url, FILENAME_ESCAPE);
         if (!escaped_url)
@@ -59,7 +57,6 @@ int pull_find_old_etags(
         }
 
         _cleanup_strv_free_ char **ans = NULL;
-        struct dirent *de;
 
         FOREACH_DIRENT_ALL(de, d, return -errno) {
                 _cleanup_free_ char *u = NULL;
@@ -131,10 +128,8 @@ int pull_make_path(const char *url, const char *etag, const char *image_root, co
         char *path;
 
         assert(url);
+        assert(image_root);
         assert(ret);
-
-        if (!image_root)
-                image_root = "/var/lib/machines";
 
         escaped_url = xescape(url, FILENAME_ESCAPE);
         if (!escaped_url)
@@ -231,14 +226,25 @@ static bool is_checksum_file(const char *fn) {
         return streq(fn, "SHA256SUMS") || endswith(fn, ".sha256");
 }
 
-static bool is_signature_file(const char *fn) {
-        /* Returns true if the specified filename refers to a signature file we grok (reminder:
-         * suse-style .sha256 files are inline signed) */
+static SignatureStyle signature_style_from_filename(const char *fn) {
+        /* Returns true if the specified filename refers to a signature file we grok */
 
         if (!fn)
-                return false;
+                return _SIGNATURE_STYLE_INVALID;
 
-        return streq(fn, "SHA256SUMS.gpg") || endswith(fn, ".sha256");
+        if (streq(fn, "SHA256SUMS.gpg"))
+                return SIGNATURE_GPG_PER_DIRECTORY;
+
+        if (streq(fn, "SHA256SUMS.asc"))
+                return SIGNATURE_ASC_PER_DIRECTORY;
+
+        if (endswith(fn, ".sha256.gpg"))
+                return SIGNATURE_GPG_PER_FILE;
+
+        if (endswith(fn, ".sha256.asc"))
+                return SIGNATURE_ASC_PER_FILE;
+
+        return _SIGNATURE_STYLE_INVALID;
 }
 
 int pull_make_verification_jobs(
@@ -277,7 +283,7 @@ int pull_make_verification_jobs(
 
         /* Acquire the checksum file if verification or signature verification is requested and the main file
          * to acquire isn't a checksum or signature file anyway */
-        if (verify != IMPORT_VERIFY_NO && !is_checksum_file(fn) && !is_signature_file(fn)) {
+        if (verify != IMPORT_VERIFY_NO && !is_checksum_file(fn) && signature_style_from_filename(fn) < 0) {
                 _cleanup_free_ char *checksum_url = NULL;
                 const char *suffixed = NULL;
 
@@ -301,11 +307,17 @@ int pull_make_verification_jobs(
                 checksum_job->on_not_found = pull_job_restart_with_sha256sum; /* if this fails, look for ubuntu-style checksum */
         }
 
-        if (verify == IMPORT_VERIFY_SIGNATURE && !is_signature_file(fn)) {
+        if (verify == IMPORT_VERIFY_SIGNATURE && signature_style_from_filename(fn) < 0) {
                 _cleanup_free_ char *signature_url = NULL;
+                const char *suffixed = NULL;
 
-                /* Queue job for the SHA256SUMS.gpg file for the image. */
-                r = import_url_change_last_component(url, "SHA256SUMS.gpg", &signature_url);
+                if (fn)
+                        suffixed = strjoina(fn, ".sha256.asc"); /* Start with the suse-style checksum (if there's a base filename) */
+                else
+                        suffixed = "SHA256SUMS.gpg";
+
+                /* Queue job for the signature file for the image. */
+                r = import_url_change_last_component(url, suffixed, &signature_url);
                 if (r < 0)
                         return r;
 
@@ -315,6 +327,7 @@ int pull_make_verification_jobs(
 
                 signature_job->on_finished = on_finished;
                 signature_job->uncompressed_max = signature_job->compressed_max = 1ULL * 1024ULL * 1024ULL;
+                signature_job->on_not_found = pull_job_restart_with_signature;
         }
 
         *ret_checksum_job = TAKE_PTR(checksum_job);
@@ -353,7 +366,7 @@ static int verify_one(PullJob *checksum_job, PullJob *job) {
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
                                        "Cannot verify checksum, could not determine server-side file name.");
 
-        if (is_checksum_file(fn) || is_signature_file(fn)) /* We cannot verify checksum files or signature files with a checksum file */
+        if (is_checksum_file(fn) || signature_style_from_filename(fn) >= 0) /* We cannot verify checksum files or signature files with a checksum file */
                 return log_error_errno(SYNTHETIC_ERRNO(ELOOP),
                                        "Cannot verify checksum/signature files via themselves.");
 
@@ -383,10 +396,10 @@ static int verify_gpg(
                 const void *payload, size_t payload_size,
                 const void *signature, size_t signature_size) {
 
-        _cleanup_close_pair_ int gpg_pipe[2] = { -1, -1 };
-        char sig_file_path[] = "/tmp/sigXXXXXX", gpg_home[] = "/tmp/gpghomeXXXXXX";
+        _cleanup_close_pair_ int gpg_pipe[2] = EBADF_PAIR;
+        _cleanup_(rm_rf_physical_and_freep) char *gpg_home = NULL;
+        char sig_file_path[] = "/tmp/sigXXXXXX";
         _cleanup_(sigkill_waitp) pid_t pid = 0;
-        bool gpg_home_created = false;
         int r;
 
         assert(payload || payload_size == 0);
@@ -397,27 +410,30 @@ static int verify_gpg(
                 return log_error_errno(errno, "Failed to create pipe for gpg: %m");
 
         if (signature_size > 0) {
-                _cleanup_close_ int sig_file = -1;
+                _cleanup_close_ int sig_file = -EBADF;
 
                 sig_file = mkostemp(sig_file_path, O_RDWR);
                 if (sig_file < 0)
                         return log_error_errno(errno, "Failed to create temporary file: %m");
 
-                r = loop_write(sig_file, signature, signature_size, false);
+                r = loop_write(sig_file, signature, signature_size);
                 if (r < 0) {
                         log_error_errno(r, "Failed to write to temporary file: %m");
                         goto finish;
                 }
         }
 
-        if (!mkdtemp(gpg_home)) {
-                r = log_error_errno(errno, "Failed to create temporary home for gpg: %m");
+        r = mkdtemp_malloc("/tmp/gpghomeXXXXXX", &gpg_home);
+        if (r < 0) {
+                log_error_errno(r, "Failed to create temporary home for gpg: %m");
                 goto finish;
         }
 
-        gpg_home_created = true;
-
-        r = safe_fork("(gpg)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        r = safe_fork_full("(gpg)",
+                           (int[]) { gpg_pipe[0], -EBADF, STDERR_FILENO },
+                           NULL, 0,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                           &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -439,16 +455,6 @@ static int verify_gpg(
                 size_t k = ELEMENTSOF(cmd) - 6;
 
                 /* Child */
-
-                gpg_pipe[1] = safe_close(gpg_pipe[1]);
-
-                r = rearrange_stdio(TAKE_FD(gpg_pipe[0]), -1, STDERR_FILENO);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to rearrange stdin/stdout: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                (void) rlimit_nofile_safe();
 
                 cmd[k++] = strjoina("--homedir=", gpg_home);
 
@@ -474,7 +480,7 @@ static int verify_gpg(
 
         gpg_pipe[0] = safe_close(gpg_pipe[0]);
 
-        r = loop_write(gpg_pipe[1], payload, payload_size, false);
+        r = loop_write(gpg_pipe[1], payload, payload_size);
         if (r < 0) {
                 log_error_errno(r, "Failed to write to pipe: %m");
                 goto finish;
@@ -496,9 +502,6 @@ static int verify_gpg(
 finish:
         if (signature_size > 0)
                 (void) unlink(sig_file_path);
-
-        if (gpg_home_created)
-                (void) rm_rf(gpg_home, REMOVE_ROOT|REMOVE_PHYSICAL);
 
         return r;
 }
@@ -551,7 +554,7 @@ int pull_verify(ImportVerify verify,
         if (r < 0)
                 return log_error_errno(r, "Failed to extract filename from URL '%s': %m", main_job->url);
 
-        if (is_signature_file(fn))
+        if (signature_style_from_filename(fn) >= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(ELOOP),
                                        "Main download is a signature file, can't verify it.");
 
@@ -559,7 +562,6 @@ int pull_verify(ImportVerify verify,
                 log_debug("Main download is a checksum file, can't validate its checksum with itself, skipping.");
                 verify_job = main_job;
         } else {
-                PullJob *j;
                 assert(main_job->calc_checksum);
                 assert(main_job->checksum);
                 assert(checksum_job);
@@ -569,7 +571,8 @@ int pull_verify(ImportVerify verify,
                         return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
                                                "Checksum is empty, cannot verify.");
 
-                FOREACH_POINTER(j, main_job, settings_job, roothash_job, roothash_signature_job, verity_job) {
+                PullJob *j;
+                FOREACH_ARGUMENT(j, main_job, settings_job, roothash_job, roothash_signature_job, verity_job) {
                         r = verify_one(checksum_job, j);
                         if (r < 0)
                                 return r;
@@ -587,17 +590,14 @@ int pull_verify(ImportVerify verify,
         if (r < 0)
                 return log_error_errno(r, "Failed to determine verification style from URL '%s': %m", verify_job->url);
 
-        if (style == VERIFICATION_PER_DIRECTORY) {
-                assert(signature_job);
-                assert(signature_job->state == PULL_JOB_DONE);
+        assert(signature_job);
+        assert(signature_job->state == PULL_JOB_DONE);
 
-                if (!signature_job->payload || signature_job->payload_size <= 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
-                                               "Signature is empty, cannot verify.");
+        if (!signature_job->payload || signature_job->payload_size <= 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Signature is empty, cannot verify.");
 
-                return verify_gpg(verify_job->payload, verify_job->payload_size, signature_job->payload, signature_job->payload_size);
-        } else
-                return verify_gpg(verify_job->payload, verify_job->payload_size, NULL, 0);
+        return verify_gpg(verify_job->payload, verify_job->payload_size, signature_job->payload, signature_job->payload_size);
 }
 
 int verification_style_from_url(const char *url, VerificationStyle *ret) {
@@ -638,12 +638,14 @@ int pull_job_restart_with_sha256sum(PullJob *j, char **ret) {
         if (r < 0)
                 return log_error_errno(r, "Failed to determine verification style of URL '%s': %m", j->url);
 
-        if (style == VERIFICATION_PER_DIRECTORY) /* Nothing to do anymore */
+        if (style == VERIFICATION_PER_DIRECTORY) { /* Nothing to do anymore */
+                *ret = NULL;
                 return 0;
+        }
 
         assert(style == VERIFICATION_PER_FILE); /* This must have been .sha256 style URL before */
 
-        log_debug("Got 404 for %s, now trying to get SHA256SUMS instead.", j->url);
+        log_debug("Got 404 for '%s', now trying to get SHA256SUMS instead.", j->url);
 
         r = import_url_change_last_component(j->url, "SHA256SUMS", ret);
         if (r < 0)
@@ -652,12 +654,93 @@ int pull_job_restart_with_sha256sum(PullJob *j, char **ret) {
         return 1;
 }
 
-bool pull_validate_local(const char *name, PullFlags flags) {
+int signature_style_from_url(const char *url, SignatureStyle *ret, char **ret_filename) {
+        _cleanup_free_ char *last = NULL;
+        SignatureStyle style;
+        int r;
 
-        if (FLAGS_SET(flags, PULL_DIRECT))
+        assert(url);
+        assert(ret);
+        assert(ret_filename);
+
+        /* Determines which kind of signature style is appropriate for this url */
+
+        r = import_url_last_component(url, &last);
+        if (r < 0)
+                return r;
+
+        style = signature_style_from_filename(last);
+        if (style < 0)
+                return style;
+
+        *ret_filename = TAKE_PTR(last);
+        *ret = style;
+        return 0;
+}
+
+int pull_job_restart_with_signature(PullJob *j, char **ret) {
+        _cleanup_free_ char *last = NULL;
+        SignatureStyle style;
+        int r;
+
+        assert(j);
+
+        /* Generic implementation of a PullJobNotFound handler, that restarts the job requesting a different
+         * signature file. After the initial file, additional *.sha256.gpg, SHA256SUMS.gpg and SHA256SUMS.asc
+         * are tried in this order. */
+
+        r = signature_style_from_url(j->url, &style, &last);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine signature style of URL '%s': %m", j->url);
+
+        switch (style) {
+
+        case SIGNATURE_ASC_PER_DIRECTORY: /* Nothing to do anymore */
+                *ret = NULL;
+                return 0;
+
+        case SIGNATURE_ASC_PER_FILE: { /* Try .sha256.gpg next */
+                char *ext;
+
+                log_debug("Got 404 for '%s', now trying to get .sha256.gpg instead.", j->url);
+
+                ext = endswith(last, ".asc");
+                assert(ext);
+                strcpy(ext, ".gpg");
+
+                r = import_url_change_last_component(j->url, last, ret);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to replace .sha256.asc suffix: %m");
+                break;
+        }
+
+        case SIGNATURE_GPG_PER_FILE: /* Try SHA256SUMS.gpg next */
+                log_debug("Got 404 for '%s', now trying to get SHA256SUMS.gpg instead.", j->url);
+                r = import_url_change_last_component(j->url, "SHA256SUMS.gpg", ret);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to replace SHA256SUMS suffix: %m");
+                break;
+
+        case SIGNATURE_GPG_PER_DIRECTORY:
+                log_debug("Got 404 for '%s', now trying to get SHA256SUMS.asc instead.", j->url);
+                r = import_url_change_last_component(j->url, "SHA256SUMS.asc", ret);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to replace SHA256SUMS.gpg suffix: %m");
+                break;
+
+        default:
+                assert_not_reached();
+        }
+
+        return 1;
+}
+
+bool pull_validate_local(const char *name, ImportFlags flags) {
+
+        if (FLAGS_SET(flags, IMPORT_DIRECT))
                 return path_is_valid(name);
 
-        return hostname_is_valid(name, 0);
+        return image_name_is_valid(name);
 }
 
 int pull_url_needs_checksum(const char *url) {
@@ -674,5 +757,5 @@ int pull_url_needs_checksum(const char *url) {
         if (r < 0)
                 return r;
 
-        return !is_checksum_file(fn) && !is_signature_file(fn);
+        return !is_checksum_file(fn) && signature_style_from_filename(fn) < 0;
 }

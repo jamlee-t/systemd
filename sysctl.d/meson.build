@@ -16,11 +16,10 @@ custom_target(
         '50-coredump.conf',
         input : '50-coredump.conf.in',
         output : '50-coredump.conf',
-        command : [meson_render_jinja2, config_h, '@INPUT@', '@OUTPUT@'],
+        command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
         install : conf.get('ENABLE_COREDUMP') == 1,
         install_dir : sysctldir)
 
 if install_sysconfdir
-        meson.add_install_script('sh', '-c',
-                                 mkdir_p.format(sysconfdir / 'sysctl.d'))
+        install_emptydir(sysconfdir / 'sysctl.d')
 endif

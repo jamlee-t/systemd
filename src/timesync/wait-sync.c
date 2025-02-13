@@ -80,17 +80,16 @@ static int inotify_handler(sd_event_source *s,
         sd_event *event = sd_event_source_get_event(s);
         ClockState *sp = userdata;
         union inotify_event_buffer buffer;
-        struct inotify_event *e;
         ssize_t l;
 
         l = read(fd, &buffer, sizeof(buffer));
         if (l < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
+                if (ERRNO_IS_TRANSIENT(errno))
                         return 0;
 
                 return log_warning_errno(errno, "Lost access to inotify: %m");
         }
-        FOREACH_INOTIFY_EVENT(e, buffer, l)
+        FOREACH_INOTIFY_EVENT_WARN(e, buffer, l)
                 process_inotify_event(event, sp, e);
 
         return 0;
@@ -148,7 +147,7 @@ static int clock_state_update(
                 tx.time.tv_usec /= 1000;
         t = timeval_load(&tx.time);
 
-        log_info("adjtime state %d status %x time %s", sp->adjtime_state, tx.status,
+        log_info("adjtime state %i status %x time %s", sp->adjtime_state, (unsigned) tx.status,
                  FORMAT_TIMESTAMP_STYLE(t, TIMESTAMP_US_UTC) ?: "unrepresentable");
 
         sp->has_watchfile = access("/run/systemd/timesync/synchronized", F_OK) >= 0;
@@ -178,26 +177,20 @@ static int clock_state_update(
 static int run(int argc, char * argv[]) {
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(clock_state_release) ClockState state = {
-                .timerfd_fd = -1,
-                .inotify_fd = -1,
+                .timerfd_fd = -EBADF,
+                .inotify_fd = -EBADF,
                 .run_systemd_wd = -1,
                 .run_systemd_timesync_wd = -1,
         };
         int r;
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-
         r = sd_event_default(&event);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
-        r = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
         if (r < 0)
-                return log_error_errno(r, "Failed to create sigterm event source: %m");
-
-        r = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create sigint event source: %m");
+                return log_error_errno(r, "Failed to enable SIGTERM/SIGINT handling: %m");
 
         r = sd_event_set_watchdog(event, true);
         if (r < 0)

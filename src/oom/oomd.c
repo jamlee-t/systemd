@@ -2,48 +2,30 @@
 
 #include <getopt.h>
 
+#include "build.h"
 #include "bus-log-control-api.h"
 #include "bus-object.h"
 #include "cgroup-util.h"
 #include "conf-parser.h"
 #include "daemon-util.h"
+#include "fileio.h"
 #include "log.h"
 #include "main-func.h"
-#include "oomd-manager.h"
+#include "oomd-conf.h"
 #include "oomd-manager-bus.h"
+#include "oomd-manager.h"
 #include "parse-util.h"
-#include "pretty-print.c"
+#include "pretty-print.h"
 #include "psi-util.h"
 #include "signal-util.h"
 
 static bool arg_dry_run = false;
-static int arg_swap_used_limit_permyriad = -1;
-static int arg_mem_pressure_limit_permyriad = -1;
-static usec_t arg_mem_pressure_usec = 0;
-
-static int parse_config(void) {
-        static const ConfigTableItem items[] = {
-                { "OOM", "SwapUsedLimit",                    config_parse_permyriad, 0, &arg_swap_used_limit_permyriad    },
-                { "OOM", "DefaultMemoryPressureLimit",       config_parse_permyriad, 0, &arg_mem_pressure_limit_permyriad },
-                { "OOM", "DefaultMemoryPressureDurationSec", config_parse_sec,       0, &arg_mem_pressure_usec            },
-                {}
-        };
-
-        return config_parse_many_nulstr(PKGSYSCONFDIR "/oomd.conf",
-                                        CONF_PATHS_NULSTR("systemd/oomd.conf.d"),
-                                        "OOM\0",
-                                        config_item_table_lookup,
-                                        items,
-                                        CONFIG_PARSE_WARN,
-                                        NULL,
-                                        NULL);
-}
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
         int r;
 
-        r = terminal_urlify_man("systemd-oomd", "1", &link);
+        r = terminal_urlify_man("systemd-oomd", "8", &link);
         if (r < 0)
                 return log_oom();
 
@@ -129,10 +111,6 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        r = parse_config();
-        if (r < 0)
-                return r;
-
         /* Do some basic requirement checks for running systemd-oomd. It's not exhaustive as some of the other
          * requirements do not have a reliable means to check for in code. */
 
@@ -149,7 +127,7 @@ static int run(int argc, char *argv[]) {
 
         r = safe_atollu(swap, &s);
         if (r < 0 || s == 0)
-                log_warning("Swap is currently not detected; memory pressure usage will be degraded");
+                log_warning("No swap; memory pressure usage will be degraded");
 
         if (!is_pressure_supported())
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Pressure Stall Information (PSI) is not supported");
@@ -167,11 +145,6 @@ static int run(int argc, char *argv[]) {
         if (!FLAGS_SET(mask, CGROUP_MASK_MEMORY))
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Requires the cgroup memory controller.");
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-
-        if (arg_mem_pressure_usec > 0 && arg_mem_pressure_usec < 1 * USEC_PER_SEC)
-                log_error_errno(SYNTHETIC_ERRNO(EINVAL), "DefaultMemoryPressureDurationSec= must be 0 or at least 1s");
-
         r = manager_new(&m);
         if (r < 0)
                 return log_error_errno(r, "Failed to create manager: %m");
@@ -179,9 +152,6 @@ static int run(int argc, char *argv[]) {
         r = manager_start(
                         m,
                         arg_dry_run,
-                        arg_swap_used_limit_permyriad,
-                        arg_mem_pressure_limit_permyriad,
-                        arg_mem_pressure_usec,
                         fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to start up daemon: %m");

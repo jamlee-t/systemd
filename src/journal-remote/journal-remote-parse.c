@@ -3,7 +3,6 @@
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "journal-remote-parse.h"
-#include "journald-native.h"
 #include "parse-util.h"
 #include "string-util.h"
 
@@ -13,12 +12,13 @@ void source_free(RemoteSource *source) {
 
         journal_importer_cleanup(&source->importer);
 
-        log_debug("Writer ref count %i", source->writer->n_ref);
+        log_debug("Writer ref count %u", source->writer->n_ref);
         writer_unref(source->writer);
 
         sd_event_source_unref(source->event);
         sd_event_source_unref(source->buffer_event);
 
+        free(source->encoding);
         free(source);
 }
 
@@ -47,7 +47,7 @@ RemoteSource* source_new(int fd, bool passive_fd, char *name, Writer *writer) {
         return source;
 }
 
-int process_source(RemoteSource *source, bool compress, bool seal) {
+int process_source(RemoteSource *source, JournalFileFlags file_flags) {
         int r;
 
         assert(source);
@@ -72,8 +72,8 @@ int process_source(RemoteSource *source, bool compress, bool seal) {
                          &source->importer.iovw,
                          &source->importer.ts,
                          &source->importer.boot_id,
-                         compress, seal);
-        if (r == -EBADMSG) {
+                         file_flags);
+        if (IN_SET(r, -EBADMSG, -EADDRNOTAVAIL)) {
                 log_warning_errno(r, "Entry is invalid, ignoring.");
                 r = 0;
         } else if (r < 0)

@@ -6,12 +6,13 @@
 #include "sd-event.h"
 #include "sd-netlink.h"
 #include "sd-network.h"
+#include "sd-varlink.h"
 
+#include "common-signal.h"
 #include "hashmap.h"
 #include "list.h"
 #include "ordered-set.h"
 #include "resolve-util.h"
-#include "varlink.h"
 
 typedef struct Manager Manager;
 
@@ -42,6 +43,7 @@ struct Manager {
         DnsCacheMode enable_cache;
         bool cache_from_localhost;
         DnsStubListenerMode dns_stub_listener_mode;
+        usec_t stale_retention_usec;
 
 #if ENABLE_DNS_OVER_TLS
         DnsTlsManagerData dnstls_data;
@@ -121,11 +123,12 @@ struct Manager {
         int hostname_fd;
         sd_event_source *hostname_event_source;
 
-        sd_event_source *sigusr1_event_source;
-        sd_event_source *sigusr2_event_source;
-        sd_event_source *sigrtmin1_event_source;
-
         unsigned n_transactions_total;
+        unsigned n_timeouts_total;
+        unsigned n_timeouts_served_stale_total;
+        unsigned n_failure_responses_total;
+        unsigned n_failure_responses_served_stale_total;
+
         unsigned n_dnssec_verdict[_DNSSEC_VERDICT_MAX];
 
         /* Data from /etc/hosts */
@@ -134,21 +137,39 @@ struct Manager {
         struct stat etc_hosts_stat;
         bool read_etc_hosts;
 
+        /* List of refused DNS Record Types*/
+        Set *refuse_record_types;
+
         OrderedSet *dns_extra_stub_listeners;
 
         /* Local DNS stub on 127.0.0.53:53 */
         sd_event_source *dns_stub_udp_event_source;
         sd_event_source *dns_stub_tcp_event_source;
 
+        /* Local DNS proxy stub on 127.0.0.54:53 */
+        sd_event_source *dns_proxy_stub_udp_event_source;
+        sd_event_source *dns_proxy_stub_tcp_event_source;
+
         Hashmap *polkit_registry;
 
-        VarlinkServer *varlink_server;
+        sd_varlink_server *varlink_server;
+        sd_varlink_server *varlink_monitor_server;
+
+        Set *varlink_query_results_subscription;
+        Set *varlink_dns_configuration_subscription;
+
+        sd_json_variant *dns_configuration_json;
+
+        sd_netlink_slot *netlink_new_route_slot;
+        sd_netlink_slot *netlink_del_route_slot;
 
         sd_event_source *clock_change_event_source;
 
         LIST_HEAD(SocketGraveyard, socket_graveyard);
         SocketGraveyard *socket_graveyard_oldest;
         size_t n_socket_graveyard;
+
+        struct sigrtmin18_info sigrtmin18_info;
 };
 
 /* Manager */
@@ -160,6 +181,9 @@ int manager_start(Manager *m);
 
 uint32_t manager_find_mtu(Manager *m);
 
+int manager_monitor_send(Manager *m, DnsQuery *q);
+
+int sendmsg_loop(int fd, struct msghdr *mh, int flags);
 int manager_write(Manager *m, int fd, DnsPacket *p);
 int manager_send(Manager *m, int fd, int ifindex, int family, const union in_addr_union *destination, uint16_t port, const union in_addr_union *source, DnsPacket *p);
 int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret);
@@ -206,3 +230,13 @@ bool manager_next_dnssd_names(Manager *m);
 bool manager_server_is_stub(Manager *m, DnsServer *s);
 
 int socket_disable_pmtud(int fd, int af);
+
+int dns_manager_dump_statistics_json(Manager *m, sd_json_variant **ret);
+
+void dns_manager_reset_statistics(Manager *m);
+
+int manager_dump_dns_configuration_json(Manager *m, sd_json_variant **ret);
+int manager_send_dns_configuration_changed(Manager *m, Link *l, bool reset);
+
+int manager_start_dns_configuration_monitor(Manager *m);
+void manager_stop_dns_configuration_monitor(Manager *m);

@@ -7,7 +7,7 @@
  *   Copyright (C) 2020 Bastien Nocera <hadess@hadess.net>
  *
  * Unless specified otherwise, all references are aimed at the "System
- * Management BIOS Reference Specification, Version 3.2.0" document,
+ * Management BIOS Reference Specification, Version 3.7.0" document,
  * available from http://www.dmtf.org/standards/smbios.
  *
  * Note to contributors:
@@ -45,12 +45,12 @@
 #include <getopt.h>
 
 #include "alloc-util.h"
+#include "build.h"
 #include "fileio.h"
 #include "main-func.h"
 #include "string-util.h"
 #include "udev-util.h"
 #include "unaligned.h"
-#include "version.h"
 
 #define SUPPORTED_SMBIOS_VER 0x030300
 
@@ -86,17 +86,17 @@ static bool verify_checksum(const uint8_t *buf, size_t len) {
 }
 
 /*
- * Type-independant Stuff
+ * Type-independent Stuff
  */
 
-static const char *dmi_string(const struct dmi_header *dm, uint8_t s) {
+static const char* dmi_string(const struct dmi_header *dm, uint8_t s) {
         const char *bp = (const char *) dm->data;
 
         if (s == 0)
                 return "Not Specified";
 
         bp += dm->length;
-        for (;s > 1 && !isempty(bp); s--)
+        for (; s > 1 && !isempty(bp); s--)
                 bp += strlen(bp) + 1;
 
         if (isempty(bp))
@@ -117,7 +117,7 @@ static void dmi_print_memory_size(
                 code <<= 10;
 
         if (slot_num >= 0)
-                printf("%s_%u_%s=%"PRIu64"\n", attr_prefix, slot_num, attr_suffix, code);
+                printf("%s_%i_%s=%"PRIu64"\n", attr_prefix, slot_num, attr_suffix, code);
         else
                 printf("%s_%s=%"PRIu64"\n", attr_prefix, attr_suffix, code);
 }
@@ -145,7 +145,7 @@ static void dmi_memory_array_location(uint8_t code) {
                 [0x01] = "PC-98/C24 Add-on Card",       /* 0xA1 */
                 [0x02] = "PC-98/E Add-on Card",         /* 0xA2 */
                 [0x03] = "PC-98/Local Bus Add-on Card", /* 0xA3 */
-                [0x04] = "CXL Flexbus 1.0",             /* 0xA4 */
+                [0x04] = "CXL Add-on Card",             /* 0xA4 */
         };
         const char *str = OUT_OF_SPEC_STR;
 
@@ -301,6 +301,9 @@ static void dmi_memory_device_type(unsigned slot_num, uint8_t code) {
                 [0x1F] = "Logical non-volatile device",
                 [0x20] = "HBM",
                 [0x21] = "HBM2",
+                [0x22] = "DDR5",
+                [0x23] = "LPDDR5",
+                [0x24] = "HBM3",
         };
 
         printf("MEMORY_DEVICE_%u_TYPE=%s\n", slot_num,
@@ -315,7 +318,7 @@ static void dmi_memory_device_type_detail(unsigned slot_num, uint16_t code) {
                 [3]  = "Fast-paged",
                 [4]  = "Static Column",
                 [5]  = "Pseudo-static",
-                [6]  = "RAMBus",
+                [6]  = "RAMBUS",
                 [7]  = "Synchronous",
                 [8]  = "CMOS",
                 [9]  = "EDO",
@@ -358,7 +361,7 @@ static void dmi_memory_device_technology(unsigned slot_num, uint8_t code) {
                 [0x04] = "NVDIMM-N",
                 [0x05] = "NVDIMM-F",
                 [0x06] = "NVDIMM-P",
-                [0x07] = "Intel Optane DC persistent memory",
+                [0x07] = "Intel Optane persistent memory",
         };
 
         printf("MEMORY_DEVICE_%u_MEMORY_TECHNOLOGY=%s\n", slot_num,
@@ -396,7 +399,7 @@ static void dmi_memory_device_manufacturer_id(
         /* LSB is 7-bit Odd Parity number of continuation codes */
         if (code != 0)
                 printf("MEMORY_DEVICE_%u_%s=Bank %d, Hex 0x%02X\n", slot_num, attr_suffix,
-                       (code & 0x7F) + 1, code >> 8);
+                       (code & 0x7F) + 1, (uint16_t) (code >> 8));
 }
 
 static void dmi_memory_device_product_id(
@@ -417,9 +420,9 @@ static void dmi_memory_device_size_detail(
                 dmi_print_memory_size("MEMORY_DEVICE", attr_suffix, slot_num, code, MEMORY_SIZE_UNIT_BYTES);
 }
 
-static void dmi_decode(const struct dmi_header *h) {
+static void dmi_decode(const struct dmi_header *h,
+                       unsigned *next_slot_num) {
         const uint8_t *data = h->data;
-        static unsigned next_slot_num = 0;
         unsigned slot_num;
 
         /*
@@ -441,15 +444,14 @@ static void dmi_decode(const struct dmi_header *h) {
                         dmi_print_memory_size("MEMORY_ARRAY", "MAX_CAPACITY", -1, DWORD(data + 0x07), MEMORY_SIZE_UNIT_KB);
                 else if (h->length >= 0x17)
                         dmi_print_memory_size("MEMORY_ARRAY", "MAX_CAPACITY", -1, QWORD(data + 0x0F), MEMORY_SIZE_UNIT_BYTES);
-                printf("MEMORY_ARRAY_NUM_DEVICES=%u\n", WORD(data + 0x0D));
 
                 break;
 
         case 17: /* 7.18 Memory Device */
-                slot_num = next_slot_num;
-                next_slot_num++;
+                slot_num = *next_slot_num;
+                *next_slot_num = slot_num + 1;
 
-                log_debug("Memory Device");
+                log_debug("Memory Device: %u", slot_num);
                 if (h->length < 0x15)
                         break;
 
@@ -525,6 +527,7 @@ static void dmi_decode(const struct dmi_header *h) {
 
 static void dmi_table_decode(const uint8_t *buf, size_t len, uint16_t num) {
         const uint8_t *data = buf;
+        unsigned next_slot_num = 0;
 
         /* 4 is the length of an SMBIOS structure header */
         for (uint16_t i = 0; (i < num || num == 0) && data + 4 <= buf + len; i++) {
@@ -559,10 +562,12 @@ static void dmi_table_decode(const uint8_t *buf, size_t len, uint16_t num) {
                         break;
 
                 if (display)
-                        dmi_decode(&h);
+                        dmi_decode(&h, &next_slot_num);
 
                 data = next;
         }
+        if (next_slot_num > 0)
+                printf("MEMORY_ARRAY_NUM_DEVICES=%u\n", next_slot_num);
 }
 
 static int dmi_table(int64_t base, uint32_t len, uint16_t num, const char *devmem, bool no_file_offset) {
@@ -636,9 +641,10 @@ static int legacy_decode(const uint8_t *buf, const char *devmem, bool no_file_of
 }
 
 static int help(void) {
-        printf("Usage: %s [options]\n"
-               " -F,--from-dump FILE   read DMI information from a binary file\n"
-               " -h,--help             print this help text\n\n",
+        printf("%s [OPTIONS...]\n\n"
+               "  -F --from-dump FILE  Read DMI information from a binary file\n"
+               "  -h --help            Show this help text\n"
+               "     --version         Show package version\n",
                program_invocation_short_name);
         return 0;
 }
@@ -648,6 +654,7 @@ static int parse_argv(int argc, char * const *argv) {
                 { "from-dump", required_argument, NULL, 'F' },
                 { "version",   no_argument,       NULL, 'V' },
                 { "help",      no_argument,       NULL, 'h' },
+                { "version",   no_argument,       NULL, 'v' },
                 {}
         };
         int c;
@@ -658,12 +665,13 @@ static int parse_argv(int argc, char * const *argv) {
                         arg_source_file = optarg;
                         break;
                 case 'V':
-                        printf("%s\n", GIT_VERSION);
-                        return 0;
+                        return version();
                 case 'h':
                         return help();
                 case '?':
                         return -EINVAL;
+                case 'v':
+                        return version();
                 default:
                         assert_not_reached();
                 }
@@ -677,10 +685,8 @@ static int run(int argc, char* const* argv) {
         size_t size;
         int r;
 
-        log_set_target(LOG_TARGET_AUTO);
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)

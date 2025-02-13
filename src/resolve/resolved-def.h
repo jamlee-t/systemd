@@ -39,7 +39,7 @@
 /* Input: Don't answer request from locally registered public LLMNR/mDNS RRs */
 #define SD_RESOLVED_NO_ZONE         (UINT64_C(1) << 13)
 
-/* Input: Don't answer request from locally registered public LLMNR/mDNS RRs */
+/* Input: Don't answer request from locally configured trust anchors. */
 #define SD_RESOLVED_NO_TRUST_ANCHOR (UINT64_C(1) << 14)
 
 /* Input: Don't go to network for this request */
@@ -69,6 +69,13 @@
 
 /* Output: Result was (at least partially) answered from network */
 #define SD_RESOLVED_FROM_NETWORK    (UINT64_C(1) << 23)
+
+/* Input: Don't answer request with stale data */
+#define SD_RESOLVED_NO_STALE        (UINT64_C(1) << 24)
+
+/* Input: Allow single-label lookups to Internet DNS servers */
+#define SD_RESOLVED_RELAX_SINGLE_LABEL          \
+                                    (UINT64_C(1) << 25)
 
 #define SD_RESOLVED_LLMNR           (SD_RESOLVED_LLMNR_IPV4|SD_RESOLVED_LLMNR_IPV6)
 #define SD_RESOLVED_MDNS            (SD_RESOLVED_MDNS_IPV4|SD_RESOLVED_MDNS_IPV6)

@@ -14,7 +14,7 @@ UserDBFlags nss_glue_userdb_flags(void) {
         UserDBFlags flags = USERDB_EXCLUDE_NSS;
 
         /* Make sure that we don't go in circles when allocating a dynamic UID by checking our own database */
-        if (getenv_bool_secure("SYSTEMD_NSS_DYNAMIC_BYPASS") > 0)
+        if (secure_getenv_bool("SYSTEMD_NSS_DYNAMIC_BYPASS") > 0)
                 flags |= USERDB_EXCLUDE_DYNAMIC_USER;
 
         return flags;
@@ -81,7 +81,7 @@ enum nss_status userdb_getpwnam(
         if (_nss_systemd_is_blocked())
                 return NSS_STATUS_NOTFOUND;
 
-        r = userdb_by_name(name, nss_glue_userdb_flags()|USERDB_SUPPRESS_SHADOW, &hr);
+        r = userdb_by_name(name, /* match= */ NULL, nss_glue_userdb_flags()|USERDB_SUPPRESS_SHADOW, &hr);
         if (r == -ESRCH)
                 return NSS_STATUS_NOTFOUND;
         if (r < 0) {
@@ -114,7 +114,7 @@ enum nss_status userdb_getpwuid(
         if (_nss_systemd_is_blocked())
                 return NSS_STATUS_NOTFOUND;
 
-        r = userdb_by_uid(uid, nss_glue_userdb_flags()|USERDB_SUPPRESS_SHADOW, &hr);
+        r = userdb_by_uid(uid, /* match= */ NULL, nss_glue_userdb_flags()|USERDB_SUPPRESS_SHADOW, &hr);
         if (r == -ESRCH)
                 return NSS_STATUS_NOTFOUND;
         if (r < 0) {
@@ -190,7 +190,7 @@ enum nss_status userdb_getspnam(
         if (_nss_systemd_is_blocked())
                 return NSS_STATUS_NOTFOUND;
 
-        r = userdb_by_name(name, nss_glue_userdb_flags(), &hr);
+        r = userdb_by_name(name, /* match= */ NULL, nss_glue_userdb_flags(), &hr);
         if (r == -ESRCH)
                 return NSS_STATUS_NOTFOUND;
         if (r < 0) {
@@ -217,7 +217,7 @@ int nss_pack_group_record(
                 char *buffer,
                 size_t buflen) {
 
-        char **array = NULL, *p, **m;
+        char **array = NULL, *p;
         size_t required, n = 0, i = 0;
 
         assert(g);
@@ -290,7 +290,7 @@ enum nss_status userdb_getgrnam(
         if (_nss_systemd_is_blocked())
                 return NSS_STATUS_NOTFOUND;
 
-        r = groupdb_by_name(name, nss_glue_userdb_flags()|USERDB_SUPPRESS_SHADOW, &g);
+        r = groupdb_by_name(name, /* match= */ NULL, nss_glue_userdb_flags()|USERDB_SUPPRESS_SHADOW, &g);
         if (r < 0 && r != -ESRCH) {
                 *errnop = -r;
                 return NSS_STATUS_UNAVAIL;
@@ -346,7 +346,6 @@ enum nss_status userdb_getgrgid(
                 size_t buflen,
                 int *errnop) {
 
-
         _cleanup_(group_record_unrefp) GroupRecord *g = NULL;
         _cleanup_strv_free_ char **members = NULL;
         bool from_nss;
@@ -358,7 +357,7 @@ enum nss_status userdb_getgrgid(
         if (_nss_systemd_is_blocked())
                 return NSS_STATUS_NOTFOUND;
 
-        r = groupdb_by_gid(gid, nss_glue_userdb_flags()|USERDB_SUPPRESS_SHADOW, &g);
+        r = groupdb_by_gid(gid, /* match= */ NULL, nss_glue_userdb_flags()|USERDB_SUPPRESS_SHADOW, &g);
         if (r < 0 && r != -ESRCH) {
                 *errnop = -r;
                 return NSS_STATUS_UNAVAIL;
@@ -457,7 +456,7 @@ enum nss_status userdb_getsgnam(
         if (_nss_systemd_is_blocked())
                 return NSS_STATUS_NOTFOUND;
 
-        r = groupdb_by_name(name, nss_glue_userdb_flags(), &hr);
+        r = groupdb_by_name(name, /* match= */ NULL, nss_glue_userdb_flags(), &hr);
         if (r == -ESRCH)
                 return NSS_STATUS_NOTFOUND;
         if (r < 0) {

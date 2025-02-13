@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_message_dump"
@@ -44,9 +44,10 @@
     <title>Description</title>
 
     <para>The <function>sd_bus_message_dump()</function> function writes a textual representation of the
-    message <parameter>m</parameter> to the stream <parameter>f</parameter>. This function is intended to be
-    used for debugging purposes, and the output is neither stable nor designed to be machine readable.
-    </para>
+    message <parameter>m</parameter> to the stream <parameter>f</parameter>. If <parameter>f</parameter> is
+    <constant>NULL</constant>, standard output (<constant>stdio</constant>) will be used. This function is
+    intended to be used for debugging purposes, and the output is neither stable nor designed to be machine
+    readable.</para>
 
     <para>The <parameter>flags</parameter> parameter may be used to modify the output. With
     <constant>SD_BUS_MESSAGE_DUMP_WITH_HEADER</constant>, a header that specifies the message type and flags
@@ -82,7 +83,7 @@
                   STRING "AnExplicitProperty";
           };
   };
-    </programlisting>
+</programlisting>
     </para>
   </refsect1>
 
@@ -98,10 +99,10 @@
   <refsect1>
     <title>See Also</title>
 
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

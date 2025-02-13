@@ -3,6 +3,7 @@
 
 #include "sd-netlink.h"
 
+#include "dns-configuration.h"
 #include "log-link.h"
 #include "network-util.h"
 
@@ -14,6 +15,7 @@ struct Link {
 
         int ifindex;
         char *ifname;
+        char **altnames;
         unsigned flags;
 
         bool required_for_online;
@@ -23,6 +25,7 @@ struct Link {
         LinkAddressState ipv4_address_state;
         LinkAddressState ipv6_address_state;
         char *state;
+        DNSConfiguration *dns_configuration;
 };
 
 int link_new(Manager *m, Link **ret, int ifindex, const char *ifname);

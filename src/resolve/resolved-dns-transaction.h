@@ -61,6 +61,8 @@ struct DnsTransaction {
 
         DnsAnswer *answer;
         int answer_rcode;
+        int answer_ede_rcode;
+        char *answer_ede_msg;
         DnssecResult answer_dnssec_result;
         DnsTransactionSource answer_source;
         uint32_t answer_nsec_ttl;
@@ -97,11 +99,8 @@ struct DnsTransaction {
         /* The features of the DNS server at time of transaction start */
         DnsServerFeatureLevel current_feature_level;
 
-        /* If we got SERVFAIL back, we retry the lookup, using a lower feature level than we used
-         * before. Similar, if we get NXDOMAIN in pure EDNS0 mode, we check in EDNS0-less mode before giving
-         * up (as mitigation for DVE-2018-0001). */
+        /* If we got SERVFAIL back, we retry the lookup, using a lower feature level than we used before. */
         DnsServerFeatureLevel clamp_feature_level_servfail;
-        DnsServerFeatureLevel clamp_feature_level_nxdomain;
 
         uint16_t id;
 
@@ -111,6 +110,8 @@ struct DnsTransaction {
         bool initial_jitter_elapsed:1;
 
         bool probing:1;
+
+        bool seen_timeout:1;
 
         /* Query candidates this transaction is referenced by and that
          * shall be notified about this specific transaction
@@ -134,6 +135,11 @@ struct DnsTransaction {
         unsigned n_picked_servers;
 
         unsigned block_gc;
+
+        /* Set when we're willing to let this transaction live beyond it's usefulness for the original query,
+         * for caching purposes. This blocks gc while there is still a chance we might still receive an
+         * answer. */
+        bool wait_for_answer;
 
         LIST_FIELDS(DnsTransaction, transactions_by_scope);
         LIST_FIELDS(DnsTransaction, transactions_by_stream);
@@ -197,28 +203,3 @@ DnsTransactionState dns_transaction_state_from_string(const char *s) _pure_;
 
 const char* dns_transaction_source_to_string(DnsTransactionSource p) _const_;
 DnsTransactionSource dns_transaction_source_from_string(const char *s) _pure_;
-
-/* LLMNR Jitter interval, see RFC 4795 Section 7 */
-#define LLMNR_JITTER_INTERVAL_USEC (100 * USEC_PER_MSEC)
-
-/* mDNS Jitter interval, see RFC 6762 Section 5.2 */
-#define MDNS_JITTER_MIN_USEC   (20 * USEC_PER_MSEC)
-#define MDNS_JITTER_RANGE_USEC (100 * USEC_PER_MSEC)
-
-/* mDNS probing interval, see RFC 6762 Section 8.1 */
-#define MDNS_PROBING_INTERVAL_USEC (250 * USEC_PER_MSEC)
-
-/* Maximum attempts to send DNS requests, across all DNS servers */
-#define DNS_TRANSACTION_ATTEMPTS_MAX 24
-
-/* Maximum attempts to send LLMNR requests, see RFC 4795 Section 2.7 */
-#define LLMNR_TRANSACTION_ATTEMPTS_MAX 3
-
-/* Maximum attempts to send MDNS requests, see RFC 6762 Section 8.1 */
-#define MDNS_TRANSACTION_ATTEMPTS_MAX 3
-
-#define TRANSACTION_ATTEMPTS_MAX(p) (((p) == DNS_PROTOCOL_LLMNR) ? \
-                                         LLMNR_TRANSACTION_ATTEMPTS_MAX : \
-                                         (((p) == DNS_PROTOCOL_MDNS) ? \
-                                             MDNS_TRANSACTION_ATTEMPTS_MAX : \
-                                             DNS_TRANSACTION_ATTEMPTS_MAX))

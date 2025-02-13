@@ -72,7 +72,7 @@ int apply_numa_policy(const NUMAPolicy *policy) {
 
         assert(policy);
 
-        if (get_mempolicy(NULL, NULL, 0, 0, 0) < 0 && errno == ENOSYS)
+        if (get_mempolicy(NULL, NULL, 0, NULL, 0) < 0 && errno == ENOSYS)
                 return -EOPNOTSUPP;
 
         if (!numa_policy_is_valid(policy))
@@ -120,15 +120,13 @@ int numa_to_cpu_set(const NUMAPolicy *policy, CPUSet *ret) {
                         return r;
         }
 
-        *ret = s;
-        s = (CPUSet) {};
+        *ret = TAKE_STRUCT(s);
 
         return 0;
 }
 
 static int numa_max_node(void) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
         int r, max_node = 0;
 
         d = opendir("/sys/devices/system/node");

@@ -1,17 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
-#include "nspawn-bind-user.h"
+#include "json-util.h"
 #include "nspawn.h"
+#include "nspawn-bind-user.h"
 #include "path-util.h"
 #include "user-util.h"
 #include "userdb.h"
-
-#define MAP_UID_START 60514
-#define MAP_UID_END 60577
 
 static int check_etc_passwd_collisions(
                 const char *directory,
@@ -24,7 +22,7 @@ static int check_etc_passwd_collisions(
         assert(directory);
         assert(name || uid_is_valid(uid));
 
-        r = chase_symlinks_and_fopen_unlocked("/etc/passwd", directory, CHASE_PREFIX_ROOT, "re", NULL, &f);
+        r = chase_and_fopen_unlocked("/etc/passwd", directory, CHASE_PREFIX_ROOT, "re", NULL, &f);
         if (r == -ENOENT)
                 return 0; /* no user database? then no user, hence no collision */
         if (r < 0)
@@ -57,7 +55,7 @@ static int check_etc_group_collisions(
         assert(directory);
         assert(name || gid_is_valid(gid));
 
-        r = chase_symlinks_and_fopen_unlocked("/etc/group", directory, CHASE_PREFIX_ROOT, "re", NULL, &f);
+        r = chase_and_fopen_unlocked("/etc/group", directory, CHASE_PREFIX_ROOT, "re", NULL, &f);
         if (r == -ENOENT)
                 return 0; /* no group database? then no group, hence no collision */
         if (r < 0)
@@ -90,7 +88,7 @@ static int convert_user(
         _cleanup_(group_record_unrefp) GroupRecord *converted_group = NULL;
         _cleanup_(user_record_unrefp) UserRecord *converted_user = NULL;
         _cleanup_free_ char *h = NULL;
-        JsonVariant *p, *hp = NULL;
+        sd_json_variant *p, *hp = NULL, *ssh = NULL;
         int r;
 
         assert(u);
@@ -116,31 +114,34 @@ static int convert_user(
                 return log_oom();
 
         /* Acquire the source hashed password array as-is, so that it retains the JSON_VARIANT_SENSITIVE flag */
-        p = json_variant_by_key(u->json, "privileged");
-        if (p)
-                hp = json_variant_by_key(p, "hashedPassword");
+        p = sd_json_variant_by_key(u->json, "privileged");
+        if (p) {
+                hp = sd_json_variant_by_key(p, "hashedPassword");
+                ssh = sd_json_variant_by_key(p, "sshAuthorizedKeys");
+        }
 
         r = user_record_build(
                         &converted_user,
-                        JSON_BUILD_OBJECT(
-                                        JSON_BUILD_PAIR("userName", JSON_BUILD_STRING(u->user_name)),
-                                        JSON_BUILD_PAIR("uid", JSON_BUILD_UNSIGNED(allocate_uid)),
-                                        JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(allocate_uid)),
-                                        JSON_BUILD_PAIR_CONDITION(u->disposition >= 0, "disposition", JSON_BUILD_STRING(user_disposition_to_string(u->disposition))),
-                                        JSON_BUILD_PAIR("homeDirectory", JSON_BUILD_STRING(h)),
-                                        JSON_BUILD_PAIR("service", JSON_BUILD_STRING("io.systemd.NSpawn")),
-                                        JSON_BUILD_PAIR_CONDITION(!strv_isempty(u->hashed_password), "privileged", JSON_BUILD_OBJECT(
-                                                                                  JSON_BUILD_PAIR("hashedPassword", JSON_BUILD_VARIANT(hp))))));
+                        SD_JSON_BUILD_OBJECT(
+                                        SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(u->user_name)),
+                                        SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(allocate_uid)),
+                                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(allocate_uid)),
+                                        SD_JSON_BUILD_PAIR_CONDITION(u->disposition >= 0, "disposition", SD_JSON_BUILD_STRING(user_disposition_to_string(u->disposition))),
+                                        SD_JSON_BUILD_PAIR("homeDirectory", SD_JSON_BUILD_STRING(h)),
+                                        SD_JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.NSpawn")),
+                                        SD_JSON_BUILD_PAIR("privileged", SD_JSON_BUILD_OBJECT(
+                                                                           SD_JSON_BUILD_PAIR_CONDITION(!strv_isempty(u->hashed_password), "hashedPassword", SD_JSON_BUILD_VARIANT(hp)),
+                                                                           SD_JSON_BUILD_PAIR_CONDITION(!!ssh, "sshAuthorizedKeys", SD_JSON_BUILD_VARIANT(ssh))))));
         if (r < 0)
                 return log_error_errno(r, "Failed to build container user record: %m");
 
         r = group_record_build(
                         &converted_group,
-                        JSON_BUILD_OBJECT(
-                                        JSON_BUILD_PAIR("groupName", JSON_BUILD_STRING(g->group_name)),
-                                        JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(allocate_uid)),
-                                        JSON_BUILD_PAIR_CONDITION(g->disposition >= 0, "disposition", JSON_BUILD_STRING(user_disposition_to_string(g->disposition))),
-                                        JSON_BUILD_PAIR("service", JSON_BUILD_STRING("io.systemd.NSpawn"))));
+                        SD_JSON_BUILD_OBJECT(
+                                        SD_JSON_BUILD_PAIR("groupName", SD_JSON_BUILD_STRING(g->group_name)),
+                                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(allocate_uid)),
+                                        SD_JSON_BUILD_PAIR_CONDITION(g->disposition >= 0, "disposition", SD_JSON_BUILD_STRING(user_disposition_to_string(g->disposition))),
+                                        SD_JSON_BUILD_PAIR("service", JSON_BUILD_CONST_STRING("io.systemd.NSpawn"))));
         if (r < 0)
                 return log_error_errno(r, "Failed to build container group record: %m");
 
@@ -156,12 +157,12 @@ static int find_free_uid(const char *directory, uid_t max_uid, uid_t *current_ui
         assert(directory);
         assert(current_uid);
 
-        for (;; (*current_uid) ++) {
-                if (*current_uid > MAP_UID_END || *current_uid > max_uid)
+        for (;; (*current_uid)++) {
+                if (*current_uid > MAP_UID_MAX || *current_uid > max_uid)
                         return log_error_errno(
                                         SYNTHETIC_ERRNO(EBUSY),
                                         "No suitable available UID in range " UID_FMT "…" UID_FMT " in container detected, can't map user.",
-                                        MAP_UID_START, MAP_UID_END);
+                                        MAP_UID_MIN, MAP_UID_MAX);
 
                 r = check_etc_passwd_collisions(directory, NULL, *current_uid);
                 if (r < 0)
@@ -202,8 +203,7 @@ int bind_user_prepare(
                 BindUserContext **ret) {
 
         _cleanup_(bind_user_context_freep) BindUserContext *c = NULL;
-        uid_t current_uid = MAP_UID_START;
-        char **n;
+        uid_t current_uid = MAP_UID_MIN;
         int r;
 
         assert(custom_mounts);
@@ -230,9 +230,8 @@ int bind_user_prepare(
                 _cleanup_(user_record_unrefp) UserRecord *u = NULL, *cu = NULL;
                 _cleanup_(group_record_unrefp) GroupRecord *g = NULL, *cg = NULL;
                 _cleanup_free_ char *sm = NULL, *sd = NULL;
-                CustomMount *cm;
 
-                r = userdb_by_name(*n, USERDB_DONT_SYNTHESIZE, &u);
+                r = userdb_by_name(*n, /* match= */ NULL, USERDB_DONT_SYNTHESIZE_INTRINSIC|USERDB_DONT_SYNTHESIZE_FOREIGN, &u);
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve user '%s': %m", *n);
 
@@ -245,15 +244,15 @@ int bind_user_prepare(
                  * and the user/group databases fully synthesized at runtime. Moreover, the name of the
                  * user/group name of the "nobody" account differs between distros, hence a check by numeric
                  * UID is safer. */
-                if (u->uid == 0 || streq(u->user_name, "root"))
+                if (user_record_is_root(u))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Mapping 'root' user not supported, sorry.");
-                if (u->uid == UID_NOBODY || STR_IN_SET(u->user_name, NOBODY_USER_NAME, "nobody"))
+                if (user_record_is_nobody(u))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Mapping 'nobody' user not supported, sorry.");
 
                 if (u->uid >= uid_shift && u->uid < uid_shift + uid_range)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "UID of user '%s' to map is already in container UID range, refusing.", u->user_name);
 
-                r = groupdb_by_gid(u->gid, USERDB_DONT_SYNTHESIZE, &g);
+                r = groupdb_by_gid(u->gid, /* match= */ NULL, USERDB_DONT_SYNTHESIZE_INTRINSIC|USERDB_DONT_SYNTHESIZE_FOREIGN, &g);
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve group of user '%s': %m", u->user_name);
 
@@ -290,11 +289,8 @@ int bind_user_prepare(
                 if (!sd)
                         return log_oom();
 
-                cm = reallocarray(*custom_mounts, sizeof(CustomMount), *n_custom_mounts + 1);
-                if (!cm)
+                if (!GREEDY_REALLOC(*custom_mounts, *n_custom_mounts + 1))
                         return log_oom();
-
-                *custom_mounts = cm;
 
                 (*custom_mounts)[(*n_custom_mounts)++] = (CustomMount) {
                         .type = CUSTOM_MOUNT_BIND,
@@ -318,7 +314,7 @@ int bind_user_prepare(
 
 static int write_and_symlink(
                 const char *root,
-                JsonVariant *v,
+                sd_json_variant *v,
                 const char *name,
                 uid_t uid,
                 const char *suffix,
@@ -333,7 +329,7 @@ static int write_and_symlink(
         assert(uid_is_valid(uid));
         assert(suffix);
 
-        r = json_variant_format(v, JSON_FORMAT_NEWLINE, &j);
+        r = sd_json_variant_format(v, SD_JSON_FORMAT_NEWLINE, &j);
         if (r < 0)
                 return log_error_errno(r, "Failed to format user record JSON: %m");
 
@@ -392,13 +388,13 @@ int bind_user_setup(
         if (!c || c->n_data == 0)
                 return 0;
 
-        r = userns_mkdir(root, "/run/host", 0755, 0, 0);
+        r = make_run_host(root);
         if (r < 0)
-                return log_error_errno(r, "Failed to create /run/host: %m");
+                return r;
 
         r = userns_mkdir(root, "/run/host/home", 0755, 0, 0);
         if (r < 0)
-                return log_error_errno(r, "Failed to create /run/host/userdb: %m");
+                return log_error_errno(r, "Failed to create /run/host/home: %m");
 
         r = userns_mkdir(root, "/run/host/userdb", 0755, 0, 0);
         if (r < 0)
@@ -414,7 +410,7 @@ int bind_user_setup(
                 if (r < 0)
                         return log_error_errno(r, "Failed to extract privileged information from group record: %m");
 
-                if (!json_variant_is_blank_object(shadow_group->json)) {
+                if (!sd_json_variant_is_blank_object(shadow_group->json)) {
                         r = write_and_symlink(
                                         root,
                                         shadow_group->json,
@@ -446,7 +442,7 @@ int bind_user_setup(
                 if (r < 0)
                         return log_error_errno(r, "Failed to extract privileged information from user record: %m");
 
-                if (!json_variant_is_blank_object(shadow_user->json)) {
+                if (!sd_json_variant_is_blank_object(shadow_user->json)) {
                         r = write_and_symlink(
                                         root,
                                         shadow_user->json,

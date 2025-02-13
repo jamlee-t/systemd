@@ -4,6 +4,7 @@
 #include <linux/sockios.h>
 #include <sys/ioctl.h>
 
+#include "sd-json.h"
 #include "sd-lldp-rx.h"
 
 #include "alloc-util.h"
@@ -69,7 +70,7 @@ static int lldp_rx_make_space(sd_lldp_rx *lldp_rx, size_t extra) {
                         goto remove_one;
 
                 if (t == USEC_INFINITY)
-                        t = now(clock_boottime_or_monotonic());
+                        t = now(CLOCK_BOOTTIME);
 
                 if (n->until > t)
                         break;
@@ -192,13 +193,14 @@ static int lldp_rx_handle_datagram(sd_lldp_rx *lldp_rx, sd_lldp_neighbor *n) {
 static int lldp_rx_receive_datagram(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
         _cleanup_(sd_lldp_neighbor_unrefp) sd_lldp_neighbor *n = NULL;
         ssize_t space, length;
-        sd_lldp_rx *lldp_rx = userdata;
+        sd_lldp_rx *lldp_rx = ASSERT_PTR(userdata);
         struct timespec ts;
 
         assert(fd >= 0);
-        assert(lldp_rx);
 
         space = next_datagram_size_fd(fd);
+        if (ERRNO_IS_NEG_TRANSIENT(space) || ERRNO_IS_NEG_DISCONNECT(space))
+                return 0;
         if (space < 0) {
                 log_lldp_rx_errno(lldp_rx, space, "Failed to determine datagram size to read, ignoring: %m");
                 return 0;
@@ -212,7 +214,7 @@ static int lldp_rx_receive_datagram(sd_event_source *s, int fd, uint32_t revents
 
         length = recv(fd, LLDP_NEIGHBOR_RAW(n), n->raw_size, MSG_DONTWAIT);
         if (length < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
+                if (ERRNO_IS_TRANSIENT(errno) || ERRNO_IS_DISCONNECT(errno))
                         return 0;
 
                 log_lldp_rx_errno(lldp_rx, errno, "Failed to read LLDP datagram, ignoring: %m");
@@ -228,7 +230,7 @@ static int lldp_rx_receive_datagram(sd_event_source *s, int fd, uint32_t revents
         if (ioctl(fd, SIOCGSTAMPNS, &ts) >= 0)
                 triple_timestamp_from_realtime(&n->timestamp, timespec_load(&ts));
         else
-                triple_timestamp_get(&n->timestamp);
+                triple_timestamp_now(&n->timestamp);
 
         (void) lldp_rx_handle_datagram(lldp_rx, n);
         return 0;
@@ -403,7 +405,7 @@ int sd_lldp_rx_new(sd_lldp_rx **ret) {
 
         *lldp_rx = (sd_lldp_rx) {
                 .n_ref = 1,
-                .fd = -1,
+                .fd = -EBADF,
                 .neighbors_max = LLDP_DEFAULT_NEIGHBORS_MAX,
                 .capability_mask = UINT16_MAX,
         };
@@ -445,13 +447,13 @@ static int lldp_rx_start_timer(sd_lldp_rx *lldp_rx, sd_lldp_neighbor *neighbor) 
                 return event_source_disable(lldp_rx->timer_event_source);
 
         return event_reset_time(lldp_rx->event, &lldp_rx->timer_event_source,
-                                clock_boottime_or_monotonic(),
+                                CLOCK_BOOTTIME,
                                 n->until, 0,
                                 on_timer_event, lldp_rx,
                                 lldp_rx->event_priority, "lldp-rx-timer", true);
 }
 
-static inline int neighbor_compare_func(sd_lldp_neighbor * const *a, sd_lldp_neighbor * const *b) {
+static int neighbor_compare_func(sd_lldp_neighbor * const *a, sd_lldp_neighbor * const *b) {
         assert(a);
         assert(b);
         assert(*a);
@@ -487,6 +489,30 @@ int sd_lldp_rx_get_neighbors(sd_lldp_rx *lldp_rx, sd_lldp_neighbor ***ret) {
         *ret = TAKE_PTR(l);
 
         return k;
+}
+
+int lldp_rx_build_neighbors_json(sd_lldp_rx *lldp_rx, sd_json_variant **ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        int r;
+
+        assert(lldp_rx);
+        assert(ret);
+
+        sd_lldp_neighbor *n;
+        HASHMAP_FOREACH(n, lldp_rx->neighbor_by_id) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *w = NULL;
+
+                r = lldp_neighbor_build_json(n, &w);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&v, w);
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(v);
+        return 0;
 }
 
 int sd_lldp_rx_set_neighbors_max(sd_lldp_rx *lldp_rx, uint64_t m) {

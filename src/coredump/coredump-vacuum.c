@@ -13,6 +13,7 @@
 #include "hashmap.h"
 #include "macro.h"
 #include "memory-util.h"
+#include "stat-util.h"
 #include "string-util.h"
 #include "time-util.h"
 #include "user-util.h"
@@ -142,7 +143,6 @@ int coredump_vacuum(int exclude_fd, uint64_t keep_free, uint64_t max_use) {
         for (;;) {
                 _cleanup_(vacuum_candidate_hashmap_freep) Hashmap *h = NULL;
                 VacuumCandidate *worst = NULL;
-                struct dirent *de;
                 uint64_t sum = 0;
 
                 rewinddir(d);
@@ -168,9 +168,7 @@ int coredump_vacuum(int exclude_fd, uint64_t keep_free, uint64_t max_use) {
                         if (!S_ISREG(st.st_mode))
                                 continue;
 
-                        if (exclude_fd >= 0 &&
-                            exclude_st.st_dev == st.st_dev &&
-                            exclude_st.st_ino == st.st_ino)
+                        if (exclude_fd >= 0 && stat_inode_same(&exclude_st, &st))
                                 continue;
 
                         r = hashmap_ensure_allocated(&h, NULL);
@@ -181,19 +179,12 @@ int coredump_vacuum(int exclude_fd, uint64_t keep_free, uint64_t max_use) {
 
                         c = hashmap_get(h, UID_TO_PTR(uid));
                         if (c) {
-
                                 if (t < c->oldest_mtime) {
-                                        char *n;
-
-                                        n = strdup(de->d_name);
-                                        if (!n)
-                                                return log_oom();
-
-                                        free(c->oldest_file);
-                                        c->oldest_file = n;
+                                        r = free_and_strdup_warn(&c->oldest_file, de->d_name);
+                                        if (r < 0)
+                                                return r;
                                         c->oldest_mtime = t;
                                 }
-
                         } else {
                                 _cleanup_(vacuum_candidate_freep) VacuumCandidate *n = NULL;
 
@@ -201,10 +192,9 @@ int coredump_vacuum(int exclude_fd, uint64_t keep_free, uint64_t max_use) {
                                 if (!n)
                                         return log_oom();
 
-                                n->oldest_file = strdup(de->d_name);
-                                if (!n->oldest_file)
-                                        return log_oom();
-
+                                r = free_and_strdup_warn(&n->oldest_file, de->d_name);
+                                if (r < 0)
+                                        return r;
                                 n->oldest_mtime = t;
 
                                 r = hashmap_put(h, UID_TO_PTR(uid), n);

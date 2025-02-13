@@ -7,6 +7,7 @@
 #include <stdlib.h>
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "bus-error.h"
 #include "bus-util.h"
 #include "cgroup-show.h"
@@ -31,14 +32,14 @@
 
 static void show_pid_array(
                 pid_t pids[],
-                unsigned n_pids,
+                size_t n_pids,
                 const char *prefix,
                 size_t n_columns,
                 bool extra,
                 bool more,
                 OutputFlags flags) {
 
-        unsigned i, j, pid_width;
+        size_t i, j, pid_width;
 
         if (n_pids == 0)
                 return;
@@ -65,16 +66,16 @@ static void show_pid_array(
         for (i = 0; i < n_pids; i++) {
                 _cleanup_free_ char *t = NULL;
 
-                (void) get_process_cmdline(pids[i], n_columns,
-                                           PROCESS_CMDLINE_COMM_FALLBACK | PROCESS_CMDLINE_USE_LOCALE,
-                                           &t);
+                (void) pid_get_cmdline(pids[i], n_columns,
+                                       PROCESS_CMDLINE_COMM_FALLBACK | PROCESS_CMDLINE_USE_LOCALE,
+                                       &t);
 
                 if (extra)
                         printf("%s%s ", prefix, special_glyph(SPECIAL_GLYPH_TRIANGULAR_BULLET));
                 else
                         printf("%s%s", prefix, special_glyph(((more || i < n_pids-1) ? SPECIAL_GLYPH_TREE_BRANCH : SPECIAL_GLYPH_TREE_RIGHT)));
 
-                printf("%s%*"PID_PRI" %s%s\n", ansi_grey(), pid_width, pids[i], strna(t), ansi_normal());
+                printf("%s%*"PID_PRI" %s%s\n", ansi_grey(), (int) pid_width, pids[i], strna(t), ansi_normal());
         }
 }
 
@@ -89,7 +90,6 @@ static int show_cgroup_one_by_path(
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *p = NULL;
         size_t n = 0;
-        pid_t pid;
         char *fn;
         int r;
 
@@ -102,9 +102,20 @@ static int show_cgroup_one_by_path(
         if (!f)
                 return -errno;
 
-        while ((r = cg_read_pid(f, &pid)) > 0) {
+        for (;;) {
+                pid_t pid;
 
-                if (!(flags & OUTPUT_KERNEL_THREADS) && is_kernel_thread(pid) > 0)
+                /* libvirt / qemu uses threaded mode and cgroup.procs cannot be read at the lower levels.
+                 * From https://docs.kernel.org/admin-guide/cgroup-v2.html#threads,
+                 * “cgroup.procs” in a threaded domain cgroup contains the PIDs of all processes in
+                 * the subtree and is not readable in the subtree proper. */
+                r = cg_read_pid(f, &pid, /* flags = */ 0);
+                if (IN_SET(r, 0, -EOPNOTSUPP))
+                        break;
+                if (r < 0)
+                        return r;
+
+                if (!(flags & OUTPUT_KERNEL_THREADS) && pid_is_kernel_thread(pid) > 0)
                         continue;
 
                 if (!GREEDY_REALLOC(pids, n + 1))
@@ -112,9 +123,6 @@ static int show_cgroup_one_by_path(
 
                 pids[n++] = pid;
         }
-
-        if (r < 0)
-                return r;
 
         show_pid_array(pids, n, prefix, n_columns, false, more, flags);
 
@@ -129,43 +137,23 @@ static int show_cgroup_name(
 
         uint64_t cgroupid = UINT64_MAX;
         _cleanup_free_ char *b = NULL;
-        _cleanup_close_ int fd = -1;
-        bool delegate = false;
+        _cleanup_close_ int fd = -EBADF;
+        bool delegate;
         int r;
 
-        if (FLAGS_SET(flags, OUTPUT_CGROUP_XATTRS) || FLAGS_SET(flags, OUTPUT_CGROUP_ID)) {
-                fd = open(path, O_PATH|O_CLOEXEC|O_NOFOLLOW|O_DIRECTORY, 0);
-                if (fd < 0)
-                        log_debug_errno(errno, "Failed to open cgroup '%s', ignoring: %m", path);
-        }
+        fd = open(path, O_PATH|O_CLOEXEC|O_NOFOLLOW|O_DIRECTORY, 0);
+        if (fd < 0)
+                return log_debug_errno(errno, "Failed to open cgroup '%s', ignoring: %m", path);
 
-        r = getxattr_malloc(fd < 0 ? path : FORMAT_PROC_FD_PATH(fd), "trusted.delegate", &b);
-        if (r < 0) {
-                if (r != -ENODATA)
-                        log_debug_errno(r, "Failed to read trusted.delegate extended attribute, ignoring: %m");
-        } else {
-                r = parse_boolean(b);
-                if (r < 0)
-                        log_debug_errno(r, "Failed to parse trusted.delegate extended attribute boolean value, ignoring: %m");
-                else
-                        delegate = r > 0;
-
-                b = mfree(b);
-        }
+        r = cg_is_delegated_fd(fd);
+        if (r < 0)
+                log_debug_errno(r, "Failed to check if cgroup is delegated, ignoring: %m");
+        delegate = r > 0;
 
         if (FLAGS_SET(flags, OUTPUT_CGROUP_ID)) {
-                cg_file_handle fh = CG_FILE_HANDLE_INIT;
-                int mnt_id = -1;
-
-                if (name_to_handle_at(
-                                    fd < 0 ? AT_FDCWD : fd,
-                                    fd < 0 ? path : "",
-                                    &fh.file_handle,
-                                    &mnt_id,
-                                    fd < 0 ? 0 : AT_EMPTY_PATH) < 0)
-                        log_debug_errno(errno, "Failed to determine cgroup ID of %s, ignoring: %m", path);
-                else
-                        cgroupid = CG_FILE_HANDLE_CGROUPID(fh);
+                r = cg_fd_get_cgroupid(fd, &cgroupid);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to determine cgroup ID of %s, ignoring: %m", path);
         }
 
         r = path_extract_filename(path, &b);
@@ -189,9 +177,8 @@ static int show_cgroup_name(
 
         printf("\n");
 
-        if (FLAGS_SET(flags, OUTPUT_CGROUP_XATTRS) && fd >= 0) {
+        if (FLAGS_SET(flags, OUTPUT_CGROUP_XATTRS)) {
                 _cleanup_free_ char *nl = NULL;
-                char *xa;
 
                 r = flistxattr_malloc(fd, &nl);
                 if (r < 0)
@@ -221,7 +208,7 @@ static int show_cgroup_name(
                         printf("%s%s%s %s%s%s: %s\n",
                                prefix,
                                glyph == SPECIAL_GLYPH_TREE_BRANCH ? special_glyph(SPECIAL_GLYPH_TREE_VERTICAL) : "  ",
-                               special_glyph(SPECIAL_GLYPH_ARROW),
+                               special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
                                ansi_blue(), x, ansi_normal(),
                                y);
                 }
@@ -269,7 +256,7 @@ int show_cgroup_by_path(
                         continue;
 
                 if (!shown_pids) {
-                        show_cgroup_one_by_path(path, prefix, n_columns, true, flags);
+                        (void) show_cgroup_one_by_path(path, prefix, n_columns, true, flags);
                         shown_pids = true;
                 }
 
@@ -295,7 +282,7 @@ int show_cgroup_by_path(
                 return r;
 
         if (!shown_pids)
-                show_cgroup_one_by_path(path, prefix, n_columns, !!last, flags);
+                (void) show_cgroup_one_by_path(path, prefix, n_columns, !!last, flags);
 
         if (last) {
                 r = show_cgroup_name(last, prefix, SPECIAL_GLYPH_TREE_RIGHT, flags);
@@ -337,11 +324,11 @@ static int show_extra_pids(
                 const char *prefix,
                 size_t n_columns,
                 const pid_t pids[],
-                unsigned n_pids,
+                size_t n_pids,
                 OutputFlags flags) {
 
         _cleanup_free_ pid_t *copy = NULL;
-        unsigned i, j;
+        size_t i, j;
         int r;
 
         assert(path);
@@ -382,7 +369,7 @@ int show_cgroup_and_extra(
                 const char *prefix,
                 size_t n_columns,
                 const pid_t extra_pids[],
-                unsigned n_extra_pids,
+                size_t n_extra_pids,
                 OutputFlags flags) {
 
         int r;
@@ -445,9 +432,9 @@ int show_cgroup_get_path_and_warn(
                 if (r < 0)
                         return log_error_errno(r, "Failed to load machine data: %m");
 
-                r = bus_connect_transport_systemd(BUS_TRANSPORT_LOCAL, NULL, false, &bus);
+                r = bus_connect_transport_systemd(BUS_TRANSPORT_LOCAL, NULL, RUNTIME_SCOPE_SYSTEM, &bus);
                 if (r < 0)
-                        return bus_log_connect_error(r, BUS_TRANSPORT_LOCAL);
+                        return bus_log_connect_error(r, BUS_TRANSPORT_LOCAL, RUNTIME_SCOPE_SYSTEM);
 
                 r = show_cgroup_get_unit_path_and_warn(bus, unit, &root);
                 if (r < 0)

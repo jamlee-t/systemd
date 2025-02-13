@@ -14,11 +14,10 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
 #include "socket-util.h"
 #include "strxcpyx.h"
 #include "udev-ctrl.h"
-#include "util.h"
 
 /* wire protocol magic must match */
 #define UDEV_CTRL_MAGIC                                0xdead1dea
@@ -38,7 +37,6 @@ struct UdevCtrl {
         socklen_t addrlen;
         bool bound;
         bool connected;
-        bool maybe_disconnected;
         sd_event *event;
         sd_event_source *event_source;
         sd_event_source *event_source_connect;
@@ -47,13 +45,13 @@ struct UdevCtrl {
 };
 
 int udev_ctrl_new_from_fd(UdevCtrl **ret, int fd) {
-        _cleanup_close_ int sock = -1;
+        _cleanup_close_ int sock = -EBADF;
         UdevCtrl *uctrl;
 
         assert(ret);
 
         if (fd < 0) {
-                sock = socket(AF_LOCAL, SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
+                sock = socket(AF_UNIX, SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
                 if (sock < 0)
                         return log_error_errno(errno, "Failed to create socket: %m");
         }
@@ -65,7 +63,7 @@ int udev_ctrl_new_from_fd(UdevCtrl **ret, int fd) {
         *uctrl = (UdevCtrl) {
                 .n_ref = 1,
                 .sock = fd >= 0 ? fd : TAKE_FD(sock),
-                .sock_connect = -1,
+                .sock_connect = -EBADF,
                 .bound = fd >= 0,
         };
 
@@ -162,7 +160,6 @@ static int udev_ctrl_connection_event_handler(sd_event_source *s, int fd, uint32
                 .msg_control = &control,
                 .msg_controllen = sizeof(control),
         };
-        struct cmsghdr *cmsg;
         struct ucred *cred;
         ssize_t size;
 
@@ -172,36 +169,40 @@ static int udev_ctrl_connection_event_handler(sd_event_source *s, int fd, uint32
          * To avoid the object freed, let's increment the refcount. */
         uctrl = udev_ctrl_ref(userdata);
 
-        size = next_datagram_size_fd(fd);
-        if (size < 0)
-                return log_error_errno(size, "Failed to get size of message: %m");
-        if (size == 0)
-                return 0; /* Client disconnects? */
-
         size = recvmsg_safe(fd, &smsg, 0);
-        if (size == -EINTR)
+        if (ERRNO_IS_NEG_TRANSIENT(size))
                 return 0;
+        if (size == -ECHRNG) {
+                log_warning_errno(size, "Got message with truncated control data (unexpected fds sent?), ignoring.");
+                return 0;
+        }
+        if (size == -EXFULL) {
+                log_warning_errno(size, "Got message with truncated payload data, ignoring.");
+                return 0;
+        }
         if (size < 0)
                 return log_error_errno(size, "Failed to receive ctrl message: %m");
 
         cmsg_close_all(&smsg);
 
-        cmsg = CMSG_FIRSTHDR(&smsg);
-
-        if (!cmsg || cmsg->cmsg_type != SCM_CREDENTIALS) {
-                log_error("No sender credentials received, ignoring message");
+        if (size != sizeof(msg_wire)) {
+                log_warning("Received message with invalid length, ignoring");
                 return 0;
         }
 
-        cred = (struct ucred *) CMSG_DATA(cmsg);
+        cred = CMSG_FIND_DATA(&smsg, SOL_SOCKET, SCM_CREDENTIALS, struct ucred);
+        if (!cred) {
+                log_warning("No sender credentials received, ignoring message");
+                return 0;
+        }
 
         if (cred->uid != 0) {
-                log_error("Invalid sender uid "UID_FMT", ignoring message", cred->uid);
+                log_warning("Invalid sender uid "UID_FMT", ignoring message", cred->uid);
                 return 0;
         }
 
         if (msg_wire.magic != UDEV_CTRL_MAGIC) {
-                log_error("Message magic 0x%08x doesn't match, ignoring message", msg_wire.magic);
+                log_warning("Message magic 0x%08x doesn't match, ignoring message", msg_wire.magic);
                 return 0;
         }
 
@@ -217,12 +218,10 @@ static int udev_ctrl_connection_event_handler(sd_event_source *s, int fd, uint32
 }
 
 static int udev_ctrl_event_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
-        UdevCtrl *uctrl = userdata;
-        _cleanup_close_ int sock = -1;
+        UdevCtrl *uctrl = ASSERT_PTR(userdata);
+        _cleanup_close_ int sock = -EBADF;
         struct ucred ucred;
         int r;
-
-        assert(uctrl);
 
         sock = accept4(fd, NULL, NULL, SOCK_CLOEXEC|SOCK_NONBLOCK);
         if (sock < 0) {
@@ -291,20 +290,18 @@ int udev_ctrl_start(UdevCtrl *uctrl, udev_ctrl_handler_t callback, void *userdat
         return 0;
 }
 
-int udev_ctrl_send(UdevCtrl *uctrl, UdevCtrlMessageType type, int intval, const char *buf) {
+int udev_ctrl_send(UdevCtrl *uctrl, UdevCtrlMessageType type, const void *data) {
         UdevCtrlMessageWire ctrl_msg_wire = {
                 .version = "udev-" STRINGIFY(PROJECT_VERSION),
                 .magic = UDEV_CTRL_MAGIC,
                 .type = type,
         };
 
-        if (uctrl->maybe_disconnected)
-                return -ENOANO; /* to distinguish this from other errors. */
-
-        if (buf)
-                strscpy(ctrl_msg_wire.value.buf, sizeof(ctrl_msg_wire.value.buf), buf);
-        else
-                ctrl_msg_wire.value.intval = intval;
+        if (type == UDEV_CTRL_SET_ENV) {
+                assert(data);
+                strscpy(ctrl_msg_wire.value.buf, sizeof(ctrl_msg_wire.value.buf), data);
+        } else if (IN_SET(type, UDEV_CTRL_SET_LOG_LEVEL, UDEV_CTRL_SET_CHILDREN_MAX))
+                ctrl_msg_wire.value.intval = PTR_TO_INT(data);
 
         if (!uctrl->connected) {
                 if (connect(uctrl->sock, &uctrl->saddr.sa, uctrl->addrlen) < 0)
@@ -315,14 +312,11 @@ int udev_ctrl_send(UdevCtrl *uctrl, UdevCtrlMessageType type, int intval, const 
         if (send(uctrl->sock, &ctrl_msg_wire, sizeof(ctrl_msg_wire), 0) < 0)
                 return -errno;
 
-        if (type == UDEV_CTRL_EXIT)
-                uctrl->maybe_disconnected = true;
-
         return 0;
 }
 
 int udev_ctrl_wait(UdevCtrl *uctrl, usec_t timeout) {
-        _cleanup_(sd_event_source_unrefp) sd_event_source *source_io = NULL, *source_timeout = NULL;
+        _cleanup_(sd_event_source_disable_unrefp) sd_event_source *source_io = NULL, *source_timeout = NULL;
         int r;
 
         assert(uctrl);
@@ -332,11 +326,9 @@ int udev_ctrl_wait(UdevCtrl *uctrl, usec_t timeout) {
         if (!uctrl->connected)
                 return 0;
 
-        if (!uctrl->maybe_disconnected) {
-                r = udev_ctrl_send(uctrl, _UDEV_CTRL_END_MESSAGES, 0, NULL);
-                if (r < 0)
-                        return r;
-        }
+        r = udev_ctrl_send(uctrl, _UDEV_CTRL_END_MESSAGES, NULL);
+        if (r < 0)
+                return r;
 
         if (timeout == 0)
                 return 0;
@@ -355,7 +347,7 @@ int udev_ctrl_wait(UdevCtrl *uctrl, usec_t timeout) {
 
         if (timeout != USEC_INFINITY) {
                 r = sd_event_add_time_relative(
-                                uctrl->event, &source_timeout, clock_boottime_or_monotonic(),
+                                uctrl->event, &source_timeout, CLOCK_BOOTTIME,
                                 timeout,
                                 0, NULL, INT_TO_PTR(-ETIMEDOUT));
                 if (r < 0)

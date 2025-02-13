@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
 #include "dns-domain.h"
 #include "resolved-dns-search-domain.h"
@@ -52,7 +54,7 @@ int dns_search_domain_new(
                 l->n_search_domains++;
                 break;
 
-        case DNS_SERVER_SYSTEM:
+        case DNS_SEARCH_DOMAIN_SYSTEM:
                 LIST_APPEND(domains, m->search_domains, d);
                 m->n_search_domains++;
                 break;
@@ -123,13 +125,13 @@ void dns_search_domain_move_back_and_unmark(DnsSearchDomain *d) {
 
         case DNS_SEARCH_DOMAIN_LINK:
                 assert(d->link);
-                LIST_FIND_TAIL(domains, d, tail);
+                tail = LIST_FIND_TAIL(domains, d);
                 LIST_REMOVE(domains, d->link->search_domains, d);
                 LIST_INSERT_AFTER(domains, d->link->search_domains, tail, d);
                 break;
 
         case DNS_SEARCH_DOMAIN_SYSTEM:
-                LIST_FIND_TAIL(domains, d, tail);
+                tail = LIST_FIND_TAIL(domains, d);
                 LIST_REMOVE(domains, d->manager->search_domains, d);
                 LIST_INSERT_AFTER(domains, d->manager->search_domains, tail, d);
                 break;
@@ -166,7 +168,7 @@ bool dns_search_domain_unlink_marked(DnsSearchDomain *first) {
         } else
                 changed = false;
 
-        return changed || dns_search_domain_unlink_marked(next);
+        return dns_search_domain_unlink_marked(next) || changed;
 }
 
 void dns_search_domain_mark_all(DnsSearchDomain *first) {
@@ -178,7 +180,6 @@ void dns_search_domain_mark_all(DnsSearchDomain *first) {
 }
 
 int dns_search_domain_find(DnsSearchDomain *first, const char *name, DnsSearchDomain **ret) {
-        DnsSearchDomain *d;
         int r;
 
         assert(name);
@@ -197,4 +198,22 @@ int dns_search_domain_find(DnsSearchDomain *first, const char *name, DnsSearchDo
 
         *ret = NULL;
         return 0;
+}
+
+int dns_search_domain_dump_to_json(DnsSearchDomain *domain, sd_json_variant **ret) {
+        int ifindex = 0;
+
+        assert(domain);
+        assert(ret);
+
+        if (domain->type == DNS_SEARCH_DOMAIN_LINK) {
+                assert(domain->link);
+                ifindex = domain->link->ifindex;
+        }
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("name", domain->name),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("routeOnly", domain->route_only),
+                        SD_JSON_BUILD_PAIR_CONDITION(ifindex > 0, "ifindex", SD_JSON_BUILD_UNSIGNED(ifindex)));
 }

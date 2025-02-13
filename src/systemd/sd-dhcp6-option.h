@@ -14,11 +14,13 @@
   Lesser General Public License for more details.
 
   You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  along with systemd; If not, see <https://www.gnu.org/licenses/>.
 ***/
 
 #include <inttypes.h>
 #include <sys/types.h>
+
+#include "sd-dhcp6-protocol.h"
 
 #include "_sd-common.h"
 

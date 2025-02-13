@@ -7,8 +7,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 # The Container Interface
 
-Also consult [Writing Virtual Machine or Container
-Managers](http://www.freedesktop.org/wiki/Software/systemd/writing-vm-managers).
+Also consult [Writing Virtual Machine or Container Managers](/WRITING_VM_AND_CONTAINER_MANAGERS).
 
 systemd has a number of interfaces for interacting with container managers,
 when systemd is used inside of an OS container. If you work on a container
@@ -37,15 +36,18 @@ manager, please consider supporting the following interfaces.
    in this context.)
 
 3. Pre-mount `/dev/` as (container private) `tmpfs` for the container and bind
-   mount some suitable TTY to `/dev/console`. Also, make sure to create device
-   nodes for `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`,
-   `/dev/urandom`, `/dev/tty`, `/dev/ptmx` in `/dev/`. It is not necessary to
-   create `/dev/fd` or `/dev/stdout`, as systemd will do that on its own. Make
-   sure to set up a `BPF_PROG_TYPE_CGROUP_DEVICE` BPF program — on cgroupv2 —
-   or the `devices` cgroup controller — on cgroupv1 — so that no other devices
-   but these may be created in the container. Note that many systemd services
-   use `PrivateDevices=`, which means that systemd will set up a private
-   `/dev/` for them for which it needs to be able to create these device nodes.
+   mount some suitable TTY to `/dev/console`. If this is a pty, make sure to
+   not close the controlling pty during systemd's lifetime. PID 1 will close
+   ttys, to avoid being killed by SAK. It only opens ttys for the time it
+   actually needs to print something. Also, make sure to create device nodes
+   for `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`,
+   `/dev/tty`, `/dev/ptmx` in `/dev/`. It is not necessary to create `/dev/fd`
+   or `/dev/stdout`, as systemd will do that on its own. Make sure to set up a
+   `BPF_PROG_TYPE_CGROUP_DEVICE` BPF program — on cgroupv2 — or the `devices`
+   cgroup controller — on cgroupv1 — so that no other devices but these may be
+   created in the container. Note that many systemd services use
+   `PrivateDevices=`, which means that systemd will set up a private `/dev/`
+   for them for which it needs to be able to create these device nodes.
    Dropping `CAP_MKNOD` for containers is hence generally not advisable, but
    see below.
 
@@ -118,7 +120,7 @@ manager, please consider supporting the following interfaces.
    variable's name you may only specify ptys, and not other types of ttys. Also
    you need to specify the pty itself, a symlink will not suffice. This is
    implemented in
-   [systemd-getty-generator(8)](https://www.freedesktop.org/software/systemd/man/systemd-getty-generator.html).
+   [systemd-getty-generator(8)](https://www.freedesktop.org/software/systemd/man/latest/systemd-getty-generator.html).
    Note that this variable should not include the pty that `/dev/console` maps
    to if it maps to one (see below). Example: if the container receives
    `container_ttys=pts/7 pts/8 pts/14` it will spawn three additional login
@@ -128,22 +130,23 @@ manager, please consider supporting the following interfaces.
    running the container manager, if this is considered desirable, please parse
    the host's `/etc/os-release` and set a `$container_host_<key>=<VALUE>`
    environment variable for the ID fields described by the [os-release
-   interface](https://www.freedesktop.org/software/systemd/man/os-release.html), eg:
+   interface](https://www.freedesktop.org/software/systemd/man/latest/os-release.html), eg:
    `$container_host_id=debian`
    `$container_host_build_id=2020-06-15`
    `$container_host_variant_id=server`
    `$container_host_version_id=10`
 
 5. systemd supports passing immutable binary data blobs with limited size and
-   restricted access to services via the `LoadCredential=` and `SetCredential=`
-   settings. The same protocol may be used to pass credentials from the
-   container manager to systemd itself. The credential data should be placed in
-   some location (ideally a read-only and non-swappable file system, like
-   'ramfs'), and the absolute path to this directory exported in the
+   restricted access to services via the `ImportCredential=`, `LoadCredential=`
+   and `SetCredential=` settings. The same protocol may be used to pass credentials
+   from the container manager to systemd itself. The credential data should be
+   placed in some location (ideally a read-only and non-swappable file system,
+   like 'ramfs'), and the absolute path to this directory exported in the
    `$CREDENTIALS_DIRECTORY` environment variable. If the container managers
    does this, the credentials passed to the service manager can be propagated
-   to services via `LoadCredential=` (see ...). The container manager can
-   choose any path, but `/run/host/credentials` is recommended.
+   to services via `LoadCredential=` or `ImportCredential=` (see ...). The
+   container manager can choose any path, but `/run/host/credentials` is
+   recommended.
 
 ## Advanced Integration
 
@@ -161,13 +164,18 @@ manager, please consider supporting the following interfaces.
    issuing `journalctl -m`. The container machine ID can be determined from
    `/etc/machine-id` in the container.
 
-3. If the container manager wants to cleanly shutdown the container, it might
+3. If the container manager wants to cleanly shut down the container, it might
    be a good idea to send `SIGRTMIN+3` to its init process. systemd will then
    do a clean shutdown. Note however, that since only systemd understands
-   `SIGRTMIN+3` like this, this might confuse other init systems.
+   `SIGRTMIN+3` like this, this might confuse other init systems. A container
+   manager may implement the `$NOTIFY_SOCKET` protocol mentioned below in which
+   case it will receive a notification message `X_SYSTEMD_SIGNALS_LEVEL=2` that
+   indicates if and when these additional signal handlers are installed. If
+   these signals are sent to the container's PID 1 before this notification
+   message is sent they might not be handled correctly yet.
 
 4. To support [Socket Activated
-   Containers](http://0pointer.de/blog/projects/socket-activated-containers.html)
+   Containers](https://0pointer.de/blog/projects/socket-activated-containers.html)
    the container manager should be capable of being run as a systemd
    service. It will then receive the sockets starting with FD 3, the number of
    passed FDs in `$LISTEN_FDS` and its PID as `$LISTEN_PID`. It should take
@@ -178,20 +186,22 @@ manager, please consider supporting the following interfaces.
    activation work. The protocol to hand sockets from systemd to services is
    hence the same as from the container manager to the container systemd. For
    further details see the explanations of
-   [sd_listen_fds(1)](http://0pointer.de/public/systemd-man/sd_listen_fds.html)
+   [sd_listen_fds(1)](https://0pointer.de/public/systemd-man/sd_listen_fds.html)
    and the [blog story for service
-   developers](http://0pointer.de/blog/projects/socket-activation.html).
+   developers](https://0pointer.de/blog/projects/socket-activation.html).
 
 5. Container managers should stay away from the cgroup hierarchy outside of the
    unit they created for their container. That's private property of systemd,
    and no other code should modify it.
 
-6. systemd running inside the container can report when boot-up is complete
-   using the usual `sd_notify()` protocol that is also used when a service
-   wants to tell the service manager about readiness. A container manager can
-   set the `$NOTIFY_SOCKET` environment variable to a suitable socket path to
-   make use of this functionality. (Also see information about
-   `/run/host/notify` below.)
+6. systemd running inside the container can report when boot-up is complete,
+   boot progress and functionality as well as various other bits of system
+   information using the `sd_notify()` protocol that is also used when a
+   service wants to tell the service manager about readiness. A container
+   manager can set the `$NOTIFY_SOCKET` environment variable to a suitable
+   socket path to make use of this functionality. (Also see information about
+   `/run/host/notify` below, as well as the Readiness Protocol section on
+   [systemd(1)](https://www.freedesktop.org/software/systemd/man/latest/systemd.html)
 
 ## Networking
 
@@ -207,7 +217,7 @@ manager, please consider supporting the following interfaces.
    container name the external side `ve-` + the container name.
 
 3. It is recommended to configure stable MAC addresses for container `veth`
-   devices, for example hashed out of the container names. That way it is more
+   devices, for example, hashed out of the container names. That way it is more
    likely that DHCP and IPv4LL will acquire stable addresses.
 
 ## The `/run/host/` Hierarchy
@@ -227,7 +237,9 @@ care should be taken to avoid naming conflicts. `systemd` (and in particular
    directory: it's used by code outside the container to insert mounts inside
    it only, and is mostly an internal vehicle to achieve this. Other container
    managers that want to implement similar functionality might consider using
-   the same directory.
+   the same directory. Alternatively, the new mount API may be used by the
+   container manager to establish new mounts in the container without the need
+   for the `/run/host/incoming/` directory.
 
 2. The `/run/host/inaccessible/` directory may be set up by the container
    manager to include six file nodes: `reg`, `dir`, `fifo`, `sock`, `chr`,
@@ -260,7 +272,7 @@ care should be taken to avoid naming conflicts. `systemd` (and in particular
    short string identifying the container manager implementation. This file
    should be newline terminated. Passing this information via this file has the
    benefit that payload code can easily access it, even when running
-   unprivileged without access to the container PID1's environment block.
+   unprivileged without access to the container PID 1's environment block.
 
 6. The `/run/host/container-uuid` file may be used to pass the same information
    as the `$container_uuid` environment variable (see above). This file should
@@ -269,12 +281,36 @@ care should be taken to avoid naming conflicts. `systemd` (and in particular
 7. The `/run/host/credentials/` directory is a good place to pass credentials
    into the container, using the `$CREDENTIALS_DIRECTORY` protocol, see above.
 
+8. The `/run/host/unix-export/` directory shall be writable from the container
+   payload, and is where container payload can bind `AF_UNIX` sockets in that
+   shall be *exported* to the host, so that the host can connect to them. The
+   container manager should bind mount this directory on the host side
+   (read-only ideally), so that the host can connect to contained sockets. This
+   is most prominently used by `systemd-ssh-generator` when run in such a
+   container to automatically bind an SSH socket into that directory, which
+   then can be used to connect to the container.
+
+9. The `/run/host/unix-export/ssh` `AF_UNIX` socket will be automatically bound
+   by `systemd-ssh-generator` in the container if possible, and can be used to
+   connect to the container.
+
+10. The `/run/host/userdb/` directory may be used to drop-in additional JSON
+    user records that `nss-systemd` inside the container shall include in the
+    system's user database. This is useful to make host users and their home
+    directories automatically accessible to containers in transitive
+    fashion. See `nss-systemd(8)` for details.
+
+11. The `/run/host/home/` directory may be used to bind mount host home
+    directories of users that shall be made available in the container to. This
+    may be used in combination with `/run/host/userdb/` above: one defines the
+    user record, the other contains the user's home directory.
+
 ## What You Shouldn't Do
 
 1. Do not drop `CAP_MKNOD` from the container. `PrivateDevices=` is a commonly
    used service setting that provides a service with its own, private, minimal
    version of `/dev/`. To set this up systemd in the container needs this
-   capability. If you take away the capability than all services that set this
+   capability. If you take away the capability, then all services that set this
    flag will cease to work. Use `BPF_PROG_TYPE_CGROUP_DEVICE` BPF programs — on
    cgroupv2 — or the `devices` controller — on cgroupv1 — to restrict what
    device nodes the container can create instead of taking away the capability
@@ -295,9 +331,9 @@ care should be taken to avoid naming conflicts. `systemd` (and in particular
    you cannot link them to each other.
 
 4. Do not pretend that the real VTs are available in the container. The VT
-   subsystem consists of all the devices `/dev/tty*`, `/dev/vcs*`, `/dev/vcsa*`
-   plus their `sysfs` counterparts. They speak specific `ioctl()`s and
-   understand specific escape sequences, that other ptys don't understand.
+   subsystem consists of all the devices `/dev/tty[0-9]*`, `/dev/vcs*`,
+   `/dev/vcsa*` plus their `sysfs` counterparts. They speak specific `ioctl()`s
+   and understand specific escape sequences, that other ptys don't understand.
    Hence, it is explicitly not OK to mount a pty to `/dev/tty1`, `/dev/tty2`,
    `/dev/tty3`. This is explicitly not supported.
 
@@ -386,7 +422,7 @@ everybody. However, that's a systemd-specific interface and other init systems
 are unlikely to do the same.
 
 Note that it is our intention to make systemd systems work flawlessly and
-out-of-the-box in containers. In fact we are interested to ensure that the same
+out-of-the-box in containers. In fact, we are interested to ensure that the same
 OS image can be booted on a bare system, in a VM and in a container, and behave
 correctly each time. If you notice that some component in systemd does not work
 in a container as it should, even though the container manager implements

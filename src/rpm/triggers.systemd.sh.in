@@ -43,23 +43,17 @@
 # This script will process files installed in {{SYSUSERS_DIR}} to create
 # specified users automatically. The priority is set such that it
 # will run before the tmpfiles file trigger.
-if test -d "/run/systemd/system"; then
-  systemd-sysusers || :
-fi
+systemd-sysusers || :
 
 %transfiletriggerin -P 1000700 udev -- {{UDEV_HWDB_DIR}}
 # This script will automatically invoke hwdb update if files have been
 # installed or updated in {{UDEV_HWDB_DIR}}.
-if test -d "/run/systemd/system"; then
-  systemd-hwdb update || :
-fi
+systemd-hwdb update || :
 
 %transfiletriggerin -P 1000700 -- {{SYSTEMD_CATALOG_DIR}}
 # This script will automatically invoke journal catalog update if files
 # have been installed or updated in {{SYSTEMD_CATALOG_DIR}}.
-if test -d "/run/systemd/system"; then
-  journalctl --update-catalog || :
-fi
+journalctl --update-catalog || :
 
 %transfiletriggerin -P 1000700 -- {{BINFMT_DIR}}
 # This script will automatically apply binfmt rules if files have been
@@ -67,7 +61,7 @@ fi
 if test -d "/run/systemd/system"; then
   # systemd-binfmt might fail if binfmt_misc kernel module is not loaded
   # during install
-  {{ROOTLIBEXECDIR}}/systemd-binfmt || :
+  {{LIBEXECDIR}}/systemd-binfmt || :
 fi
 
 %transfiletriggerin -P 1000600 -- {{TMPFILES_DIR}}
@@ -81,13 +75,11 @@ fi
 %transfiletriggerin -P 1000600 udev -- {{UDEV_RULES_DIR}}
 # This script will automatically update udev with new rules if files
 # have been installed or updated in {{UDEV_RULES_DIR}}.
-if test -e /run/udev/control; then
-  udevadm control --reload || :
-fi
+{{SYSTEMD_UPDATE_HELPER_PATH}} mark-reload-system-units systemd-udevd.service || :
 
 %transfiletriggerin -P 1000500 -- {{SYSCTL_DIR}}
 # This script will automatically apply sysctl rules if files have been
 # installed or updated in {{SYSCTL_DIR}}.
 if test -d "/run/systemd/system"; then
-  {{ROOTLIBEXECDIR}}/systemd-sysctl || :
+  {{LIBEXECDIR}}/systemd-sysctl || :
 fi

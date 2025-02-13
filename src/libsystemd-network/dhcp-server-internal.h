@@ -8,7 +8,8 @@
 #include "sd-dhcp-server.h"
 #include "sd-event.h"
 
-#include "dhcp-internal.h"
+#include "dhcp-client-id-internal.h"
+#include "dhcp-option.h"
 #include "network-common.h"
 #include "ordered-set.h"
 #include "time-util.h"
@@ -23,22 +24,6 @@ typedef enum DHCPRawOption {
         _DHCP_RAW_OPTION_DATA_MAX,
         _DHCP_RAW_OPTION_DATA_INVALID,
 } DHCPRawOption;
-
-typedef struct DHCPClientId {
-        size_t length;
-        void *data;
-} DHCPClientId;
-
-typedef struct DHCPLease {
-        sd_dhcp_server *server;
-
-        DHCPClientId client_id;
-
-        be32_t address;
-        be32_t gateway;
-        uint8_t chaddr[16];
-        usec_t expiration;
-} DHCPLease;
 
 struct sd_dhcp_server {
         unsigned n_ref;
@@ -63,6 +48,9 @@ struct sd_dhcp_server {
         char *timezone;
 
         DHCPServerData servers[_SD_DHCP_LEASE_SERVER_TYPE_MAX];
+        struct in_addr boot_server_address;
+        char *boot_server_name;
+        char *boot_filename;
 
         OrderedSet *extra_options;
         OrderedSet *vendor_options;
@@ -75,7 +63,10 @@ struct sd_dhcp_server {
         Hashmap *static_leases_by_client_id;
         Hashmap *static_leases_by_address;
 
-        uint32_t max_lease_time, default_lease_time;
+        usec_t max_lease_time;
+        usec_t default_lease_time;
+        usec_t ipv6_only_preferred_usec;
+        bool rapid_commit;
 
         sd_dhcp_server_callback_t callback;
         void *callback_userdata;
@@ -84,6 +75,9 @@ struct sd_dhcp_server {
 
         char *agent_circuit_id;
         char *agent_remote_id;
+
+        int lease_dir_fd;
+        char *lease_file;
 };
 
 typedef struct DHCPRequest {
@@ -91,24 +85,24 @@ typedef struct DHCPRequest {
         DHCPMessage *message;
 
         /* options */
-        DHCPClientId client_id;
+        sd_dhcp_client_id client_id;
         size_t max_optlen;
         be32_t server_id;
         be32_t requested_ip;
-        uint32_t lifetime;
+        usec_t lifetime;
         const uint8_t *agent_info_option;
+        char *hostname;
+        const uint8_t *parameter_request_list;
+        size_t parameter_request_list_len;
+        bool rapid_commit;
+        triple_timestamp timestamp;
 } DHCPRequest;
 
-extern const struct hash_ops dhcp_lease_hash_ops;
-
 int dhcp_server_handle_message(sd_dhcp_server *server, DHCPMessage *message,
-                               size_t length);
+                               size_t length, const triple_timestamp *timestamp);
 int dhcp_server_send_packet(sd_dhcp_server *server,
                             DHCPRequest *req, DHCPPacket *packet,
                             int type, size_t optoffset);
-
-void client_id_hash_func(const DHCPClientId *p, struct siphash *state);
-int client_id_compare_func(const DHCPClientId *a, const DHCPClientId *b);
 
 #define log_dhcp_server_errno(server, error, fmt, ...)          \
         log_interface_prefix_full_errno(                        \

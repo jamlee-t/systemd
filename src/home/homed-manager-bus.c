@@ -4,8 +4,10 @@
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
+#include "bus-message-util.h"
 #include "bus-polkit.h"
 #include "format-util.h"
+#include "home-util.h"
 #include "homed-bus.h"
 #include "homed-home-bus.h"
 #include "homed-manager-bus.h"
@@ -24,22 +26,20 @@ static int property_get_auto_login(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Home *h;
         int r;
 
         assert(bus);
         assert(reply);
-        assert(m);
 
         r = sd_bus_message_open_container(reply, 'a', "(sso)");
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(h, m->homes_by_name) {
-                _cleanup_(strv_freep) char **seats = NULL;
+        HASHMAP_FOREACH(h, m->homes_by_uid) {
+                _cleanup_strv_free_ char **seats = NULL;
                 _cleanup_free_ char *home_path = NULL;
-                char **s;
 
                 r = home_auto_login(h, &seats);
                 if (r < 0) {
@@ -63,6 +63,51 @@ static int property_get_auto_login(
         return sd_bus_message_close_container(reply);
 }
 
+static int lookup_user_name(
+                Manager *m,
+                sd_bus_message *message,
+                const char *user_name,
+                sd_bus_error *error,
+                Home **ret) {
+
+        Home *h;
+        int r;
+
+        assert(m);
+        assert(message);
+        assert(user_name);
+        assert(ret);
+
+        if (isempty(user_name)) {
+                _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+                uid_t uid;
+
+                /* If an empty user name is specified, then identify caller's EUID and find home by that. */
+
+                r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_EUID, &creds);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_creds_get_euid(creds, &uid);
+                if (r < 0)
+                        return r;
+
+                h = hashmap_get(m->homes_by_uid, UID_TO_PTR(uid));
+                if (!h)
+                        return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_HOME, "Client's UID " UID_FMT " not managed.", uid);
+
+        } else {
+                r = manager_get_home_by_name(m, user_name, &h);
+                if (r < 0)
+                        return r;
+                if (!h)
+                        return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_HOME, "No home for user %s known", user_name);
+        }
+
+        *ret = h;
+        return 0;
+}
+
 static int method_get_home_by_name(
                 sd_bus_message *message,
                 void *userdata,
@@ -70,22 +115,19 @@ static int method_get_home_by_name(
 
         _cleanup_free_ char *path = NULL;
         const char *user_name;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Home *h;
         int r;
 
         assert(message);
-        assert(m);
 
         r = sd_bus_message_read(message, "s", &user_name);
         if (r < 0)
                 return r;
-        if (!valid_user_group_name(user_name, 0))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "User name %s is not valid", user_name);
 
-        h = hashmap_get(m->homes_by_name, user_name);
-        if (!h)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_HOME, "No home for user %s known", user_name);
+        r = lookup_user_name(m, message, user_name, error, &h);
+        if (r < 0)
+                return r;
 
         r = bus_home_path(h, &path);
         if (r < 0)
@@ -108,13 +150,12 @@ static int method_get_home_by_uid(
                 sd_bus_error *error) {
 
         _cleanup_free_ char *path = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         uint32_t uid;
         int r;
         Home *h;
 
         assert(message);
-        assert(m);
 
         r = sd_bus_message_read(message, "u", &uid);
         if (r < 0)
@@ -149,12 +190,11 @@ static int method_list_homes(
                 sd_bus_error *error) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Home *h;
         int r;
 
         assert(message);
-        assert(m);
 
         r = sd_bus_message_new_method_return(message, &reply);
         if (r < 0)
@@ -198,24 +238,21 @@ static int method_get_user_record_by_name(
                 sd_bus_error *error) {
 
         _cleanup_free_ char *json = NULL, *path = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         const char *user_name;
         bool incomplete;
         Home *h;
         int r;
 
         assert(message);
-        assert(m);
 
         r = sd_bus_message_read(message, "s", &user_name);
         if (r < 0)
                 return r;
-        if (!valid_user_group_name(user_name, 0))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "User name %s is not valid", user_name);
 
-        h = hashmap_get(m->homes_by_name, user_name);
-        if (!h)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_HOME, "No home for user %s known", user_name);
+        r = lookup_user_name(m, message, user_name, error, &h);
+        if (r < 0)
+                return r;
 
         r = bus_home_get_record_json(h, message, &json, &incomplete);
         if (r < 0)
@@ -238,14 +275,13 @@ static int method_get_user_record_by_uid(
                 sd_bus_error *error) {
 
         _cleanup_free_ char *json = NULL, *path = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         bool incomplete;
         uint32_t uid;
         Home *h;
         int r;
 
         assert(message);
-        assert(m);
 
         r = sd_bus_message_read(message, "u", &uid);
         if (r < 0)
@@ -281,16 +317,17 @@ static int generic_home_method(
         Home *h;
         int r;
 
+        assert(m);
+        assert(message);
+        assert(handler);
+
         r = sd_bus_message_read(message, "s", &user_name);
         if (r < 0)
                 return r;
 
-        if (!valid_user_group_name(user_name, 0))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "User name %s is not valid", user_name);
-
-        h = hashmap_get(m->homes_by_name, user_name);
-        if (!h)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_HOME, "No home for user %s known", user_name);
+        r = lookup_user_name(m, message, user_name, error, &h);
+        if (r < 0)
+                return r;
 
         return handler(message, h, error);
 }
@@ -303,10 +340,33 @@ static int method_deactivate_home(sd_bus_message *message, void *userdata, sd_bu
         return generic_home_method(userdata, message, bus_home_method_deactivate, error);
 }
 
-static int validate_and_allocate_home(Manager *m, UserRecord *hr, Home **ret, sd_bus_error *error) {
+static int check_for_conflicts(Manager *m, const char *name, sd_bus_error *error) {
+        int r;
+
+        assert(m);
+        assert(name);
+
+        Home *other = hashmap_get(m->homes_by_name, name);
+        if (other)
+                return sd_bus_error_setf(error, BUS_ERROR_USER_NAME_EXISTS, "Specified user name %s exists already, refusing.", name);
+
+        r = getpwnam_malloc(name, /* ret= */ NULL);
+        if (r >= 0)
+                return sd_bus_error_setf(error, BUS_ERROR_USER_NAME_EXISTS, "Specified user name %s exists in the NSS user database, refusing.", name);
+        if (r != -ESRCH)
+                return r;
+
+        r = getgrnam_malloc(name, /* ret= */ NULL);
+        if (r >= 0)
+                return sd_bus_error_setf(error, BUS_ERROR_USER_NAME_EXISTS, "Specified user name %s conflicts with an NSS group by the same name, refusing.", name);
+        if (r != -ESRCH)
+                return r;
+
+        return 0;
+}
+
+static int validate_and_allocate_home(Manager *m, UserRecord *hr, Hashmap *blobs, Home **ret, sd_bus_error *error) {
         _cleanup_(user_record_unrefp) UserRecord *signed_hr = NULL;
-        struct passwd *pw;
-        struct group *gr;
         bool signed_locally;
         Home *other;
         int r;
@@ -319,17 +379,41 @@ static int validate_and_allocate_home(Manager *m, UserRecord *hr, Home **ret, sd
         if (r < 0)
                 return r;
 
-        other = hashmap_get(m->homes_by_name, hr->user_name);
-        if (other)
-                return sd_bus_error_setf(error, BUS_ERROR_USER_NAME_EXISTS, "Specified user name %s exists already, refusing.", hr->user_name);
+        r = check_for_conflicts(m, hr->user_name, error);
+        if (r < 0)
+                return r;
 
-        pw = getpwnam(hr->user_name);
-        if (pw)
-                return sd_bus_error_setf(error, BUS_ERROR_USER_NAME_EXISTS, "Specified user name %s exists in the NSS user database, refusing.", hr->user_name);
+        if (hr->realm) {
+                r = check_for_conflicts(m, user_record_user_name_and_realm(hr), error);
+                if (r < 0)
+                        return r;
+        }
 
-        gr = getgrnam(hr->user_name);
-        if (gr)
-                return sd_bus_error_setf(error, BUS_ERROR_USER_NAME_EXISTS, "Specified user name %s conflicts with an NSS group by the same name, refusing.", hr->user_name);
+        STRV_FOREACH(a, hr->aliases) {
+                r = check_for_conflicts(m, *a, error);
+                if (r < 0)
+                        return r;
+
+                if (hr->realm) {
+                        _cleanup_free_ char *alias_with_realm = NULL;
+                        alias_with_realm = strjoin(*a, "@", hr->realm);
+                        if (!alias_with_realm)
+                                return -ENOMEM;
+
+                        r = check_for_conflicts(m, alias_with_realm, error);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        if (blobs) {
+                const char *failed = NULL;
+                r = user_record_ensure_blob_manifest(hr, blobs, &failed);
+                if (r == -EINVAL)
+                        return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Provided blob files do not correspond to blob manifest.");
+                if (r < 0)
+                        return sd_bus_error_set_errnof(error, r, "Failed to generate hash for blob %s: %m", strnull(failed));
+        }
 
         r = manager_verify_user_record(m, hr);
         switch (r) {
@@ -360,17 +444,24 @@ static int validate_and_allocate_home(Manager *m, UserRecord *hr, Home **ret, sd
         }
 
         if (uid_is_valid(hr->uid)) {
+                _cleanup_free_ struct passwd *pw = NULL;
+                _cleanup_free_ struct group *gr = NULL;
+
                 other = hashmap_get(m->homes_by_uid, UID_TO_PTR(hr->uid));
                 if (other)
                         return sd_bus_error_setf(error, BUS_ERROR_UID_IN_USE, "Specified UID " UID_FMT " already in use by home %s, refusing.", hr->uid, other->user_name);
 
-                pw = getpwuid(hr->uid);
-                if (pw)
+                r = getpwuid_malloc(hr->uid, &pw);
+                if (r >= 0)
                         return sd_bus_error_setf(error, BUS_ERROR_UID_IN_USE, "Specified UID " UID_FMT " already in use by NSS user %s, refusing.", hr->uid, pw->pw_name);
+                if (r != -ESRCH)
+                        return r;
 
-                gr = getgrgid(hr->uid);
-                if (gr)
+                r = getgrgid_malloc(hr->uid, &gr);
+                if (r >= 0)
                         return sd_bus_error_setf(error, BUS_ERROR_UID_IN_USE, "Specified UID " UID_FMT " already in use as GID by NSS group %s, refusing.", hr->uid, gr->gr_name);
+                if (r != -ESRCH)
+                        return r;
         } else {
                 r = manager_augment_record_with_uid(m, hr);
                 if (r < 0)
@@ -391,12 +482,11 @@ static int method_register_home(
                 sd_bus_error *error) {
 
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
-        Manager *m = userdata;
-        Home *h;
+        Manager *m = ASSERT_PTR(userdata);
+        _cleanup_(home_freep) Home *h = NULL;
         int r;
 
         assert(message);
-        assert(m);
 
         r = bus_message_read_home_record(message, USER_RECORD_LOAD_EMBEDDED|USER_RECORD_PERMISSIVE, &hr, error);
         if (r < 0)
@@ -404,11 +494,8 @@ static int method_register_home(
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.home1.create-home",
-                        NULL,
-                        true,
-                        UID_INVALID,
+                        /* details= */ NULL,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -416,15 +503,15 @@ static int method_register_home(
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = validate_and_allocate_home(m, hr, &h, error);
+        r = validate_and_allocate_home(m, hr, NULL, &h, error);
         if (r < 0)
                 return r;
 
         r = home_save_record(h);
-        if (r < 0) {
-                home_free(h);
+        if (r < 0)
                 return r;
-        }
+
+        TAKE_PTR(h);
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -433,30 +520,36 @@ static int method_unregister_home(sd_bus_message *message, void *userdata, sd_bu
         return generic_home_method(userdata, message, bus_home_method_unregister, error);
 }
 
-static int method_create_home(
-                sd_bus_message *message,
-                void *userdata,
-                sd_bus_error *error) {
-
+static int method_create_home(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
-        Manager *m = userdata;
+        _cleanup_hashmap_free_ Hashmap *blobs = NULL;
+        uint64_t flags = 0;
+        Manager *m = ASSERT_PTR(userdata);
         Home *h;
         int r;
 
         assert(message);
-        assert(m);
 
         r = bus_message_read_home_record(message, USER_RECORD_REQUIRE_REGULAR|USER_RECORD_ALLOW_SECRET|USER_RECORD_ALLOW_PRIVILEGED|USER_RECORD_ALLOW_PER_MACHINE|USER_RECORD_ALLOW_SIGNATURE, &hr, error);
         if (r < 0)
                 return r;
 
+        if (endswith(sd_bus_message_get_member(message), "Ex")) {
+                r = bus_message_read_blobs(message, &blobs, error);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_read(message, "t", &flags);
+                if (r < 0)
+                        return r;
+                if ((flags & ~SD_HOMED_CREATE_FLAGS_ALL) != 0)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid flags provided.");
+        }
+
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.home1.create-home",
-                        NULL,
-                        true,
-                        UID_INVALID,
+                        /* details= */ NULL,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -464,11 +557,11 @@ static int method_create_home(
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = validate_and_allocate_home(m, hr, &h, error);
+        r = validate_and_allocate_home(m, hr, blobs, &h, error);
         if (r < 0)
                 return r;
 
-        r = home_create(h, hr, error);
+        r = home_create(h, hr, blobs, flags, error);
         if (r < 0)
                 goto fail;
 
@@ -479,6 +572,8 @@ static int method_create_home(
         r = home_set_current_message(h, message);
         if (r < 0)
                 return r;
+
+        h->current_operation->call_flags = flags;
 
         return 1;
 
@@ -506,16 +601,27 @@ static int method_authenticate_home(sd_bus_message *message, void *userdata, sd_
 
 static int method_update_home(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
-        Manager *m = userdata;
+        _cleanup_hashmap_free_ Hashmap *blobs = NULL;
+        uint64_t flags = 0;
+        Manager *m = ASSERT_PTR(userdata);
         Home *h;
         int r;
 
         assert(message);
-        assert(m);
 
         r = bus_message_read_home_record(message, USER_RECORD_REQUIRE_REGULAR|USER_RECORD_ALLOW_SECRET|USER_RECORD_ALLOW_PRIVILEGED|USER_RECORD_ALLOW_PER_MACHINE|USER_RECORD_ALLOW_SIGNATURE|USER_RECORD_PERMISSIVE, &hr, error);
         if (r < 0)
                 return r;
+
+        if (endswith(sd_bus_message_get_member(message), "Ex")) {
+                r = bus_message_read_blobs(message, &blobs, error);
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_read(message, "t", &flags);
+                if (r < 0)
+                        return r;
+        }
 
         assert(hr->user_name);
 
@@ -523,7 +629,7 @@ static int method_update_home(sd_bus_message *message, void *userdata, sd_bus_er
         if (!h)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_HOME, "No home for user %s known", hr->user_name);
 
-        return bus_home_method_update_record(h, message, hr, error);
+        return bus_home_update_record(h, message, hr, blobs, flags, error);
 }
 
 static int method_resize_home(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -557,22 +663,17 @@ static int method_release_home(sd_bus_message *message, void *userdata, sd_bus_e
 static int method_lock_all_homes(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(operation_unrefp) Operation *o = NULL;
         bool waiting = false;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Home *h;
         int r;
-
-        assert(m);
 
         /* This is called from logind when we are preparing for system suspend. We enqueue a lock operation
          * for every suitable home we have and only when all of them completed we send a reply indicating
          * completion. */
 
-        HASHMAP_FOREACH(h, m->homes_by_name) {
+        HASHMAP_FOREACH(h, m->homes_by_uid) {
 
-                /* Automatically suspend all homes that have at least one client referencing it that asked
-                 * for "please suspend", and no client that asked for "please do not suspend". */
-                if (h->ref_event_source_dont_suspend ||
-                    !h->ref_event_source_please_suspend)
+                if (!home_shall_suspend(h))
                         continue;
 
                 if (!o) {
@@ -600,18 +701,16 @@ static int method_lock_all_homes(sd_bus_message *message, void *userdata, sd_bus
 static int method_deactivate_all_homes(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_(operation_unrefp) Operation *o = NULL;
         bool waiting = false;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Home *h;
         int r;
-
-        assert(m);
 
         /* This is called from systemd-homed-activate.service's ExecStop= command to ensure that all home
          * directories are shutdown before the system goes down. Note that we don't do this from
          * systemd-homed.service itself since we want to allow restarting of it without tearing down all home
          * directories. */
 
-        HASHMAP_FOREACH(h, m->homes_by_name) {
+        HASHMAP_FOREACH(h, m->homes_by_uid) {
 
                 if (!o) {
                         o = operation_new(OPERATION_DEACTIVATE_ALL, message);
@@ -635,179 +734,177 @@ static int method_deactivate_all_homes(sd_bus_message *message, void *userdata, 
         return sd_bus_reply_method_return(message, NULL);
 }
 
+static int method_rebalance(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
+
+        r = manager_schedule_rebalance(m, /* immediately= */ true);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return sd_bus_reply_method_errorf(message, BUS_ERROR_REBALANCE_NOT_NEEDED, "No home directories need rebalancing.");
+
+        /* Keep a reference to this message, so that we can reply to it once we are done */
+        r = set_ensure_consume(&m->rebalance_queued_method_calls, &bus_message_hash_ops, sd_bus_message_ref(message));
+        if (r < 0)
+                return log_error_errno(r, "Failed to track rebalance bus message: %m");
+        assert(r > 0);
+
+        return 1;
+}
+
 static const sd_bus_vtable manager_vtable[] = {
         SD_BUS_VTABLE_START(0),
 
         SD_BUS_PROPERTY("AutoLogin", "a(sso)", property_get_auto_login, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 
-        SD_BUS_METHOD_WITH_NAMES("GetHomeByName",
-                                 "s",
-                                 SD_BUS_PARAM(user_name),
-                                 "usussso",
-                                 SD_BUS_PARAM(uid)
-                                 SD_BUS_PARAM(home_state)
-                                 SD_BUS_PARAM(gid)
-                                 SD_BUS_PARAM(real_name)
-                                 SD_BUS_PARAM(home_directory)
-                                 SD_BUS_PARAM(shell)
-                                 SD_BUS_PARAM(bus_path),
-                                 method_get_home_by_name,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD_WITH_NAMES("GetHomeByUID",
-                                 "u",
-                                 SD_BUS_PARAM(uid),
-                                 "ssussso",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(home_state)
-                                 SD_BUS_PARAM(gid)
-                                 SD_BUS_PARAM(real_name)
-                                 SD_BUS_PARAM(home_directory)
-                                 SD_BUS_PARAM(shell)
-                                 SD_BUS_PARAM(bus_path),
-                                 method_get_home_by_uid,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD_WITH_NAMES("GetUserRecordByName",
-                                 "s",
-                                 SD_BUS_PARAM(user_name),
-                                 "sbo",
-                                 SD_BUS_PARAM(user_record)
-                                 SD_BUS_PARAM(incomplete)
-                                 SD_BUS_PARAM(bus_path),
-                                 method_get_user_record_by_name,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("GetUserRecordByUID",
-                                 "u",
-                                 SD_BUS_PARAM(uid),
-                                 "sbo",
-                                 SD_BUS_PARAM(user_record)
-                                 SD_BUS_PARAM(incomplete)
-                                 SD_BUS_PARAM(bus_path),
-                                 method_get_user_record_by_uid,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("ListHomes",
-                                 NULL,,
-                                 "a(susussso)",
-                                 SD_BUS_PARAM(home_areas),
-                                 method_list_homes,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetHomeByName",
+                                SD_BUS_ARGS("s", user_name),
+                                SD_BUS_RESULT("u", uid,
+                                              "s", home_state,
+                                              "u", gid,
+                                              "s", real_name,
+                                              "s", home_directory,
+                                              "s", shell,
+                                              "o", bus_path),
+                                method_get_home_by_name,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetHomeByUID",
+                                SD_BUS_ARGS("u", uid),
+                                SD_BUS_RESULT("s", user_name,
+                                              "s", home_state,
+                                              "u", gid,
+                                              "s", real_name,
+                                              "s", home_directory,
+                                              "s", shell,
+                                              "o", bus_path),
+                                method_get_home_by_uid,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("GetUserRecordByName",
+                                SD_BUS_ARGS("s", user_name),
+                                SD_BUS_RESULT("s", user_record, "b", incomplete, "o", bus_path),
+                                method_get_user_record_by_name,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("GetUserRecordByUID",
+                                SD_BUS_ARGS("u", uid),
+                                SD_BUS_RESULT("s", user_record, "b", incomplete, "o", bus_path),
+                                method_get_user_record_by_uid,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("ListHomes",
+                                SD_BUS_NO_ARGS,
+                                SD_BUS_RESULT("a(susussso)", home_areas),
+                                method_list_homes,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
 
         /* The following methods directly execute an operation on a home area, without ref-counting, queueing
          * or anything, and are accessible through homectl. */
-        SD_BUS_METHOD_WITH_NAMES("ActivateHome",
-                                 "ss",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 method_activate_home,
-                                 SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("DeactivateHome",
-                                 "s",
-                                 SD_BUS_PARAM(user_name),
-                                 NULL,,
-                                 method_deactivate_home,
-                                 0),
+        SD_BUS_METHOD_WITH_ARGS("ActivateHome",
+                                SD_BUS_ARGS("s", user_name, "s", secret),
+                                SD_BUS_NO_RESULT,
+                                method_activate_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("ActivateHomeIfReferenced",
+                                SD_BUS_ARGS("s", user_name, "s", secret),
+                                SD_BUS_NO_RESULT,
+                                method_activate_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("DeactivateHome",
+                                SD_BUS_ARGS("s", user_name),
+                                SD_BUS_NO_RESULT,
+                                method_deactivate_home,
+                                0),
 
         /* Add the JSON record to homed, but don't create actual $HOME */
-        SD_BUS_METHOD_WITH_NAMES("RegisterHome",
-                                 "s",
-                                 SD_BUS_PARAM(user_record),
-                                 NULL,,
-                                 method_register_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("RegisterHome",
+                                SD_BUS_ARGS("s", user_record),
+                                SD_BUS_NO_RESULT,
+                                method_register_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
 
         /* Remove the JSON record from homed, but don't remove actual $HOME  */
-        SD_BUS_METHOD_WITH_NAMES("UnregisterHome",
-                                 "s",
-                                 SD_BUS_PARAM(user_name),
-                                 NULL,,
-                                 method_unregister_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("UnregisterHome",
+                                SD_BUS_ARGS("s", user_name),
+                                SD_BUS_NO_RESULT,
+                                method_unregister_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
 
         /* Add JSON record, and create $HOME for it */
-        SD_BUS_METHOD_WITH_NAMES("CreateHome",
-                                 "s",
-                                 SD_BUS_PARAM(user_record),
-                                 NULL,,
-                                 method_create_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("CreateHome",
+                                SD_BUS_ARGS("s", user_record),
+                                SD_BUS_NO_RESULT,
+                                method_create_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("CreateHomeEx",
+                                SD_BUS_ARGS("s", user_record, "a{sh}", blobs, "t", flags),
+                                SD_BUS_NO_RESULT,
+                                method_create_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
 
         /* Create $HOME for already registered JSON entry */
-        SD_BUS_METHOD_WITH_NAMES("RealizeHome",
-                                 "ss",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 method_realize_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("RealizeHome",
+                                SD_BUS_ARGS("s", user_name, "s", secret),
+                                SD_BUS_NO_RESULT,
+                                method_realize_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
 
         /* Remove the JSON record and remove $HOME */
-        SD_BUS_METHOD_WITH_NAMES("RemoveHome",
-                                 "s",
-                                 SD_BUS_PARAM(user_name),
-                                 NULL,,
-                                 method_remove_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_ARGS("RemoveHome",
+                                SD_BUS_ARGS("s", user_name),
+                                SD_BUS_NO_RESULT,
+                                method_remove_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED),
 
         /* Investigate $HOME and propagate contained JSON record into our database */
-        SD_BUS_METHOD_WITH_NAMES("FixateHome",
-                                 "ss",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 method_fixate_home,
-                                 SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("FixateHome",
+                                SD_BUS_ARGS("s", user_name, "s", secret),
+                                SD_BUS_NO_RESULT,
+                                method_fixate_home,
+                                SD_BUS_VTABLE_SENSITIVE),
 
         /* Just check credentials */
-        SD_BUS_METHOD_WITH_NAMES("AuthenticateHome",
-                                 "ss",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 method_authenticate_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("AuthenticateHome",
+                                SD_BUS_ARGS("s", user_name, "s", secret),
+                                SD_BUS_NO_RESULT,
+                                method_authenticate_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
 
         /* Update the JSON record of existing user */
-        SD_BUS_METHOD_WITH_NAMES("UpdateHome",
-                                 "s",
-                                 SD_BUS_PARAM(user_record),
-                                 NULL,,
-                                 method_update_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("UpdateHome",
+                                SD_BUS_ARGS("s", user_record),
+                                SD_BUS_NO_RESULT,
+                                method_update_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("UpdateHomeEx",
+                                SD_BUS_ARGS("s", user_record, "a{sh}", blobs, "t", flags),
+                                SD_BUS_NO_RESULT,
+                                method_update_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
 
-        SD_BUS_METHOD_WITH_NAMES("ResizeHome",
-                                 "sts",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(size)
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 method_resize_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("ResizeHome",
+                                SD_BUS_ARGS("s", user_name, "t", size, "s", secret),
+                                SD_BUS_NO_RESULT,
+                                method_resize_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
 
-        SD_BUS_METHOD_WITH_NAMES("ChangePasswordHome",
-                                 "sss",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(new_secret)
-                                 SD_BUS_PARAM(old_secret),
-                                 NULL,,
-                                 method_change_password_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("ChangePasswordHome",
+                                SD_BUS_ARGS("s", user_name, "s", new_secret, "s", old_secret),
+                                SD_BUS_NO_RESULT,
+                                method_change_password_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
 
         /* Prepare active home for system suspend: flush out passwords, suspend access */
-        SD_BUS_METHOD_WITH_NAMES("LockHome",
-                                 "s",
-                                 SD_BUS_PARAM(user_name),
-                                 NULL,,
-                                 method_lock_home,
-                                 0),
+        SD_BUS_METHOD_WITH_ARGS("LockHome",
+                                SD_BUS_ARGS("s", user_name),
+                                SD_BUS_NO_RESULT,
+                                method_lock_home,
+                                0),
 
         /* Make $HOME usable after system resume again */
-        SD_BUS_METHOD_WITH_NAMES("UnlockHome",
-                                 "ss",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(secret),
-                                 NULL,,
-                                 method_unlock_home,
-                                 SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("UnlockHome",
+                                SD_BUS_ARGS("s", user_name, "s", secret),
+                                SD_BUS_NO_RESULT,
+                                method_unlock_home,
+                                SD_BUS_VTABLE_SENSITIVE),
 
         /* The following methods implement ref-counted activation, and are what the PAM module and "homectl
          * with" use. In contrast to the methods above which fail if an operation is already being executed
@@ -816,33 +913,31 @@ static const sd_bus_vtable manager_vtable[] = {
          * the state of the home area, so that the end result is always the same (i.e. the home directory is
          * accessible), and we always validate the specified passwords. RefHome() will not authenticate, and
          * thus only works if the home area is already active. */
-        SD_BUS_METHOD_WITH_NAMES("AcquireHome",
-                                 "ssb",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(secret)
-                                 SD_BUS_PARAM(please_suspend),
-                                 "h",
-                                 SD_BUS_PARAM(send_fd),
-                                 method_acquire_home,
-                                 SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
-        SD_BUS_METHOD_WITH_NAMES("RefHome",
-                                 "sb",
-                                 SD_BUS_PARAM(user_name)
-                                 SD_BUS_PARAM(please_suspend),
-                                 "h",
-                                 SD_BUS_PARAM(send_fd),
-                                 method_ref_home,
-                                 0),
-        SD_BUS_METHOD_WITH_NAMES("ReleaseHome",
-                                 "s",
-                                 SD_BUS_PARAM(user_name),
-                                 NULL,,
-                                 method_release_home,
-                                 0),
+        SD_BUS_METHOD_WITH_ARGS("AcquireHome",
+                                SD_BUS_ARGS("s", user_name, "s", secret, "b", please_suspend),
+                                SD_BUS_RESULT("h", send_fd),
+                                method_acquire_home,
+                                SD_BUS_VTABLE_UNPRIVILEGED|SD_BUS_VTABLE_SENSITIVE),
+        SD_BUS_METHOD_WITH_ARGS("RefHome",
+                                SD_BUS_ARGS("s", user_name, "b", please_suspend),
+                                SD_BUS_RESULT("h", send_fd),
+                                method_ref_home,
+                                0),
+        SD_BUS_METHOD_WITH_ARGS("RefHomeUnrestricted",
+                                SD_BUS_ARGS("s", user_name, "b", please_suspend),
+                                SD_BUS_RESULT("h", send_fd),
+                                method_ref_home,
+                                0),
+        SD_BUS_METHOD_WITH_ARGS("ReleaseHome",
+                                SD_BUS_ARGS("s", user_name),
+                                SD_BUS_NO_RESULT,
+                                method_release_home,
+                                0),
 
         /* An operation that acts on all homes that allow it */
         SD_BUS_METHOD("LockAllHomes", NULL, NULL, method_lock_all_homes, 0),
         SD_BUS_METHOD("DeactivateAllHomes", NULL, NULL, method_deactivate_all_homes, 0),
+        SD_BUS_METHOD("Rebalance", NULL, NULL, method_rebalance, 0),
 
         SD_BUS_VTABLE_END
 };
@@ -855,10 +950,8 @@ const BusObjectImplementation manager_object = {
 };
 
 static int on_deferred_auto_login(sd_event_source *s, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         int r;
-
-        assert(m);
 
         m->deferred_auto_login_event_source = sd_event_source_disable_unref(m->deferred_auto_login_event_source);
 

@@ -1,8 +1,8 @@
-/* SPDX-License-Identifier: CC0-1.0 */
+/* SPDX-License-Identifier: MIT-0 */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <sd-path.h>
+#include <systemd/sd-path.h>
 
 int main(void) {
   int r;

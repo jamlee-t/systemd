@@ -5,35 +5,66 @@
 #include "fileio.h"
 #include "hashmap.h"
 #include "manager-dump.h"
+#include "memstream-util.h"
 #include "unit-serialize.h"
+#include "version.h"
 
-void manager_dump_jobs(Manager *s, FILE *f, const char *prefix) {
+void manager_dump_jobs(Manager *s, FILE *f, char **patterns, const char *prefix) {
         Job *j;
 
         assert(s);
         assert(f);
 
-        HASHMAP_FOREACH(j, s->jobs)
+        HASHMAP_FOREACH(j, s->jobs) {
+
+                if (!strv_fnmatch_or_empty(patterns, j->unit->id, FNM_NOESCAPE))
+                        continue;
+
                 job_dump(j, f, prefix);
+        }
 }
 
-void manager_dump_units(Manager *s, FILE *f, const char *prefix) {
+int manager_get_dump_jobs_string(Manager *m, char **patterns, const char *prefix, char **ret) {
+        _cleanup_(memstream_done) MemStream ms = {};
+        FILE *f;
+
+        assert(m);
+        assert(ret);
+
+        f = memstream_init(&ms);
+        if (!f)
+                return -errno;
+
+        manager_dump_jobs(m, f, patterns, prefix);
+
+        return memstream_finalize(&ms, ret, NULL);
+}
+
+void manager_dump_units(Manager *s, FILE *f, char **patterns, const char *prefix) {
         Unit *u;
         const char *t;
 
         assert(s);
         assert(f);
 
-        HASHMAP_FOREACH_KEY(u, t, s->units)
-                if (u->id == t)
-                        unit_dump(u, f, prefix);
+        HASHMAP_FOREACH_KEY(u, t, s->units) {
+                if (u->id != t)
+                        continue;
+
+                if (!strv_fnmatch_or_empty(patterns, u->id, FNM_NOESCAPE))
+                        continue;
+
+                unit_dump(u, f, prefix);
+        }
 }
 
-void manager_dump(Manager *m, FILE *f, const char *prefix) {
-        assert(m);
-        assert(f);
+static void manager_dump_header(Manager *m, FILE *f, const char *prefix) {
 
-        fprintf(f, "%sManager: systemd " STRINGIFY(PROJECT_VERSION) " (" GIT_VERSION ")\n", strempty(prefix));
+        /* NB: this is a debug interface for developers. It's not supposed to be machine readable or be
+         * stable between versions. We take the liberty to restructure it entirely between versions and
+         * add/remove fields at will. */
+
+        fprintf(f, "%sManager: systemd " PROJECT_VERSION_FULL " (" GIT_VERSION ")\n", strempty(prefix));
         fprintf(f, "%sFeatures: %s\n", strempty(prefix), systemd_features);
 
         for (ManagerTimestamp q = 0; q < _MANAGER_TIMESTAMP_MAX; q++) {
@@ -47,42 +78,45 @@ void manager_dump(Manager *m, FILE *f, const char *prefix) {
                                                                 FORMAT_TIMESPAN(t->monotonic, 1));
         }
 
-        manager_dump_units(m, f, prefix);
-        manager_dump_jobs(m, f, prefix);
+        for (const char *n = sd_bus_track_first(m->subscribed); n; n = sd_bus_track_next(m->subscribed))
+                fprintf(f, "%sSubscribed: %s\n", strempty(prefix), n);
 }
 
-int manager_get_dump_string(Manager *m, char **ret) {
-        _cleanup_free_ char *dump = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
-        size_t size;
-        int r;
+void manager_dump(Manager *m, FILE *f, char **patterns, const char *prefix) {
+        assert(m);
+        assert(f);
+
+        /* If no pattern is provided, dump the full manager state including the manager version, features and
+         * so on. Otherwise limit the dump to the units/jobs matching the specified patterns. */
+        if (!patterns)
+                manager_dump_header(m, f, prefix);
+
+        manager_dump_units(m, f, patterns, prefix);
+        manager_dump_jobs(m, f, patterns, prefix);
+}
+
+int manager_get_dump_string(Manager *m, char **patterns, char **ret) {
+        _cleanup_(memstream_done) MemStream ms = {};
+        FILE *f;
 
         assert(m);
         assert(ret);
 
-        f = open_memstream_unlocked(&dump, &size);
+        f = memstream_init(&ms);
         if (!f)
                 return -errno;
 
-        manager_dump(m, f, NULL);
+        manager_dump(m, f, patterns, NULL);
 
-        r = fflush_and_check(f);
-        if (r < 0)
-                return r;
-
-        f = safe_fclose(f);
-
-        *ret = TAKE_PTR(dump);
-
-        return 0;
+        return memstream_finalize(&ms, ret, NULL);
 }
 
 void manager_test_summary(Manager *m) {
         assert(m);
 
         printf("-> By units:\n");
-        manager_dump_units(m, stdout, "\t");
+        manager_dump_units(m, stdout, /* patterns= */ NULL, "\t");
 
         printf("-> By jobs:\n");
-        manager_dump_jobs(m, stdout, "\t");
+        manager_dump_jobs(m, stdout, /* patterns= */ NULL, "\t");
 }

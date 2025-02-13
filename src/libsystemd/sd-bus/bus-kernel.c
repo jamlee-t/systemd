@@ -9,12 +9,6 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 
-/* When we include libgen.h because we need dirname() we immediately
- * undefine basename() since libgen.h defines it as a macro to the POSIX
- * version which is really broken. We prefer GNU basename(). */
-#include <libgen.h>
-#undef basename
-
 #include "alloc-util.h"
 #include "bus-internal.h"
 #include "bus-kernel.h"
@@ -33,8 +27,11 @@
 #include "memory-util.h"
 
 void close_and_munmap(int fd, void *address, size_t size) {
-        if (size > 0)
-                assert_se(munmap(address, PAGE_ALIGN(size)) >= 0);
+        if (size > 0) {
+                size = PAGE_ALIGN(size);
+                assert(size < SIZE_MAX);
+                assert_se(munmap(address, size) >= 0);
+        }
 
         safe_close(fd);
 }

@@ -1,64 +1,75 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-if conf.get('HAVE_LIBCRYPTSETUP_PLUGINS') == 1
+lib_cryptsetup_token_common = static_library(
+        'cryptsetup-token-common',
+        'cryptsetup-token-util.c',
+        include_directories : includes,
+        dependencies : userspace,
+        link_with : libshared,
+        build_by_default : false)
 
-cryptsetup_token_c_args = ['-fvisibility=hidden']
+cryptsetup_token_systemd_tpm2_sources = files(
+        'cryptsetup-token-systemd-tpm2.c',
+        'luks2-tpm2.c',
+)
 
-cryptsetup_token_sym = files('cryptsetup-token.sym')
-cryptsetup_token_sym_path = meson.current_source_dir() / 'cryptsetup-token.sym'
+cryptsetup_token_systemd_fido2_sources = files(
+        'cryptsetup-token-systemd-fido2.c',
+        'luks2-fido2.c',
+)
 
-if conf.get('HAVE_TPM2') == 1
-        cryptsetup_token_systemd_tpm2_sources = files('''
-                cryptsetup-token-systemd-tpm2.c
-                cryptsetup-token.h
-                cryptsetup-token-util.h
-                cryptsetup-token-util.c
-                luks2-tpm2.c
-                luks2-tpm2.h
-        '''.split())
+cryptsetup_token_systemd_pkcs11_sources = files(
+        'cryptsetup-token-systemd-pkcs11.c',
+        'luks2-pkcs11.c',
+)
 
-        cryptsetup_token_systemd_tpm2_static = static_library(
-                'cryptsetup-token-systemd-tpm2_static',
-                cryptsetup_token_systemd_tpm2_sources,
-                include_directories : includes,
-                dependencies : libshared_deps + [libcryptsetup, versiondep],
-                c_args : cryptsetup_token_c_args)
-endif
+template = {
+        'include_directories' : includes,
+        'link_with' : [
+                lib_cryptsetup_token_common,
+                libshared,
+        ],
+        'version-script' : meson.current_source_dir() / 'cryptsetup-token.sym',
+        'install_rpath' : pkglibdir,
+        'install' : true,
+        'install_dir' : libcryptsetup_plugins_dir,
+}
 
-if conf.get('HAVE_LIBFIDO2') == 1
-        cryptsetup_token_systemd_fido2_sources = files('''
-                cryptsetup-token-systemd-fido2.c
-                cryptsetup-token.h
-                cryptsetup-token-util.h
-                cryptsetup-token-util.c
-                luks2-fido2.c
-                luks2-fido2.h
-        '''.split())
-
-        cryptsetup_token_systemd_fido2_static = static_library(
-                'cryptsetup-token-systemd-fido2_static',
-                cryptsetup_token_systemd_fido2_sources,
-                include_directories : includes,
-                dependencies : libshared_deps + [libcryptsetup, versiondep],
-                c_args : cryptsetup_token_c_args)
-endif
-
-if conf.get('HAVE_P11KIT') == 1
-        cryptsetup_token_systemd_pkcs11_sources = files('''
-                cryptsetup-token-systemd-pkcs11.c
-                cryptsetup-token.h
-                cryptsetup-token-util.h
-                cryptsetup-token-util.c
-                luks2-pkcs11.c
-                luks2-pkcs11.h
-        '''.split())
-
-        cryptsetup_token_systemd_pkcs11_static = static_library(
-                'cryptsetup-token-systemd-pkcs11_static',
-                cryptsetup_token_systemd_pkcs11_sources,
-                include_directories : includes,
-                dependencies : libshared_deps + [libcryptsetup, versiondep],
-                c_args : cryptsetup_token_c_args)
-endif
-
-endif
+modules += [
+        template + {
+                'name' : 'cryptsetup-token-systemd-tpm2',
+                'conditions' : [
+                        'HAVE_LIBCRYPTSETUP_PLUGINS',
+                        'HAVE_TPM2',
+                ],
+                'sources' : cryptsetup_token_systemd_tpm2_sources,
+                'dependencies' : [
+                        libcryptsetup,
+                        tpm2,
+                ],
+        },
+        template + {
+                'name' : 'cryptsetup-token-systemd-fido2',
+                'conditions' : [
+                        'HAVE_LIBCRYPTSETUP_PLUGINS',
+                        'HAVE_LIBFIDO2',
+                ],
+                'sources' : cryptsetup_token_systemd_fido2_sources,
+                'dependencies' : [
+                        libcryptsetup,
+                        libfido2,
+                ],
+        },
+        template + {
+                'name' : 'cryptsetup-token-systemd-pkcs11',
+                'conditions' : [
+                        'HAVE_LIBCRYPTSETUP_PLUGINS',
+                        'HAVE_P11KIT',
+                ],
+                'sources' : cryptsetup_token_systemd_pkcs11_sources,
+                'dependencies' : [
+                        libcryptsetup,
+                        libp11kit_cflags,
+                ],
+        },
+]

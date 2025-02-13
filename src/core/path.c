@@ -10,6 +10,7 @@
 #include "dbus-path.h"
 #include "dbus-unit.h"
 #include "escape.h"
+#include "event-util.h"
 #include "fd-util.h"
 #include "glob-util.h"
 #include "inotify-util.h"
@@ -26,10 +27,10 @@
 #include "unit.h"
 
 static const UnitActiveState state_translation_table[_PATH_STATE_MAX] = {
-        [PATH_DEAD] = UNIT_INACTIVE,
+        [PATH_DEAD]    = UNIT_INACTIVE,
         [PATH_WAITING] = UNIT_ACTIVE,
         [PATH_RUNNING] = UNIT_ACTIVE,
-        [PATH_FAILED] = UNIT_FAILED,
+        [PATH_FAILED]  = UNIT_FAILED,
 };
 
 static int path_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata);
@@ -80,7 +81,7 @@ int path_spec_watch(PathSpec *s, sd_event_io_handler_t handler) {
                         tmp = *cut;
                         *cut = '\0';
 
-                        flags = IN_MOVE_SELF | IN_DELETE_SELF | IN_ATTRIB | IN_CREATE | IN_MOVED_TO;
+                        flags = IN_MOVE_SELF | IN_DELETE_SELF | IN_CREATE | IN_MOVED_TO;
                 } else {
                         cut = NULL;
                         flags = flags_table[s->type];
@@ -89,7 +90,7 @@ int path_spec_watch(PathSpec *s, sd_event_io_handler_t handler) {
                 /* If this is a symlink watch both the symlink inode and where it points to. If the inode is
                  * not a symlink both calls will install the same watch, which is redundant and doesn't
                  * hurt. */
-                for (int follow_symlink = 0; follow_symlink < 2; follow_symlink ++) {
+                for (int follow_symlink = 0; follow_symlink < 2; follow_symlink++) {
                         uint32_t f = flags;
 
                         SET_FLAG(f, IN_DONT_FOLLOW, !follow_symlink);
@@ -173,7 +174,6 @@ void path_spec_unwatch(PathSpec *s) {
 
 int path_spec_fd_event(PathSpec *s, uint32_t revents) {
         union inotify_event_buffer buffer;
-        struct inotify_event *e;
         ssize_t l;
 
         assert(s);
@@ -184,22 +184,26 @@ int path_spec_fd_event(PathSpec *s, uint32_t revents) {
 
         l = read(s->inotify_fd, &buffer, sizeof(buffer));
         if (l < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
+                if (ERRNO_IS_TRANSIENT(errno))
                         return 0;
 
                 return log_error_errno(errno, "Failed to read inotify event: %m");
         }
 
         if (IN_SET(s->type, PATH_CHANGED, PATH_MODIFIED))
-                FOREACH_INOTIFY_EVENT(e, buffer, l)
+                FOREACH_INOTIFY_EVENT_WARN(e, buffer, l)
                         if (s->primary_wd == e->wd)
                                 return 1;
 
         return 0;
 }
 
-static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_notify) {
+static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_notify, char **ret_trigger_path) {
+        _cleanup_free_ char *trigger = NULL;
         bool b, good = false;
+
+        assert(s);
+        assert(ret_trigger_path);
 
         switch (s->type) {
 
@@ -208,14 +212,14 @@ static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_no
                 break;
 
         case PATH_EXISTS_GLOB:
-                good = glob_exists(s->path) > 0;
+                good = glob_first(s->path, &trigger) > 0;
                 break;
 
         case PATH_DIRECTORY_NOT_EMPTY: {
                 int k;
 
-                k = dir_is_empty(s->path);
-                good = !(k == -ENOENT || k > 0);
+                k = dir_is_empty(s->path, /* ignore_hidden_or_backup= */ true);
+                good = !(IN_SET(k, -ENOENT, -ENOTDIR) || k > 0);
                 break;
         }
 
@@ -230,11 +234,22 @@ static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_no
                 ;
         }
 
+        if (good) {
+                if (!trigger) {
+                        trigger = strdup(s->path);
+                        if (!trigger)
+                                (void) log_oom_debug();
+                }
+                *ret_trigger_path = TAKE_PTR(trigger);
+        }
+
         return good;
 }
 
 static void path_spec_mkdir(PathSpec *s, mode_t mode) {
         int r;
+
+        assert(s);
 
         if (IN_SET(s->type, PATH_EXISTS, PATH_EXISTS_GLOB))
                 return;
@@ -247,24 +262,29 @@ static void path_spec_mkdir(PathSpec *s, mode_t mode) {
 static void path_spec_dump(PathSpec *s, FILE *f, const char *prefix) {
         const char *type;
 
+        assert(s);
+        assert(f);
+        assert(prefix);
+
         assert_se(type = path_type_to_string(s->type));
         fprintf(f, "%s%s: %s\n", prefix, type, s->path);
 }
 
 void path_spec_done(PathSpec *s) {
         assert(s);
-        assert(s->inotify_fd == -1);
+        assert(s->inotify_fd == -EBADF);
 
         free(s->path);
 }
 
 static void path_init(Unit *u) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
 
-        assert(u);
         assert(u->load_state == UNIT_STUB);
 
         p->directory_mode = 0755;
+
+        p->trigger_limit = RATELIMIT_OFF;
 }
 
 void path_free_specs(Path *p) {
@@ -272,30 +292,27 @@ void path_free_specs(Path *p) {
 
         assert(p);
 
-        while ((s = p->specs)) {
+        while ((s = LIST_POP(spec, p->specs))) {
                 path_spec_unwatch(s);
-                LIST_REMOVE(spec, p->specs, s);
                 path_spec_done(s);
                 free(s);
         }
 }
 
 static void path_done(Unit *u) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
 
-        assert(p);
-
+        p->trigger_notify_event_source = sd_event_source_disable_unref(p->trigger_notify_event_source);
         path_free_specs(p);
 }
 
 static int path_add_mount_dependencies(Path *p) {
-        PathSpec *s;
         int r;
 
         assert(p);
 
         LIST_FOREACH(spec, s, p->specs) {
-                r = unit_require_mounts_for(UNIT(p), s->path, UNIT_DEPENDENCY_FILE);
+                r = unit_add_mounts_for(UNIT(p), s->path, UNIT_DEPENDENCY_FILE, UNIT_MOUNT_REQUIRES);
                 if (r < 0)
                         return r;
         }
@@ -353,6 +370,16 @@ static int path_add_trigger_dependencies(Path *p) {
 static int path_add_extras(Path *p) {
         int r;
 
+        assert(p);
+
+        /* To avoid getting pid1 in a busy-loop state (eg: unmet condition on associated service),
+         * set a default trigger limit if the user didn't specify any. */
+        if (p->trigger_limit.interval == USEC_INFINITY)
+                p->trigger_limit.interval = 2 * USEC_PER_SEC;
+
+        if (p->trigger_limit.burst == UINT_MAX)
+                p->trigger_limit.burst = 200;
+
         r = path_add_trigger_dependencies(p);
         if (r < 0)
                 return r;
@@ -365,10 +392,9 @@ static int path_add_extras(Path *p) {
 }
 
 static int path_load(Unit *u) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
         int r;
 
-        assert(u);
         assert(u->load_state == UNIT_STUB);
 
         r = unit_load_fragment_and_dropin(u, true);
@@ -386,12 +412,11 @@ static int path_load(Unit *u) {
 }
 
 static void path_dump(Unit *u, FILE *f, const char *prefix) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
         Unit *trigger;
-        PathSpec *s;
 
-        assert(p);
         assert(f);
+        assert(prefix);
 
         trigger = UNIT_TRIGGER(u);
 
@@ -400,20 +425,22 @@ static void path_dump(Unit *u, FILE *f, const char *prefix) {
                 "%sResult: %s\n"
                 "%sUnit: %s\n"
                 "%sMakeDirectory: %s\n"
-                "%sDirectoryMode: %04o\n",
+                "%sDirectoryMode: %04o\n"
+                "%sTriggerLimitIntervalSec: %s\n"
+                "%sTriggerLimitBurst: %u\n",
                 prefix, path_state_to_string(p->state),
                 prefix, path_result_to_string(p->result),
                 prefix, trigger ? trigger->id : "n/a",
                 prefix, yes_no(p->make_directory),
-                prefix, p->directory_mode);
+                prefix, p->directory_mode,
+                prefix, FORMAT_TIMESPAN(p->trigger_limit.interval, USEC_PER_SEC),
+                prefix, p->trigger_limit.burst);
 
         LIST_FOREACH(spec, s, p->specs)
                 path_spec_dump(s, f, prefix);
 }
 
 static void path_unwatch(Path *p) {
-        PathSpec *s;
-
         assert(p);
 
         LIST_FOREACH(spec, s, p->specs)
@@ -422,7 +449,6 @@ static void path_unwatch(Path *p) {
 
 static int path_watch(Path *p) {
         int r;
-        PathSpec *s;
 
         assert(p);
 
@@ -437,6 +463,7 @@ static int path_watch(Path *p) {
 
 static void path_set_state(Path *p, PathState state) {
         PathState old_state;
+
         assert(p);
 
         if (p->state != state)
@@ -451,15 +478,14 @@ static void path_set_state(Path *p, PathState state) {
         if (state != old_state)
                 log_unit_debug(UNIT(p), "Changed %s -> %s", path_state_to_string(old_state), path_state_to_string(state));
 
-        unit_notify(UNIT(p), state_translation_table[old_state], state_translation_table[state], 0);
+        unit_notify(UNIT(p), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
 }
 
 static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify);
 
 static int path_coldplug(Unit *u) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
 
-        assert(p);
         assert(p->state == PATH_DEAD);
 
         if (p->deserialized_state != p->state) {
@@ -480,12 +506,14 @@ static void path_enter_dead(Path *p, PathResult f) {
                 p->result = f;
 
         unit_log_result(UNIT(p), p->result == PATH_SUCCESS, path_result_to_string(p->result));
-        path_set_state(p, p->result == PATH_SUCCESS ? PATH_DEAD : PATH_FAILED);
+        path_set_state(p, p->result != PATH_SUCCESS ? PATH_FAILED : PATH_DEAD);
 }
 
-static void path_enter_running(Path *p) {
+static void path_enter_running(Path *p, char *trigger_path) {
+        _cleanup_(activation_details_unrefp) ActivationDetails *details = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         Unit *trigger;
+        Job *job;
         int r;
 
         assert(p);
@@ -494,16 +522,37 @@ static void path_enter_running(Path *p) {
         if (unit_stop_pending(UNIT(p)))
                 return;
 
-        trigger = UNIT_TRIGGER(UNIT(p));
-        if (!trigger) {
-                log_unit_error(UNIT(p), "Unit to trigger vanished.");
-                path_enter_dead(p, PATH_FAILURE_RESOURCES);
+        if (!ratelimit_below(&p->trigger_limit)) {
+                log_unit_warning(UNIT(p), "Trigger limit hit, refusing further activation.");
+                path_enter_dead(p, PATH_FAILURE_TRIGGER_LIMIT_HIT);
                 return;
         }
 
-        r = manager_add_job(UNIT(p)->manager, JOB_START, trigger, JOB_REPLACE, NULL, &error, NULL);
-        if (r < 0)
+        trigger = UNIT_TRIGGER(UNIT(p));
+        if (!trigger) {
+                log_unit_error(UNIT(p), "Unit to trigger vanished.");
                 goto fail;
+        }
+
+        details = activation_details_new(UNIT(p));
+        if (!details) {
+                log_oom();
+                goto fail;
+        }
+
+        r = free_and_strdup(&(ACTIVATION_DETAILS_PATH(details))->trigger_path_filename, trigger_path);
+        if (r < 0) {
+                log_oom();
+                goto fail;
+        }
+
+        r = manager_add_job(UNIT(p)->manager, JOB_START, trigger, JOB_REPLACE, &error, &job);
+        if (r < 0) {
+                log_unit_warning(UNIT(p), "Failed to queue unit startup job: %s", bus_error_message(&error, r));
+                goto fail;
+        }
+
+        job_set_activation_details(job, details);
 
         path_set_state(p, PATH_RUNNING);
         path_unwatch(p);
@@ -511,65 +560,63 @@ static void path_enter_running(Path *p) {
         return;
 
 fail:
-        log_unit_warning(UNIT(p), "Failed to queue unit startup job: %s", bus_error_message(&error, r));
         path_enter_dead(p, PATH_FAILURE_RESOURCES);
 }
 
-static bool path_check_good(Path *p, bool initial, bool from_trigger_notify) {
-        PathSpec *s;
-
+static bool path_check_good(Path *p, bool initial, bool from_trigger_notify, char **ret_trigger_path) {
         assert(p);
+        assert(ret_trigger_path);
 
         LIST_FOREACH(spec, s, p->specs)
-                if (path_spec_check_good(s, initial, from_trigger_notify))
+                if (path_spec_check_good(s, initial, from_trigger_notify, ret_trigger_path))
                         return true;
 
         return false;
 }
 
 static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify) {
+        _cleanup_free_ char *trigger_path = NULL;
         Unit *trigger;
         int r;
 
+        if (p->trigger_notify_event_source)
+                (void) event_source_disable(p->trigger_notify_event_source);
+
         /* If the triggered unit is already running, so are we */
         trigger = UNIT_TRIGGER(UNIT(p));
-        if (trigger && !UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(trigger))) {
+        if (trigger && !UNIT_IS_INACTIVE_OR_DEACTIVATING(unit_active_state(trigger))) {
                 path_set_state(p, PATH_RUNNING);
                 path_unwatch(p);
                 return;
         }
 
-        if (path_check_good(p, initial, from_trigger_notify)) {
-                log_unit_debug(UNIT(p), "Got triggered.");
-                path_enter_running(p);
+        if (path_check_good(p, initial, from_trigger_notify, &trigger_path)) {
+                log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
+                path_enter_running(p, trigger_path);
                 return;
         }
 
         r = path_watch(p);
-        if (r < 0)
-                goto fail;
+        if (r < 0) {
+                log_unit_warning_errno(UNIT(p), r, "Failed to enter waiting state: %m");
+                path_enter_dead(p, PATH_FAILURE_RESOURCES);
+                return;
+        }
 
         /* Hmm, so now we have created inotify watches, but the file
          * might have appeared/been removed by now, so we must
          * recheck */
 
-        if (path_check_good(p, false, from_trigger_notify)) {
-                log_unit_debug(UNIT(p), "Got triggered.");
-                path_enter_running(p);
+        if (path_check_good(p, false, from_trigger_notify, &trigger_path)) {
+                log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
+                path_enter_running(p, trigger_path);
                 return;
         }
 
         path_set_state(p, PATH_WAITING);
-        return;
-
-fail:
-        log_unit_warning_errno(UNIT(p), r, "Failed to enter waiting state: %m");
-        path_enter_dead(p, PATH_FAILURE_RESOURCES);
 }
 
 static void path_mkdir(Path *p) {
-        PathSpec *s;
-
         assert(p);
 
         if (!p->make_directory)
@@ -580,10 +627,9 @@ static void path_mkdir(Path *p) {
 }
 
 static int path_start(Unit *u) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
         int r;
 
-        assert(p);
         assert(IN_SET(p->state, PATH_DEAD, PATH_FAILED));
 
         r = unit_test_trigger_loaded(u);
@@ -603,9 +649,8 @@ static int path_start(Unit *u) {
 }
 
 static int path_stop(Unit *u) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
 
-        assert(p);
         assert(IN_SET(p->state, PATH_WAITING, PATH_RUNNING));
 
         path_enter_dead(p, PATH_SUCCESS);
@@ -613,10 +658,8 @@ static int path_stop(Unit *u) {
 }
 
 static int path_serialize(Unit *u, FILE *f, FDSet *fds) {
-        Path *p = PATH(u);
-        PathSpec *s;
+        Path *p = ASSERT_PTR(PATH(u));
 
-        assert(u);
         assert(f);
         assert(fds);
 
@@ -638,13 +681,14 @@ static int path_serialize(Unit *u, FILE *f, FDSet *fds) {
                                              escaped);
         }
 
+        (void) serialize_ratelimit(f, "trigger-ratelimit", &p->trigger_limit);
+
         return 0;
 }
 
 static int path_deserialize_item(Unit *u, const char *key, const char *value, FDSet *fds) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
 
-        assert(u);
         assert(key);
         assert(value);
         assert(fds);
@@ -677,7 +721,6 @@ static int path_deserialize_item(Unit *u, const char *key, const char *value, FD
                         _cleanup_free_ char *unescaped = NULL;
                         ssize_t l;
                         PathType type;
-                        PathSpec *s;
 
                         type = path_type_from_string(type_str);
                         if (type < 0) {
@@ -700,55 +743,54 @@ static int path_deserialize_item(Unit *u, const char *key, const char *value, FD
                                 }
                 }
 
-        } else
+        } else if (streq(key, "trigger-ratelimit"))
+                deserialize_ratelimit(&p->trigger_limit, key, value);
+
+        else
                 log_unit_debug(u, "Unknown serialization key: %s", key);
 
         return 0;
 }
 
-_pure_ static UnitActiveState path_active_state(Unit *u) {
-        assert(u);
+static UnitActiveState path_active_state(Unit *u) {
+        Path *p = ASSERT_PTR(PATH(u));
 
-        return state_translation_table[PATH(u)->state];
+        return state_translation_table[p->state];
 }
 
-_pure_ static const char *path_sub_state_to_string(Unit *u) {
-        assert(u);
+static const char *path_sub_state_to_string(Unit *u) {
+        Path *p = ASSERT_PTR(PATH(u));
 
-        return path_state_to_string(PATH(u)->state);
+        return path_state_to_string(p->state);
 }
 
 static int path_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        PathSpec *s = userdata;
-        Path *p;
+        PathSpec *s = ASSERT_PTR(userdata), *found = NULL;
+        Path *p = ASSERT_PTR(PATH(s->unit));
         int changed;
 
-        assert(s);
-        assert(s->unit);
         assert(fd >= 0);
-
-        p = PATH(s->unit);
 
         if (!IN_SET(p->state, PATH_WAITING, PATH_RUNNING))
                 return 0;
 
-        /* log_debug("inotify wakeup on %s.", UNIT(p)->id); */
-
-        LIST_FOREACH(spec, s, p->specs)
-                if (path_spec_owns_inotify_fd(s, fd))
+        LIST_FOREACH(spec, i, p->specs)
+                if (path_spec_owns_inotify_fd(i, fd)) {
+                        found = i;
                         break;
+                }
 
-        if (!s) {
+        if (!found) {
                 log_error("Got event on unknown fd.");
                 goto fail;
         }
 
-        changed = path_spec_fd_event(s, revents);
+        changed = path_spec_fd_event(found, revents);
         if (changed < 0)
                 goto fail;
 
         if (changed)
-                path_enter_running(p);
+                path_enter_running(p, found->path);
         else
                 path_enter_waiting(p, false, false);
 
@@ -759,10 +801,29 @@ fail:
         return 0;
 }
 
-static void path_trigger_notify(Unit *u, Unit *other) {
-        Path *p = PATH(u);
+static void path_trigger_notify_impl(Unit *u, Unit *other, bool on_defer);
 
-        assert(u);
+static int path_trigger_notify_on_defer(sd_event_source *s, void *userdata) {
+        Path *p = ASSERT_PTR(userdata);
+        Unit *trigger;
+
+        assert(s);
+
+        trigger = UNIT_TRIGGER(UNIT(p));
+        if (!trigger) {
+                log_unit_error(UNIT(p), "Unit to trigger vanished.");
+                path_enter_dead(p, PATH_FAILURE_RESOURCES);
+                return 0;
+        }
+
+        path_trigger_notify_impl(UNIT(p), trigger, /* on_defer = */ true);
+        return 0;
+}
+
+static void path_trigger_notify_impl(Unit *u, Unit *other, bool on_defer) {
+        Path *p = ASSERT_PTR(PATH(u));
+        int r;
+
         assert(other);
 
         /* Invoked whenever the unit we trigger changes state or gains or loses a job */
@@ -780,30 +841,56 @@ static void path_trigger_notify(Unit *u, Unit *other) {
                 return;
         }
 
-        if (unit_has_failed_condition_or_assert(other)) {
-                path_enter_dead(p, PATH_FAILURE_UNIT_CONDITION_FAILED);
-                return;
-        }
-
         /* Don't propagate anything if there's still a job queued */
         if (other->job)
                 return;
 
         if (p->state == PATH_RUNNING &&
-            UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(other))) {
-                log_unit_debug(UNIT(p), "Got notified about unit deactivation.");
-                path_enter_waiting(p, false, true);
+            UNIT_IS_INACTIVE_OR_DEACTIVATING(unit_active_state(other))) {
+                if (!on_defer)
+                        log_unit_debug(u, "Got notified about unit deactivation.");
         } else if (p->state == PATH_WAITING &&
-                   !UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(other))) {
-                log_unit_debug(UNIT(p), "Got notified about unit activation.");
-                path_enter_waiting(p, false, true);
+                   !UNIT_IS_INACTIVE_OR_DEACTIVATING(unit_active_state(other))) {
+                if (!on_defer)
+                        log_unit_debug(u, "Got notified about unit activation.");
+        } else
+                return;
+
+        if (on_defer) {
+                path_enter_waiting(p, /* initial = */ false, /* from_trigger_notify = */ true);
+                return;
+        }
+
+        /* Do not call path_enter_waiting() directly from path_trigger_notify(), as this may be called by
+         * job_install() -> job_finish_and_invalidate() -> unit_trigger_notify(), and path_enter_waiting()
+         * may install another job and will trigger assertion in job_install().
+         * https://github.com/systemd/systemd/issues/24577#issuecomment-1522628906
+         * Hence, first setup defer event source here, and call path_enter_waiting() slightly later. */
+        if (p->trigger_notify_event_source) {
+                r = sd_event_source_set_enabled(p->trigger_notify_event_source, SD_EVENT_ONESHOT);
+                if (r < 0) {
+                        log_unit_warning_errno(u, r, "Failed to enable event source for triggering notify: %m");
+                        path_enter_dead(p, PATH_FAILURE_RESOURCES);
+                        return;
+                }
+        } else {
+                r = sd_event_add_defer(u->manager->event, &p->trigger_notify_event_source, path_trigger_notify_on_defer, p);
+                if (r < 0) {
+                        log_unit_warning_errno(u, r, "Failed to allocate event source for triggering notify: %m");
+                        path_enter_dead(p, PATH_FAILURE_RESOURCES);
+                        return;
+                }
+
+                (void) sd_event_source_set_description(p->trigger_notify_event_source, "path-trigger-notify");
         }
 }
 
-static void path_reset_failed(Unit *u) {
-        Path *p = PATH(u);
+static void path_trigger_notify(Unit *u, Unit *other) {
+        path_trigger_notify_impl(u, other, /* on_defer = */ false);
+}
 
-        assert(p);
+static void path_reset_failed(Unit *u) {
+        Path *p = ASSERT_PTR(PATH(u));
 
         if (p->state == PATH_FAILED)
                 path_set_state(p, PATH_DEAD);
@@ -812,10 +899,8 @@ static void path_reset_failed(Unit *u) {
 }
 
 static int path_can_start(Unit *u) {
-        Path *p = PATH(u);
+        Path *p = ASSERT_PTR(PATH(u));
         int r;
-
-        assert(p);
 
         r = unit_test_start_limit(u);
         if (r < 0) {
@@ -824,6 +909,81 @@ static int path_can_start(Unit *u) {
         }
 
         return 1;
+}
+
+static void activation_details_path_done(ActivationDetails *details) {
+        ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
+
+        p->trigger_path_filename = mfree(p->trigger_path_filename);
+}
+
+static void activation_details_path_serialize(ActivationDetails *details, FILE *f) {
+        ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
+
+        assert(f);
+
+        if (p->trigger_path_filename)
+                (void) serialize_item(f, "activation-details-path-filename", p->trigger_path_filename);
+}
+
+static int activation_details_path_deserialize(const char *key, const char *value, ActivationDetails **details) {
+        int r;
+
+        assert(key);
+        assert(value);
+
+        if (!details || !*details)
+                return -EINVAL;
+
+        ActivationDetailsPath *p = ACTIVATION_DETAILS_PATH(*details);
+        if (!p)
+                return -EINVAL;
+
+        if (!streq(key, "activation-details-path-filename"))
+                return -EINVAL;
+
+        r = free_and_strdup(&p->trigger_path_filename, value);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+static int activation_details_path_append_env(ActivationDetails *details, char ***strv) {
+        ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
+        char *s;
+        int r;
+
+        assert(strv);
+
+        if (isempty(p->trigger_path_filename))
+                return 0;
+
+        s = strjoin("TRIGGER_PATH=", p->trigger_path_filename);
+        if (!s)
+                return -ENOMEM;
+
+        r = strv_consume(strv, TAKE_PTR(s));
+        if (r < 0)
+                return r;
+
+        return 1; /* Return the number of variables added to the env block */
+}
+
+static int activation_details_path_append_pair(ActivationDetails *details, char ***strv) {
+        ActivationDetailsPath *p = ASSERT_PTR(ACTIVATION_DETAILS_PATH(details));
+        int r;
+
+        assert(strv);
+
+        if (isempty(p->trigger_path_filename))
+                return 0;
+
+        r = strv_extend_many(strv, "trigger_path", p->trigger_path_filename);
+        if (r < 0)
+                return r;
+
+        return 1; /* Return the number of pairs added to the env block */
 }
 
 static const char* const path_type_table[_PATH_TYPE_MAX] = {
@@ -837,11 +997,11 @@ static const char* const path_type_table[_PATH_TYPE_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP(path_type, PathType);
 
 static const char* const path_result_table[_PATH_RESULT_MAX] = {
-        [PATH_SUCCESS]                       = "success",
-        [PATH_FAILURE_RESOURCES]             = "resources",
-        [PATH_FAILURE_START_LIMIT_HIT]       = "start-limit-hit",
-        [PATH_FAILURE_UNIT_START_LIMIT_HIT]  = "unit-start-limit-hit",
-        [PATH_FAILURE_UNIT_CONDITION_FAILED] = "unit-condition-failed",
+        [PATH_SUCCESS]                      = "success",
+        [PATH_FAILURE_RESOURCES]            = "resources",
+        [PATH_FAILURE_START_LIMIT_HIT]      = "start-limit-hit",
+        [PATH_FAILURE_UNIT_START_LIMIT_HIT] = "unit-start-limit-hit",
+        [PATH_FAILURE_TRIGGER_LIMIT_HIT]    = "trigger-limit-hit",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(path_result, PathResult);
@@ -883,4 +1043,14 @@ const UnitVTable path_vtable = {
         .bus_set_property = bus_path_set_property,
 
         .can_start = path_can_start,
+};
+
+const ActivationDetailsVTable activation_details_path_vtable = {
+        .object_size = sizeof(ActivationDetailsPath),
+
+        .done = activation_details_path_done,
+        .serialize = activation_details_path_serialize,
+        .deserialize = activation_details_path_deserialize,
+        .append_env = activation_details_path_append_env,
+        .append_pair = activation_details_path_append_pair,
 };

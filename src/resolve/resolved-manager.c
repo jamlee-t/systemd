@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <linux/ipv6.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -11,13 +12,18 @@
 #include "af-list.h"
 #include "alloc-util.h"
 #include "bus-polkit.h"
+#include "daemon-util.h"
 #include "dirent-util.h"
 #include "dns-domain.h"
+#include "event-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "hostname-util.h"
 #include "idn-util.h"
 #include "io-util.h"
+#include "iovec-util.h"
+#include "json-util.h"
+#include "memstream-util.h"
 #include "missing_network.h"
 #include "missing_socket.h"
 #include "netlink-util.h"
@@ -39,17 +45,17 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "utf8.h"
+#include "varlink-util.h"
 
 #define SEND_TIMEOUT_USEC (200 * USEC_PER_MSEC)
 
 static int manager_process_link(sd_netlink *rtnl, sd_netlink_message *mm, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         uint16_t type;
         Link *l;
         int ifindex, r;
 
         assert(rtnl);
-        assert(m);
         assert(mm);
 
         r = sd_netlink_message_get_type(mm, &type);
@@ -92,10 +98,21 @@ static int manager_process_link(sd_netlink *rtnl, sd_netlink_message *mm, void *
                         log_debug("Removing link %i/%s", l->ifindex, l->ifname);
                         link_remove_user(l);
                         link_free(l);
+
+                        /* Make sure DNS servers are dropped from written resolv.conf if their link goes away */
+                        manager_write_resolv_conf(m);
                 }
 
                 break;
         }
+
+        /* Now check all the links, and if mDNS/llmr are disabled everywhere, stop them globally too. */
+        manager_llmnr_maybe_stop(m);
+        manager_mdns_maybe_stop(m);
+
+        /* The accessible flag on link DNS servers will have been reset by
+         * link_update(). Just reset the global DNS servers. */
+        (void) manager_send_dns_configuration_changed(m, NULL, /* reset= */ true);
 
         return 0;
 
@@ -105,8 +122,8 @@ fail:
 }
 
 static int manager_process_address(sd_netlink *rtnl, sd_netlink_message *mm, void *userdata) {
-        Manager *m = userdata;
-        union in_addr_union address;
+        Manager *m = ASSERT_PTR(userdata);
+        union in_addr_union address, broadcast = {};
         uint16_t type;
         int r, ifindex, family;
         LinkAddress *a;
@@ -114,7 +131,6 @@ static int manager_process_address(sd_netlink *rtnl, sd_netlink_message *mm, voi
 
         assert(rtnl);
         assert(mm);
-        assert(m);
 
         r = sd_netlink_message_get_type(mm, &type);
         if (r < 0)
@@ -135,6 +151,7 @@ static int manager_process_address(sd_netlink *rtnl, sd_netlink_message *mm, voi
         switch (family) {
 
         case AF_INET:
+                sd_netlink_message_read_in_addr(mm, IFA_BROADCAST, &broadcast.in);
                 r = sd_netlink_message_read_in_addr(mm, IFA_LOCAL, &address.in);
                 if (r < 0) {
                         r = sd_netlink_message_read_in_addr(mm, IFA_ADDRESS, &address.in);
@@ -165,7 +182,7 @@ static int manager_process_address(sd_netlink *rtnl, sd_netlink_message *mm, voi
         case RTM_NEWADDR:
 
                 if (!a) {
-                        r = link_address_new(l, &a, family, &address);
+                        r = link_address_new(l, &a, family, &address, &broadcast);
                         if (r < 0)
                                 return r;
                 }
@@ -181,6 +198,8 @@ static int manager_process_address(sd_netlink *rtnl, sd_netlink_message *mm, voi
                 break;
         }
 
+        (void) manager_send_dns_configuration_changed(m, l, /* reset= */ true);
+
         return 0;
 
 fail:
@@ -188,9 +207,40 @@ fail:
         return 0;
 }
 
+static int manager_process_route(sd_netlink *rtnl, sd_netlink_message *mm, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+        Link *l = NULL;
+        uint16_t type;
+        uint32_t ifindex = 0;
+        int r;
+
+        assert(rtnl);
+        assert(mm);
+
+        r = sd_netlink_message_get_type(mm, &type);
+        if (r < 0) {
+                log_warning_errno(r, "Failed not get message type, ignoring: %m");
+                return 0;
+        }
+
+        if (!IN_SET(type, RTM_NEWROUTE, RTM_DELROUTE)) {
+                log_warning("Unexpected message type %u when processing route, ignoring.", type);
+                return 0;
+        }
+
+        r = sd_netlink_message_read_u32(mm, RTA_OIF, &ifindex);
+        if (r < 0)
+                log_full_errno(r == -ENODATA ? LOG_DEBUG : LOG_WARNING, r, "Failed to get route ifindex, ignoring: %m");
+        else
+                l = hashmap_get(m->links, INT_TO_PTR(ifindex));
+
+        (void) manager_send_dns_configuration_changed(m, l, /* reset= */ true);
+
+        return 0;
+}
+
 static int manager_rtnl_listen(Manager *m) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL, *reply = NULL;
-        sd_netlink_message *i;
         int r;
 
         assert(m);
@@ -225,7 +275,7 @@ static int manager_rtnl_listen(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_request_dump(req, true);
+        r = sd_netlink_message_set_request_dump(req, true);
         if (r < 0)
                 return r;
 
@@ -233,7 +283,7 @@ static int manager_rtnl_listen(Manager *m) {
         if (r < 0)
                 return r;
 
-        for (i = reply; i; i = sd_netlink_message_next(i)) {
+        for (sd_netlink_message *i = reply; i; i = sd_netlink_message_next(i)) {
                 r = manager_process_link(m->rtnl, i, m);
                 if (r < 0)
                         return r;
@@ -247,7 +297,7 @@ static int manager_rtnl_listen(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_request_dump(req, true);
+        r = sd_netlink_message_set_request_dump(req, true);
         if (r < 0)
                 return r;
 
@@ -255,7 +305,7 @@ static int manager_rtnl_listen(Manager *m) {
         if (r < 0)
                 return r;
 
-        for (i = reply; i; i = sd_netlink_message_next(i)) {
+        for (sd_netlink_message *i = reply; i; i = sd_netlink_message_next(i)) {
                 r = manager_process_address(m->rtnl, i, m);
                 if (r < 0)
                         return r;
@@ -265,11 +315,9 @@ static int manager_rtnl_listen(Manager *m) {
 }
 
 static int on_network_event(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Link *l;
         int r;
-
-        assert(m);
 
         sd_network_monitor_flush(m->network_monitor);
 
@@ -281,7 +329,11 @@ static int on_network_event(sd_event_source *s, int fd, uint32_t revents, void *
 
         (void) manager_write_resolv_conf(m);
         (void) manager_send_changed(m, "DNS");
+        (void) manager_send_dns_configuration_changed(m, NULL, /* reset= */ true);
 
+        /* Now check all the links, and if mDNS/llmr are disabled everywhere, stop them globally too. */
+        manager_llmnr_maybe_stop(m);
+        manager_mdns_maybe_stop(m);
         return 0;
 }
 
@@ -318,9 +370,7 @@ static int manager_network_monitor_listen(Manager *m) {
 static int manager_clock_change_listen(Manager *m);
 
 static int on_clock_change(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
-
-        assert(m);
+        Manager *m = ASSERT_PTR(userdata);
 
         /* The clock has changed, let's flush all caches. Why that? That's because DNSSEC validation takes
          * the system clock into consideration, and if the clock changes the old validations might have been
@@ -338,27 +388,15 @@ static int on_clock_change(sd_event_source *source, int fd, uint32_t revents, vo
 }
 
 static int manager_clock_change_listen(Manager *m) {
-        _cleanup_close_ int fd = -1;
         int r;
 
         assert(m);
 
         m->clock_change_event_source = sd_event_source_disable_unref(m->clock_change_event_source);
 
-        fd = time_change_fd();
-        if (fd < 0)
-                return log_error_errno(fd, "Failed to allocate clock change timer fd: %m");
-
-        r = sd_event_add_io(m->event, &m->clock_change_event_source, fd, EPOLLIN, on_clock_change, m);
+        r = event_add_time_change(m->event, &m->clock_change_event_source, on_clock_change, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to create clock change event source: %m");
-
-        r = sd_event_source_set_io_fd_own(m->clock_change_event_source, true);
-        if (r < 0)
-                return log_error_errno(r, "Failed to pass ownership of clock fd to event source: %m");
-        TAKE_FD(fd);
-
-        (void) sd_event_source_set_description(m->clock_change_event_source, "clock-change");
 
         return 0;
 }
@@ -403,7 +441,7 @@ static char* fallback_hostname(void) {
 
 static int make_fallback_hostnames(char **full_hostname, char **llmnr_hostname, char **mdns_hostname) {
         _cleanup_free_ char *h = NULL, *n = NULL, *m = NULL;
-        char label[DNS_LABEL_MAX];
+        char label[DNS_LABEL_MAX+1];
         const char *p;
         int r;
 
@@ -438,11 +476,9 @@ static int make_fallback_hostnames(char **full_hostname, char **llmnr_hostname, 
 
 static int on_hostname_change(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
         _cleanup_free_ char *full_hostname = NULL, *llmnr_hostname = NULL, *mdns_hostname = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         bool llmnr_hostname_changed;
         int r;
-
-        assert(m);
 
         r = determine_hostnames(&full_hostname, &llmnr_hostname, &mdns_hostname);
         if (r < 0) {
@@ -511,19 +547,15 @@ static int manager_watch_hostname(Manager *m) {
 }
 
 static int manager_sigusr1(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
-        _cleanup_free_ char *buffer = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
-        Manager *m = userdata;
-        DnsServer *server;
-        size_t size = 0;
-        DnsScope *scope;
+        _cleanup_(memstream_done) MemStream ms = {};
+        Manager *m = ASSERT_PTR(userdata);
         Link *l;
+        FILE *f;
 
         assert(s);
         assert(si);
-        assert(m);
 
-        f = open_memstream_unlocked(&buffer, &size);
+        f = memstream_init(&ms);
         if (!f)
                 return log_oom();
 
@@ -538,19 +570,14 @@ static int manager_sigusr1(sd_event_source *s, const struct signalfd_siginfo *si
                 LIST_FOREACH(servers, server, l->dns_servers)
                         dns_server_dump(server, f);
 
-        if (fflush_and_check(f) < 0)
-                return log_oom();
-
-        log_dump(LOG_INFO, buffer);
-        return 0;
+        return memstream_dump(LOG_INFO, &ms);
 }
 
 static int manager_sigusr2(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
         assert(s);
         assert(si);
-        assert(m);
 
         manager_flush_caches(m, LOG_INFO);
 
@@ -558,13 +585,103 @@ static int manager_sigusr2(sd_event_source *s, const struct signalfd_siginfo *si
 }
 
 static int manager_sigrtmin1(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
         assert(s);
         assert(si);
-        assert(m);
 
         manager_reset_server_features(m);
+        return 0;
+}
+
+static int manager_memory_pressure(sd_event_source *s, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+
+        log_info("Under memory pressure, flushing caches.");
+
+        manager_flush_caches(m, LOG_INFO);
+        sd_event_trim_memory();
+
+        return 0;
+}
+
+static int manager_memory_pressure_listen(Manager *m) {
+        int r;
+
+        assert(m);
+
+        r = sd_event_add_memory_pressure(m->event, NULL, manager_memory_pressure, m);
+        if (r < 0)
+                log_full_errno(ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_PRIVILEGE(r) || (r == -EHOSTDOWN )? LOG_DEBUG : LOG_NOTICE, r,
+                               "Failed to install memory pressure event source, ignoring: %m");
+
+        return 0;
+}
+
+static void manager_set_defaults(Manager *m) {
+        assert(m);
+
+        m->llmnr_support = DEFAULT_LLMNR_MODE;
+        m->mdns_support = DEFAULT_MDNS_MODE;
+        m->dnssec_mode = DEFAULT_DNSSEC_MODE;
+        m->dns_over_tls_mode = DEFAULT_DNS_OVER_TLS_MODE;
+        m->enable_cache = DNS_CACHE_MODE_YES;
+        m->dns_stub_listener_mode = DNS_STUB_LISTENER_YES;
+        m->read_etc_hosts = true;
+        m->resolve_unicast_single_label = false;
+        m->cache_from_localhost = false;
+        m->stale_retention_usec = 0;
+}
+
+static int manager_dispatch_reload_signal(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+        int r;
+
+        (void) notify_reloading();
+
+        manager_set_defaults(m);
+
+        dns_server_unlink_on_reload(m->dns_servers);
+        dns_server_unlink_on_reload(m->fallback_dns_servers);
+        m->dns_extra_stub_listeners = ordered_set_free(m->dns_extra_stub_listeners);
+        dnssd_service_clear_on_reload(m->dnssd_services);
+        m->unicast_scope = dns_scope_free(m->unicast_scope);
+
+        dns_trust_anchor_flush(&m->trust_anchor);
+
+        r = dns_trust_anchor_load(&m->trust_anchor);
+        if (r < 0)
+                return r;
+
+        r = manager_parse_config_file(m);
+        if (r < 0)
+                log_warning_errno(r, "Failed to parse config file on reload: %m");
+        else
+                log_info("Config file reloaded.");
+
+        r = dnssd_load(m);
+        if (r < 0)
+                log_warning_errno(r, "Failed to load DNS-SD configuration files: %m");
+
+        /* The default scope configuration is influenced by the manager's configuration (modes, etc.), so
+         * recreate it on reload. */
+        r = dns_scope_new(m, &m->unicast_scope, NULL, DNS_PROTOCOL_DNS, AF_UNSPEC);
+        if (r < 0)
+                return r;
+
+        /* The configuration has changed, so reload the per-interface configuration too in order to take
+         * into account any changes (e.g.: enable/disable DNSSEC). */
+        r = on_network_event(/* sd_event_source= */ NULL, -EBADF, /* revents= */ 0, m);
+        if (r < 0)
+                log_warning_errno(r, "Failed to update network information: %m");
+
+        /* We have new configuration, which means potentially new servers, so close all connections and drop
+         * all caches, so that we can start fresh. */
+        (void) dns_stream_disconnect_all(m);
+        manager_flush_caches(m, LOG_INFO);
+        manager_verify_all(m);
+
+        (void) sd_notify(/* unset= */ false, NOTIFY_READY);
         return 0;
 }
 
@@ -579,25 +696,23 @@ int manager_new(Manager **ret) {
                 return -ENOMEM;
 
         *m = (Manager) {
-                .llmnr_ipv4_udp_fd = -1,
-                .llmnr_ipv6_udp_fd = -1,
-                .llmnr_ipv4_tcp_fd = -1,
-                .llmnr_ipv6_tcp_fd = -1,
-                .mdns_ipv4_fd = -1,
-                .mdns_ipv6_fd = -1,
-                .hostname_fd = -1,
+                .llmnr_ipv4_udp_fd = -EBADF,
+                .llmnr_ipv6_udp_fd = -EBADF,
+                .llmnr_ipv4_tcp_fd = -EBADF,
+                .llmnr_ipv6_tcp_fd = -EBADF,
+                .mdns_ipv4_fd = -EBADF,
+                .mdns_ipv6_fd = -EBADF,
+                .hostname_fd = -EBADF,
 
-                .llmnr_support = DEFAULT_LLMNR_MODE,
-                .mdns_support = DEFAULT_MDNS_MODE,
-                .dnssec_mode = DEFAULT_DNSSEC_MODE,
-                .dns_over_tls_mode = DEFAULT_DNS_OVER_TLS_MODE,
-                .enable_cache = DNS_CACHE_MODE_YES,
-                .dns_stub_listener_mode = DNS_STUB_LISTENER_YES,
                 .read_resolv_conf = true,
                 .need_builtin_fallbacks = true,
                 .etc_hosts_last = USEC_INFINITY,
-                .read_etc_hosts = true,
+
+                .sigrtmin18_info.memory_pressure_handler = manager_memory_pressure,
+                .sigrtmin18_info.memory_pressure_userdata = m,
         };
+
+        manager_set_defaults(m);
 
         r = dns_trust_anchor_load(&m->trust_anchor);
         if (r < 0)
@@ -617,8 +732,9 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 return r;
 
-        (void) sd_event_add_signal(m->event, NULL, SIGTERM, NULL,  NULL);
-        (void) sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(m->event, true);
+        if (r < 0)
+                return r;
 
         (void) sd_event_set_watchdog(m->event, true);
 
@@ -646,13 +762,33 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 return r;
 
+        r = manager_memory_pressure_listen(m);
+        if (r < 0)
+                return r;
+
         r = manager_connect_bus(m);
         if (r < 0)
                 return r;
 
-        (void) sd_event_add_signal(m->event, &m->sigusr1_event_source, SIGUSR1, manager_sigusr1, m);
-        (void) sd_event_add_signal(m->event, &m->sigusr2_event_source, SIGUSR2, manager_sigusr2, m);
-        (void) sd_event_add_signal(m->event, &m->sigrtmin1_event_source, SIGRTMIN+1, manager_sigrtmin1, m);
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, SIGHUP | SD_EVENT_SIGNAL_PROCMASK, manager_dispatch_reload_signal, m);
+        if (r < 0)
+                return log_debug_errno(r, "Failed install SIGHUP handler: %m");
+
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, SIGUSR1 | SD_EVENT_SIGNAL_PROCMASK, manager_sigusr1, m);
+        if (r < 0)
+                return log_debug_errno(r, "Failed install SIGUSR1 handler: %m");
+
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, SIGUSR2 | SD_EVENT_SIGNAL_PROCMASK, manager_sigusr2, m);
+        if (r < 0)
+                return log_debug_errno(r, "Failed install SIGUSR2 handler: %m");
+
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, (SIGRTMIN+1) | SD_EVENT_SIGNAL_PROCMASK, manager_sigrtmin1, m);
+        if (r < 0)
+                return log_debug_errno(r, "Failed install SIGRTMIN+1 handler: %m");
+
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, (SIGRTMIN+18) | SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, &m->sigrtmin18_info);
+        if (r < 0)
+                return log_debug_errno(r, "Failed install SIGRTMIN+18 handler: %m");
 
         manager_cleanup_saved_user(m);
 
@@ -707,15 +843,20 @@ Manager *manager_free(Manager *m) {
         dnstls_manager_free(m);
 #endif
 
+        set_free(m->refuse_record_types);
         hashmap_free(m->links);
         hashmap_free(m->dns_transactions);
 
         sd_event_source_unref(m->network_event_source);
         sd_network_monitor_unref(m->network_monitor);
 
+        sd_netlink_slot_unref(m->netlink_new_route_slot);
+        sd_netlink_slot_unref(m->netlink_del_route_slot);
         sd_netlink_unref(m->rtnl);
         sd_event_source_unref(m->rtnl_event_source);
         sd_event_source_unref(m->clock_change_event_source);
+
+        sd_json_variant_unref(m->dns_configuration_json);
 
         manager_llmnr_stop(m);
         manager_mdns_stop(m);
@@ -726,13 +867,9 @@ Manager *manager_free(Manager *m) {
 
         ordered_set_free(m->dns_extra_stub_listeners);
 
-        bus_verify_polkit_async_registry_free(m->polkit_registry);
+        hashmap_free(m->polkit_registry);
 
         sd_bus_flush_close_unref(m->bus);
-
-        sd_event_source_unref(m->sigusr1_event_source);
-        sd_event_source_unref(m->sigusr2_event_source);
-        sd_event_source_unref(m->sigrtmin1_event_source);
 
         dns_resource_key_unref(m->llmnr_host_ipv4_key);
         dns_resource_key_unref(m->llmnr_host_ipv6_key);
@@ -792,12 +929,10 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
         iov = IOVEC_MAKE(DNS_PACKET_DATA(p), p->allocated);
 
         l = recvmsg_safe(fd, &mh, 0);
-        if (IN_SET(l, -EAGAIN, -EINTR))
+        if (ERRNO_IS_NEG_TRANSIENT(l))
                 return 0;
         if (l <= 0)
                 return l;
-
-        assert(!(mh.msg_flags & MSG_TRUNC));
 
         p->size = (size_t) l;
 
@@ -813,7 +948,7 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
         } else
                 return -EAFNOSUPPORT;
 
-        p->timestamp = now(clock_boottime_or_monotonic());
+        p->timestamp = now(CLOCK_BOOTTIME);
 
         CMSG_FOREACH(cmsg, &mh) {
 
@@ -823,7 +958,7 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
                         switch (cmsg->cmsg_type) {
 
                         case IPV6_PKTINFO: {
-                                struct in6_pktinfo *i = (struct in6_pktinfo*) CMSG_DATA(cmsg);
+                                struct in6_pktinfo *i = CMSG_TYPED_DATA(cmsg, struct in6_pktinfo);
 
                                 if (p->ifindex <= 0)
                                         p->ifindex = i->ipi6_ifindex;
@@ -833,11 +968,11 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
                         }
 
                         case IPV6_HOPLIMIT:
-                                p->ttl = *(int *) CMSG_DATA(cmsg);
+                                p->ttl = *CMSG_TYPED_DATA(cmsg, int);
                                 break;
 
                         case IPV6_RECVFRAGSIZE:
-                                p->fragsize = *(int *) CMSG_DATA(cmsg);
+                                p->fragsize = *CMSG_TYPED_DATA(cmsg, int);
                                 break;
                         }
                 } else if (cmsg->cmsg_level == IPPROTO_IP) {
@@ -846,7 +981,7 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
                         switch (cmsg->cmsg_type) {
 
                         case IP_PKTINFO: {
-                                struct in_pktinfo *i = (struct in_pktinfo*) CMSG_DATA(cmsg);
+                                struct in_pktinfo *i = CMSG_TYPED_DATA(cmsg, struct in_pktinfo);
 
                                 if (p->ifindex <= 0)
                                         p->ifindex = i->ipi_ifindex;
@@ -856,11 +991,11 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
                         }
 
                         case IP_TTL:
-                                p->ttl = *(int *) CMSG_DATA(cmsg);
+                                p->ttl = *CMSG_TYPED_DATA(cmsg, int);
                                 break;
 
                         case IP_RECVFRAGSIZE:
-                                p->fragsize = *(int *) CMSG_DATA(cmsg);
+                                p->fragsize = *CMSG_TYPED_DATA(cmsg, int);
                                 break;
                         }
                 }
@@ -880,30 +1015,35 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
                         p->ifindex = manager_find_ifindex(m, p->family, &p->destination);
         }
 
-        log_debug("Received %s UDP packet of size %zu, ifindex=%i, ttl=%i, fragsize=%zu",
-                  dns_protocol_to_string(protocol), p->size, p->ifindex, p->ttl, p->fragsize);
+        log_debug("Received %s UDP packet of size %zu, ifindex=%i, ttl=%u, fragsize=%zu, sender=%s, destination=%s",
+                  dns_protocol_to_string(protocol), p->size, p->ifindex, p->ttl, p->fragsize,
+                  IN_ADDR_TO_STRING(p->family, &p->sender),
+                  IN_ADDR_TO_STRING(p->family, &p->destination));
 
         *ret = TAKE_PTR(p);
         return 1;
 }
 
-static int sendmsg_loop(int fd, struct msghdr *mh, int flags) {
+int sendmsg_loop(int fd, struct msghdr *mh, int flags) {
+        usec_t end;
         int r;
 
         assert(fd >= 0);
         assert(mh);
 
+        end = usec_add(now(CLOCK_MONOTONIC), SEND_TIMEOUT_USEC);
+
         for (;;) {
                 if (sendmsg(fd, mh, flags) >= 0)
                         return 0;
-
                 if (errno == EINTR)
                         continue;
-
                 if (errno != EAGAIN)
                         return -errno;
 
-                r = fd_wait_for_event(fd, POLLOUT, SEND_TIMEOUT_USEC);
+                r = fd_wait_for_event(fd, POLLOUT, LESS_BY(end, now(CLOCK_MONOTONIC)));
+                if (ERRNO_IS_NEG_TRANSIENT(r))
+                        continue;
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -912,22 +1052,25 @@ static int sendmsg_loop(int fd, struct msghdr *mh, int flags) {
 }
 
 static int write_loop(int fd, void *message, size_t length) {
+        usec_t end;
         int r;
 
         assert(fd >= 0);
         assert(message);
 
+        end = usec_add(now(CLOCK_MONOTONIC), SEND_TIMEOUT_USEC);
+
         for (;;) {
                 if (write(fd, message, length) >= 0)
                         return 0;
-
                 if (errno == EINTR)
                         continue;
-
                 if (errno != EAGAIN)
                         return -errno;
 
-                r = fd_wait_for_event(fd, POLLOUT, SEND_TIMEOUT_USEC);
+                r = fd_wait_for_event(fd, POLLOUT, LESS_BY(end, now(CLOCK_MONOTONIC)));
+                if (ERRNO_IS_NEG_TRANSIENT(r))
+                        continue;
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -996,7 +1139,7 @@ static int manager_ipv4_send(
                 cmsg->cmsg_level = IPPROTO_IP;
                 cmsg->cmsg_type = IP_PKTINFO;
 
-                pi = (struct in_pktinfo*) CMSG_DATA(cmsg);
+                pi = CMSG_TYPED_DATA(cmsg, struct in_pktinfo);
                 pi->ipi_ifindex = ifindex;
 
                 if (source)
@@ -1052,7 +1195,7 @@ static int manager_ipv6_send(
                 cmsg->cmsg_level = IPPROTO_IPV6;
                 cmsg->cmsg_type = IPV6_PKTINFO;
 
-                pi = (struct in6_pktinfo*) CMSG_DATA(cmsg);
+                pi = CMSG_TYPED_DATA(cmsg, struct in6_pktinfo);
                 pi->ipi6_ifindex = ifindex;
 
                 if (source)
@@ -1060,6 +1203,116 @@ static int manager_ipv6_send(
         }
 
         return sendmsg_loop(fd, &mh, 0);
+}
+
+static int dns_question_to_json(DnsQuestion *q, sd_json_variant **ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *l = NULL;
+        DnsResourceKey *key;
+        int r;
+
+        assert(ret);
+
+        DNS_QUESTION_FOREACH(key, q) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+                r = dns_resource_key_to_json(key, &v);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&l, v);
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(l);
+        return 0;
+}
+
+int manager_monitor_send(Manager *m, DnsQuery *q) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *jquestion = NULL, *jcollected_questions = NULL, *janswer = NULL;
+        _cleanup_(dns_question_unrefp) DnsQuestion *merged = NULL;
+        DnsAnswerItem *rri;
+        int r;
+
+        assert(m);
+
+        if (set_isempty(m->varlink_query_results_subscription))
+                return 0;
+
+        /* Merge all questions into one */
+        r = dns_question_merge(q->question_idna, q->question_utf8, &merged);
+        if (r < 0)
+                return log_error_errno(r, "Failed to merge UTF8/IDNA questions: %m");
+
+        if (q->question_bypass) {
+                _cleanup_(dns_question_unrefp) DnsQuestion *merged2 = NULL;
+
+                r = dns_question_merge(merged, q->question_bypass->question, &merged2);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to merge UTF8/IDNA questions and DNS packet question: %m");
+
+                dns_question_unref(merged);
+                merged = TAKE_PTR(merged2);
+        }
+
+        /* Convert the current primary question to JSON */
+        r = dns_question_to_json(merged, &jquestion);
+        if (r < 0)
+                return log_error_errno(r, "Failed to convert question to JSON: %m");
+
+        /* Generate a JSON array of the questions preceding the current one in the CNAME chain */
+        r = dns_question_to_json(q->collected_questions, &jcollected_questions);
+        if (r < 0)
+                return log_error_errno(r, "Failed to convert question to JSON: %m");
+
+        DNS_ANSWER_FOREACH_ITEM(rri, q->answer) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+                r = dns_resource_record_to_json(rri->rr, &v);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to convert answer resource record to JSON: %m");
+
+                r = dns_resource_record_to_wire_format(rri->rr, /* canonical= */ false); /* don't use DNSSEC canonical format, since it removes casing, but we want that for DNS_SD compat */
+                if (r < 0)
+                        return log_error_errno(r, "Failed to generate RR wire format: %m");
+
+                r = sd_json_variant_append_arraybo(
+                                &janswer,
+                                SD_JSON_BUILD_PAIR_CONDITION(!!v, "rr", SD_JSON_BUILD_VARIANT(v)),
+                                SD_JSON_BUILD_PAIR("raw", SD_JSON_BUILD_BASE64(rri->rr->wire_format, rri->rr->wire_format_size)),
+                                SD_JSON_BUILD_PAIR_CONDITION(rri->ifindex > 0, "ifindex", SD_JSON_BUILD_INTEGER(rri->ifindex)));
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to append notification entry to array: %m");
+        }
+
+        r = varlink_many_notifybo(
+                        m->varlink_query_results_subscription,
+                        SD_JSON_BUILD_PAIR("state", SD_JSON_BUILD_STRING(dns_transaction_state_to_string(q->state))),
+                        SD_JSON_BUILD_PAIR_CONDITION(q->state == DNS_TRANSACTION_DNSSEC_FAILED,
+                                                     "result", SD_JSON_BUILD_STRING(dnssec_result_to_string(q->answer_dnssec_result))),
+                        SD_JSON_BUILD_PAIR_CONDITION(q->state == DNS_TRANSACTION_RCODE_FAILURE,
+                                                     "rcode", SD_JSON_BUILD_INTEGER(q->answer_rcode)),
+                        SD_JSON_BUILD_PAIR_CONDITION(q->state == DNS_TRANSACTION_ERRNO,
+                                                     "errno", SD_JSON_BUILD_INTEGER(q->answer_errno)),
+                        SD_JSON_BUILD_PAIR_CONDITION(IN_SET(q->state,
+                                                            DNS_TRANSACTION_DNSSEC_FAILED,
+                                                            DNS_TRANSACTION_RCODE_FAILURE) &&
+                                                     q->answer_ede_rcode >= 0,
+                                                     "extendedDNSErrorCode", SD_JSON_BUILD_INTEGER(q->answer_ede_rcode)),
+                        SD_JSON_BUILD_PAIR_CONDITION(IN_SET(q->state,
+                                                            DNS_TRANSACTION_DNSSEC_FAILED,
+                                                            DNS_TRANSACTION_RCODE_FAILURE) &&
+                                                     q->answer_ede_rcode >= 0 && !isempty(q->answer_ede_msg),
+                                                     "extendedDNSErrorMessage", SD_JSON_BUILD_STRING(q->answer_ede_msg)),
+                        SD_JSON_BUILD_PAIR("question", SD_JSON_BUILD_VARIANT(jquestion)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!jcollected_questions,
+                                                     "collectedQuestions", SD_JSON_BUILD_VARIANT(jcollected_questions)),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!janswer,
+                                                             "answer", SD_JSON_BUILD_VARIANT(janswer)));
+        if (r < 0)
+                log_debug_errno(r, "Failed to send monitor event, ignoring: %m");
+
+        return 0;
 }
 
 int manager_send(
@@ -1078,8 +1331,11 @@ int manager_send(
         assert(port > 0);
         assert(p);
 
+        /* For mDNS, it is natural that the packet have truncated flag when we have many known answers. */
+        bool truncated = DNS_PACKET_TC(p) && (p->protocol != DNS_PROTOCOL_MDNS || !p->more);
+
         log_debug("Sending %s%s packet with id %" PRIu16 " on interface %i/%s of size %zu.",
-                  DNS_PACKET_TC(p) ? "truncated (!) " : "",
+                  truncated ? "truncated (!) " : "",
                   DNS_PACKET_QR(p) ? "response" : "query",
                   DNS_PACKET_ID(p),
                   ifindex, af_to_name(family),
@@ -1156,7 +1412,7 @@ void manager_refresh_rrs(Manager *m) {
         if (m->mdns_support == RESOLVE_SUPPORT_YES)
                 HASHMAP_FOREACH(s, m->dnssd_services)
                         if (dnssd_update_rrs(s) < 0)
-                                log_warning("Failed to refresh DNS-SD service '%s'", s->name);
+                                log_warning("Failed to refresh DNS-SD service '%s'", s->id);
 
         HASHMAP_FOREACH(l, m->links)
                 link_add_rrs(l, false);
@@ -1171,7 +1427,7 @@ static int manager_next_random_name(const char *old, char **ret_new) {
         assert(p);
 
         while (p > old) {
-                if (!strchr(DIGITS, p[-1]))
+                if (!ascii_isdigit(p[-1]))
                         break;
 
                 p--;
@@ -1305,8 +1561,6 @@ DnsScope* manager_find_scope(Manager *m, DnsPacket *p) {
 }
 
 void manager_verify_all(Manager *m) {
-        DnsScope *s;
-
         assert(m);
 
         LIST_FOREACH(scopes, s, m->dns_scopes)
@@ -1338,7 +1592,6 @@ int manager_is_own_hostname(Manager *m, const char *name) {
 }
 
 int manager_compile_dns_servers(Manager *m, OrderedSet **dns) {
-        DnsServer *s;
         Link *l;
         int r;
 
@@ -1389,7 +1642,6 @@ int manager_compile_dns_servers(Manager *m, OrderedSet **dns) {
  *   > 0 or true: return only domains which are for routing only
  */
 int manager_compile_search_domains(Manager *m, OrderedSet **domains, int filter_route) {
-        DnsSearchDomain *d;
         Link *l;
         int r;
 
@@ -1501,8 +1753,6 @@ bool manager_routable(Manager *m) {
 }
 
 void manager_flush_caches(Manager *m, int log_level) {
-        DnsScope *scope;
-
         assert(m);
 
         LIST_FOREACH(scopes, scope, m->dns_scopes)
@@ -1525,7 +1775,6 @@ void manager_reset_server_features(Manager *m) {
 
 void manager_cleanup_saved_user(Manager *m) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
 
         assert(m);
 
@@ -1543,7 +1792,6 @@ void manager_cleanup_saved_user(Manager *m) {
         }
 
         FOREACH_DIRENT_ALL(de, d, log_error_errno(errno, "Failed to read interface directory: %m")) {
-                _cleanup_free_ char *p = NULL;
                 int ifindex;
                 Link *l;
 
@@ -1567,13 +1815,8 @@ void manager_cleanup_saved_user(Manager *m) {
                 continue;
 
         rm:
-                p = path_join("/run/systemd/resolve/netif", de->d_name);
-                if (!p) {
-                        log_oom();
-                        return;
-                }
-
-                (void) unlink(p);
+                if (unlinkat(dirfd(d), de->d_name, 0) < 0)
+                        log_warning_errno(errno, "Failed to remove left-over interface configuration file '%s', ignoring: %m", de->d_name);
         }
 }
 
@@ -1592,7 +1835,7 @@ bool manager_next_dnssd_names(Manager *m) {
 
                 r = manager_next_random_name(s->name_template, &new_name);
                 if (r < 0) {
-                        log_warning_errno(r, "Failed to get new name for service '%s': %m", s->name);
+                        log_warning_errno(r, "Failed to get new name for service '%s': %m", s->id);
                         continue;
                 }
 
@@ -1639,9 +1882,9 @@ int socket_disable_pmtud(int fd, int af) {
         assert(fd >= 0);
 
         if (af == AF_UNSPEC) {
-                r = socket_get_family(fd, &af);
-                if (r < 0)
-                        return r;
+                af = socket_get_family(fd);
+                if (af < 0)
+                        return af;
         }
 
         switch (af) {
@@ -1691,4 +1934,231 @@ int socket_disable_pmtud(int fd, int af) {
         default:
                 return -EAFNOSUPPORT;
         }
+}
+
+int dns_manager_dump_statistics_json(Manager *m, sd_json_variant **ret) {
+        uint64_t size = 0, hit = 0, miss = 0;
+
+        assert(m);
+        assert(ret);
+
+        LIST_FOREACH(scopes, s, m->dns_scopes) {
+                size += dns_cache_size(&s->cache);
+                hit += s->cache.n_hit;
+                miss += s->cache.n_miss;
+        }
+
+        return sd_json_buildo(ret,
+                              SD_JSON_BUILD_PAIR("transactions", SD_JSON_BUILD_OBJECT(
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("currentTransactions", hashmap_size(m->dns_transactions)),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("totalTransactions", m->n_transactions_total),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("totalTimeouts", m->n_timeouts_total),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("totalTimeoutsServedStale", m->n_timeouts_served_stale_total),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("totalFailedResponses", m->n_failure_responses_total),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("totalFailedResponsesServedStale", m->n_failure_responses_served_stale_total)
+                                                 )),
+                              SD_JSON_BUILD_PAIR("cache", SD_JSON_BUILD_OBJECT(
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("size", size),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("hits", hit),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("misses", miss)
+                                                 )),
+                              SD_JSON_BUILD_PAIR("dnssec", SD_JSON_BUILD_OBJECT(
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("secure", m->n_dnssec_verdict[DNSSEC_SECURE]),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("insecure", m->n_dnssec_verdict[DNSSEC_INSECURE]),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("bogus", m->n_dnssec_verdict[DNSSEC_BOGUS]),
+                                                                 SD_JSON_BUILD_PAIR_UNSIGNED("indeterminate", m->n_dnssec_verdict[DNSSEC_INDETERMINATE])
+                                                 )));
+}
+
+void dns_manager_reset_statistics(Manager *m) {
+
+        assert(m);
+
+        LIST_FOREACH(scopes, s, m->dns_scopes)
+                s->cache.n_hit = s->cache.n_miss = 0;
+
+        m->n_transactions_total = 0;
+        m->n_timeouts_total = 0;
+        m->n_timeouts_served_stale_total = 0;
+        m->n_failure_responses_total = 0;
+        m->n_failure_responses_served_stale_total = 0;
+        zero(m->n_dnssec_verdict);
+}
+
+static int dns_configuration_json_append(
+                const char *ifname,
+                int ifindex,
+                int default_route,
+                DnsServer *current_dns_server,
+                DnsServer *dns_servers,
+                DnsSearchDomain *search_domains,
+                sd_json_variant **configuration) {
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *dns_servers_json = NULL,
+                                                          *search_domains_json = NULL,
+                                                          *current_dns_server_json = NULL;
+        int r;
+
+        assert(configuration);
+
+        if (dns_servers) {
+                r = sd_json_variant_new_array(&dns_servers_json, NULL, 0);
+                if (r < 0)
+                        return r;
+        }
+
+        if (search_domains) {
+                r = sd_json_variant_new_array(&search_domains_json, NULL, 0);
+                if (r < 0)
+                        return r;
+        }
+
+        if (current_dns_server) {
+                r = dns_server_dump_configuration_to_json(current_dns_server, &current_dns_server_json);
+                if (r < 0)
+                        return r;
+        }
+
+        LIST_FOREACH(servers, s, dns_servers) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+                assert(dns_servers_json);
+
+                r = dns_server_dump_configuration_to_json(s, &v);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&dns_servers_json, v);
+                if (r < 0)
+                        return r;
+        }
+
+        LIST_FOREACH(domains, d, search_domains) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+                assert(search_domains_json);
+
+                r = dns_search_domain_dump_to_json(d, &v);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&search_domains_json, v);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_json_variant_append_arraybo(
+                        configuration,
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("ifname", ifname),
+                        SD_JSON_BUILD_PAIR_CONDITION(ifindex > 0, "ifindex", SD_JSON_BUILD_UNSIGNED(ifindex)),
+                        SD_JSON_BUILD_PAIR_CONDITION(ifindex > 0, "defaultRoute", SD_JSON_BUILD_BOOLEAN(default_route > 0)),
+                        JSON_BUILD_PAIR_VARIANT_NON_NULL("currentServer", current_dns_server_json),
+                        JSON_BUILD_PAIR_VARIANT_NON_NULL("servers", dns_servers_json),
+                        JSON_BUILD_PAIR_VARIANT_NON_NULL("searchDomains", search_domains_json));
+}
+
+int manager_dump_dns_configuration_json(Manager *m, sd_json_variant **ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *configuration = NULL;
+        Link *l;
+        int r;
+
+        assert(m);
+        assert(ret);
+
+        /* Global DNS configuration */
+        r = dns_configuration_json_append(
+                        /* ifname = */ NULL,
+                        /* ifindex = */ 0,
+                        /* default_route = */ 0,
+                        manager_get_dns_server(m),
+                        m->dns_servers,
+                        m->search_domains,
+                        &configuration);
+        if (r < 0)
+                return r;
+
+        /* Append configuration for each link */
+        HASHMAP_FOREACH(l, m->links) {
+                r = dns_configuration_json_append(
+                                l->ifname,
+                                l->ifindex,
+                                link_get_default_route(l),
+                                link_get_dns_server(l),
+                                l->dns_servers,
+                                l->search_domains,
+                                &configuration);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_json_buildo(ret, SD_JSON_BUILD_PAIR_VARIANT("configuration", configuration));
+}
+
+int manager_send_dns_configuration_changed(Manager *m, Link *l, bool reset) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *configuration = NULL;
+        int r;
+
+        assert(m);
+
+        if (set_isempty(m->varlink_dns_configuration_subscription))
+                return 0;
+
+        if (reset) {
+                dns_server_reset_accessible_all(m->dns_servers);
+
+                if (l)
+                        dns_server_reset_accessible_all(l->dns_servers);
+        }
+
+        r = manager_dump_dns_configuration_json(m, &configuration);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to dump DNS configuration json: %m");
+
+        if (sd_json_variant_equal(configuration, m->dns_configuration_json))
+                return 0;
+
+        JSON_VARIANT_REPLACE(m->dns_configuration_json, TAKE_PTR(configuration));
+
+        r = varlink_many_notify(m->varlink_dns_configuration_subscription, m->dns_configuration_json);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to send DNS configuration event: %m");
+
+        return 0;
+}
+
+int manager_start_dns_configuration_monitor(Manager *m) {
+        Link *l;
+        int r;
+
+        assert(m);
+        assert(!m->dns_configuration_json);
+        assert(!m->netlink_new_route_slot);
+        assert(!m->netlink_del_route_slot);
+
+        dns_server_reset_accessible_all(m->dns_servers);
+
+        HASHMAP_FOREACH(l, m->links)
+                dns_server_reset_accessible_all(l->dns_servers);
+
+        r = manager_dump_dns_configuration_json(m, &m->dns_configuration_json);
+        if (r < 0)
+                return r;
+
+        r = sd_netlink_add_match(m->rtnl, &m->netlink_new_route_slot, RTM_NEWROUTE, manager_process_route, NULL, m, "resolve-NEWROUTE");
+        if (r < 0)
+                return r;
+
+        r = sd_netlink_add_match(m->rtnl, &m->netlink_del_route_slot, RTM_DELROUTE, manager_process_route, NULL, m, "resolve-DELROUTE");
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+void manager_stop_dns_configuration_monitor(Manager *m) {
+        assert(m);
+
+        m->dns_configuration_json = sd_json_variant_unref(m->dns_configuration_json);
+        m->netlink_new_route_slot = sd_netlink_slot_unref(m->netlink_new_route_slot);
+        m->netlink_del_route_slot = sd_netlink_slot_unref(m->netlink_del_route_slot);
 }

@@ -10,7 +10,6 @@
 #include "log.h"
 #include "string-util.h"
 #include "utf8.h"
-#include "util.h"
 
 /**
  * Write up to size bytes to buf. Return negative on error, and number of
@@ -24,7 +23,7 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
 
         for (;;) {
 
-                switch(u->entry_state) {
+                switch (u->entry_state) {
                 case ENTRY_CURSOR: {
                         u->current_cursor = mfree(u->current_cursor);
 
@@ -251,18 +250,26 @@ static void check_update_watchdog(Uploader *u) {
 }
 
 static size_t journal_input_callback(void *buf, size_t size, size_t nmemb, void *userp) {
-        Uploader *u = userp;
+        Uploader *u = ASSERT_PTR(userp);
+        _cleanup_free_ char *compression_buffer = NULL;
         int r;
         sd_journal *j;
         size_t filled = 0;
         ssize_t w;
 
-        assert(u);
         assert(nmemb <= SSIZE_MAX / size);
 
         check_update_watchdog(u);
 
         j = u->journal;
+
+        if (u->compression.algorithm != COMPRESSION_NONE) {
+                compression_buffer = malloc_multiply(nmemb, size);
+                if (!compression_buffer) {
+                        log_oom();
+                        return CURL_READFUNC_ABORT;
+                }
+        }
 
         while (j && filled < size * nmemb) {
                 if (u->entry_state == ENTRY_DONE) {
@@ -286,7 +293,7 @@ static size_t journal_input_callback(void *buf, size_t size, size_t nmemb, void 
                         u->entry_state = ENTRY_CURSOR;
                 }
 
-                w = write_entry((char*)buf + filled, size * nmemb - filled, u);
+                w = write_entry((compression_buffer ?: (char*) buf) + filled, size * nmemb - filled, u);
                 if (w < 0)
                         return CURL_READFUNC_ABORT;
                 filled += w;
@@ -300,6 +307,19 @@ static size_t journal_input_callback(void *buf, size_t size, size_t nmemb, void 
 
                 log_debug("Entry %zu (%s) has been uploaded.",
                           u->entries_sent, u->current_cursor);
+        }
+
+        if (filled > 0 && u->compression.algorithm != COMPRESSION_NONE) {
+                size_t compressed_size;
+                r = compress_blob(u->compression.algorithm, compression_buffer, filled, buf, size * nmemb, &compressed_size, u->compression.level);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to compress %zu bytes (Compression=%s, Level=%d): %m",
+                                        filled, compression_lowercase_to_string(u->compression.algorithm), u->compression.level);
+                        return CURL_READFUNC_ABORT;
+                }
+
+                assert(compressed_size <= size * nmemb);
+                return compressed_size;
         }
 
         return filled;
@@ -356,9 +376,7 @@ static int dispatch_journal_input(sd_event_source *event,
                                   int fd,
                                   uint32_t revents,
                                   void *userp) {
-        Uploader *u = userp;
-
-        assert(u);
+        Uploader *u = ASSERT_PTR(userp);
 
         if (u->uploading)
                 return 0;
@@ -392,7 +410,7 @@ int open_journal_for_upload(Uploader *u,
                 else
                         u->timeout = JOURNAL_UPLOAD_POLL_TIMEOUT;
 
-                r = sd_event_add_io(u->events, &u->input_event,
+                r = sd_event_add_io(u->event, &u->input_event,
                                     fd, events, dispatch_journal_input, u);
                 if (r < 0)
                         return log_error_errno(r, "Failed to register input event: %m");

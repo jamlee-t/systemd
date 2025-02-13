@@ -5,11 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#if HAVE_LINUX_TIME_TYPES_H
-/* This header defines __kernel_timespec for us, but is only available since Linux 5.1, hence conditionally
- * include this. */
 #include <linux/time_types.h>
-#endif
 #include <signal.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -22,12 +18,23 @@
 
 #include "macro.h"
 #include "missing_keyctl.h"
+#include "missing_sched.h"
 #include "missing_stat.h"
 #include "missing_syscall_def.h"
 
-/* linux/kcmp.h */
-#ifndef KCMP_FILE /* 3f4994cfc15f38a3159c6e3a4b3ab2e1481a6b02 (3.19) */
-#define KCMP_FILE 0
+/* ======================================================================= */
+
+#if !HAVE_FCHMODAT2
+static inline int missing_fchmodat2(int dirfd, const char *path, mode_t mode, int flags) {
+#  ifdef __NR_fchmodat2
+        return syscall(__NR_fchmodat2, dirfd, path, mode, flags);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define fchmodat2 missing_fchmodat2
 #endif
 
 /* ======================================================================= */
@@ -64,12 +71,7 @@ static inline int missing_ioprio_set(int which, int who, int ioprio) {
 
 #if !HAVE_MEMFD_CREATE
 static inline int missing_memfd_create(const char *name, unsigned int flags) {
-#  ifdef __NR_memfd_create
         return syscall(__NR_memfd_create, name, flags);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 }
 
 #  define memfd_create missing_memfd_create
@@ -78,13 +80,9 @@ static inline int missing_memfd_create(const char *name, unsigned int flags) {
 /* ======================================================================= */
 
 #if !HAVE_GETRANDOM
-static inline int missing_getrandom(void *buffer, size_t count, unsigned flags) {
-#  ifdef __NR_getrandom
+/* glibc says getrandom() returns ssize_t */
+static inline ssize_t missing_getrandom(void *buffer, size_t count, unsigned flags) {
         return syscall(__NR_getrandom, buffer, count, flags);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 }
 
 #  define getrandom missing_getrandom
@@ -130,12 +128,7 @@ static inline int missing_name_to_handle_at(int fd, const char *name, struct fil
 
 #if !HAVE_SETNS
 static inline int missing_setns(int fd, int nstype) {
-#  ifdef __NR_setns
         return syscall(__NR_setns, fd, nstype);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 }
 
 #  define setns missing_setns
@@ -155,12 +148,7 @@ static inline pid_t raw_getpid(void) {
 
 #if !HAVE_RENAMEAT2
 static inline int missing_renameat2(int oldfd, const char *oldname, int newfd, const char *newname, unsigned flags) {
-#  ifdef __NR_renameat2
         return syscall(__NR_renameat2, oldfd, oldname, newfd, newname, flags);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 }
 
 #  define renameat2 missing_renameat2
@@ -170,12 +158,7 @@ static inline int missing_renameat2(int oldfd, const char *oldname, int newfd, c
 
 #if !HAVE_KCMP
 static inline int missing_kcmp(pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2) {
-#  if defined __NR_kcmp && __NR_kcmp >= 0
         return syscall(__NR_kcmp, pid1, pid2, type, idx1, idx2);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 }
 
 #  define kcmp missing_kcmp
@@ -185,34 +168,19 @@ static inline int missing_kcmp(pid_t pid1, pid_t pid2, int type, unsigned long i
 
 #if !HAVE_KEYCTL
 static inline long missing_keyctl(int cmd, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
-#  if defined __NR_keyctl && __NR_keyctl >= 0
         return syscall(__NR_keyctl, cmd, arg2, arg3, arg4, arg5);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 
 #  define keyctl missing_keyctl
 }
 
 static inline key_serial_t missing_add_key(const char *type, const char *description, const void *payload, size_t plen, key_serial_t ringid) {
-#  if defined __NR_add_key && __NR_add_key >= 0
         return syscall(__NR_add_key, type, description, payload, plen, ringid);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 
 #  define add_key missing_add_key
 }
 
 static inline key_serial_t missing_request_key(const char *type, const char *description, const char * callout_info, key_serial_t destringid) {
-#  if defined __NR_request_key && __NR_request_key >= 0
         return syscall(__NR_request_key, type, description, callout_info, destringid);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 
 #  define request_key missing_request_key
 }
@@ -322,12 +290,7 @@ static inline long missing_get_mempolicy(int *mode, unsigned long *nodemask,
 
 #if !HAVE_PIDFD_SEND_SIGNAL
 static inline int missing_pidfd_send_signal(int fd, int sig, siginfo_t *info, unsigned flags) {
-#  ifdef __NR_pidfd_send_signal
         return syscall(__NR_pidfd_send_signal, fd, sig, info, flags);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 }
 
 #  define pidfd_send_signal missing_pidfd_send_signal
@@ -335,12 +298,7 @@ static inline int missing_pidfd_send_signal(int fd, int sig, siginfo_t *info, un
 
 #if !HAVE_PIDFD_OPEN
 static inline int missing_pidfd_open(pid_t pid, unsigned flags) {
-#  ifdef __NR_pidfd_open
         return syscall(__NR_pidfd_open, pid, flags);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
 }
 
 #  define pidfd_open missing_pidfd_open
@@ -358,6 +316,20 @@ static inline int missing_rt_sigqueueinfo(pid_t tgid, int sig, siginfo_t *info) 
 }
 
 #  define rt_sigqueueinfo missing_rt_sigqueueinfo
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_RT_TGSIGQUEUEINFO
+static inline int missing_rt_tgsigqueueinfo(pid_t tgid, pid_t tid, int sig, siginfo_t *info) {
+#  if defined __NR_rt_tgsigqueueinfo && __NR_rt_tgsigqueueinfo >= 0
+        return syscall(__NR_rt_tgsigqueueinfo, tgid, tid, sig, info);
+#  else
+#    error "__NR_rt_tgsigqueueinfo not defined"
+#  endif
+}
+
+#  define rt_tgsigqueueinfo missing_rt_tgsigqueueinfo
 #endif
 
 /* ======================================================================= */
@@ -382,23 +354,14 @@ static inline int missing_execveat(int dirfd, const char *pathname,
 /* ======================================================================= */
 
 #if !HAVE_CLOSE_RANGE
-static inline int missing_close_range(int first_fd, int end_fd, unsigned flags) {
+static inline int missing_close_range(unsigned first_fd, unsigned end_fd, unsigned flags) {
 #  ifdef __NR_close_range
         /* Kernel-side the syscall expects fds as unsigned integers (just like close() actually), while
-         * userspace exclusively uses signed integers for fds. We don't know just yet how glibc is going to
-         * wrap this syscall, but let's assume it's going to be similar to what they do for close(),
-         * i.e. make the same unsigned → signed type change from the raw kernel syscall compared to the
-         * userspace wrapper. There's only one caveat for this: unlike for close() there's the special
-         * UINT_MAX fd value for the 'end_fd' argument. Let's safely map that to -1 here. And let's refuse
-         * any other negative values. */
-        if ((first_fd < 0) || (end_fd < 0 && end_fd != -1)) {
-                errno = -EBADF;
-                return -1;
-        }
-
+         * userspace exclusively uses signed integers for fds. glibc chose to expose it 1:1 however, hence we
+         * do so here too, even if we end up passing signed fds to it most of the time. */
         return syscall(__NR_close_range,
-                       (unsigned) first_fd,
-                       end_fd == -1 ? UINT_MAX : (unsigned) end_fd, /* Of course, the compiler should figure out that this is the identity mapping IRL */
+                       first_fd,
+                       end_fd,
                        flags);
 #  else
         errno = ENOSYS;
@@ -407,44 +370,6 @@ static inline int missing_close_range(int first_fd, int end_fd, unsigned flags) 
 }
 
 #  define close_range missing_close_range
-#endif
-
-/* ======================================================================= */
-
-#if !HAVE_EPOLL_PWAIT2
-
-/* Defined to be equivalent to the kernel's _NSIG_WORDS, i.e. the size of the array of longs that is
- * encapsulated by sigset_t. */
-#define KERNEL_NSIG_WORDS (64 / (sizeof(long) * 8))
-#define KERNEL_NSIG_BYTES (KERNEL_NSIG_WORDS * sizeof(long))
-
-struct epoll_event;
-
-static inline int missing_epoll_pwait2(
-                int fd,
-                struct epoll_event *events,
-                int maxevents,
-                const struct timespec *timeout,
-                const sigset_t *sigset) {
-
-#  if defined(__NR_epoll_pwait2) && HAVE_LINUX_TIME_TYPES_H
-        if (timeout) {
-                /* Convert from userspace timespec to kernel timespec */
-                struct __kernel_timespec ts = {
-                        .tv_sec = timeout->tv_sec,
-                        .tv_nsec = timeout->tv_nsec,
-                };
-
-                return syscall(__NR_epoll_pwait2, fd, events, maxevents, &ts, sigset, sigset ? KERNEL_NSIG_BYTES : 0);
-        } else
-                return syscall(__NR_epoll_pwait2, fd, events, maxevents, NULL, sigset, sigset ? KERNEL_NSIG_BYTES : 0);
-#  else
-        errno = ENOSYS;
-        return -1;
-#  endif
-}
-
-#  define epoll_pwait2 missing_epoll_pwait2
 #endif
 
 /* ======================================================================= */
@@ -462,20 +387,56 @@ struct mount_attr {
 struct mount_attr;
 #endif
 
+#ifndef MOUNT_ATTR_RDONLY
+#define MOUNT_ATTR_RDONLY       0x00000001 /* Mount read-only */
+#endif
+
+#ifndef MOUNT_ATTR_NOSUID
+#define MOUNT_ATTR_NOSUID       0x00000002 /* Ignore suid and sgid bits */
+#endif
+
+#ifndef MOUNT_ATTR_NODEV
+#define MOUNT_ATTR_NODEV        0x00000004 /* Disallow access to device special files */
+#endif
+
+#ifndef MOUNT_ATTR_NOEXEC
+#define MOUNT_ATTR_NOEXEC       0x00000008 /* Disallow program execution */
+#endif
+
+#ifndef MOUNT_ATTR__ATIME
+#define MOUNT_ATTR__ATIME       0x00000070 /* Setting on how atime should be updated */
+#endif
+
+#ifndef MOUNT_ATTR_RELATIME
+#define MOUNT_ATTR_RELATIME     0x00000000 /* - Update atime relative to mtime/ctime. */
+#endif
+
+#ifndef MOUNT_ATTR_NOATIME
+#define MOUNT_ATTR_NOATIME      0x00000010 /* - Do not update access times. */
+#endif
+
+#ifndef MOUNT_ATTR_STRICTATIME
+#define MOUNT_ATTR_STRICTATIME  0x00000020 /* - Always perform atime updates */
+#endif
+
+#ifndef MOUNT_ATTR_NODIRATIME
+#define MOUNT_ATTR_NODIRATIME   0x00000080 /* Do not update directory access times */
+#endif
+
 #ifndef MOUNT_ATTR_IDMAP
-#define MOUNT_ATTR_IDMAP 0x00100000
+#define MOUNT_ATTR_IDMAP        0x00100000 /* Idmap mount to @userns_fd in struct mount_attr. */
 #endif
 
 #ifndef MOUNT_ATTR_NOSYMFOLLOW
-#define MOUNT_ATTR_NOSYMFOLLOW 0x00200000
+#define MOUNT_ATTR_NOSYMFOLLOW  0x00200000 /* Do not follow symlinks */
+#endif
+
+#ifndef MOUNT_ATTR_SIZE_VER0
+#define MOUNT_ATTR_SIZE_VER0    32 /* sizeof first published struct */
 #endif
 
 #ifndef AT_RECURSIVE
 #define AT_RECURSIVE 0x8000
-#endif
-
-#ifndef MOUNT_ATTR_SIZE_VER0
-#define MOUNT_ATTR_SIZE_VER0 32
 #endif
 
 static inline int missing_mount_setattr(
@@ -526,10 +487,18 @@ static inline int missing_open_tree(
 
 /* ======================================================================= */
 
+#ifndef MOVE_MOUNT_BENEATH
+#define MOVE_MOUNT_BENEATH 0x00000200
+#endif
+
 #if !HAVE_MOVE_MOUNT
 
 #ifndef MOVE_MOUNT_F_EMPTY_PATH
 #define MOVE_MOUNT_F_EMPTY_PATH 0x00000004 /* Empty from path permitted */
+#endif
+
+#ifndef MOVE_MOUNT_T_EMPTY_PATH
+#define MOVE_MOUNT_T_EMPTY_PATH 0x00000040 /* Empty to path permitted */
 #endif
 
 static inline int missing_move_mount(
@@ -552,6 +521,78 @@ static inline int missing_move_mount(
 
 /* ======================================================================= */
 
+#if !HAVE_FSOPEN
+
+#ifndef FSOPEN_CLOEXEC
+#define FSOPEN_CLOEXEC 0x00000001
+#endif
+
+static inline int missing_fsopen(const char *fsname, unsigned flags) {
+#  if defined __NR_fsopen && __NR_fsopen >= 0
+        return syscall(__NR_fsopen, fsname, flags);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define fsopen missing_fsopen
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_FSCONFIG
+
+#ifndef FSCONFIG_SET_FLAG
+#define FSCONFIG_SET_FLAG 0 /* Set parameter, supplying no value */
+#endif
+
+#ifndef FSCONFIG_SET_STRING
+#define FSCONFIG_SET_STRING 1 /* Set parameter, supplying a string value */
+#endif
+
+#ifndef FSCONFIG_SET_FD
+#define FSCONFIG_SET_FD 5 /* Set parameter, supplying an object by fd */
+#endif
+
+#ifndef FSCONFIG_CMD_CREATE
+#define FSCONFIG_CMD_CREATE 6 /* Invoke superblock creation */
+#endif
+
+static inline int missing_fsconfig(int fd, unsigned cmd, const char *key, const void *value, int aux) {
+#  if defined __NR_fsconfig && __NR_fsconfig >= 0
+        return syscall(__NR_fsconfig, fd, cmd, key, value, aux);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define fsconfig missing_fsconfig
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_FSMOUNT
+
+#ifndef FSMOUNT_CLOEXEC
+#define FSMOUNT_CLOEXEC 0x00000001
+#endif
+
+static inline int missing_fsmount(int fd, unsigned flags, unsigned ms_flags) {
+#  if defined __NR_fsmount && __NR_fsmount >= 0
+        return syscall(__NR_fsmount, fd, flags, ms_flags);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define fsmount missing_fsmount
+#endif
+
+/* ======================================================================= */
+
 #if !HAVE_GETDENTS64
 
 static inline ssize_t missing_getdents64(int fd, void *buffer, size_t length) {
@@ -564,4 +605,79 @@ static inline ssize_t missing_getdents64(int fd, void *buffer, size_t length) {
 }
 
 #  define getdents64 missing_getdents64
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_SCHED_SETATTR
+
+static inline ssize_t missing_sched_setattr(pid_t pid, struct sched_attr *attr, unsigned int flags) {
+        return syscall(__NR_sched_setattr, pid, attr, flags);
+}
+
+#  define sched_setattr missing_sched_setattr
+#endif
+
+/* ======================================================================= */
+
+/* glibc does not provide clone() on ia64, only clone2(). Not only that, but it also doesn't provide a
+ * prototype, only the symbol in the shared library (it provides a prototype for clone(), but not the
+ * symbol in the shared library). */
+#if defined(__ia64__)
+int __clone2(int (*fn)(void *), void *stack_base, size_t stack_size, int flags, void *arg);
+#define HAVE_CLONE 0
+#else
+/* We know that everywhere else clone() is available, so we don't bother with a meson check (that takes time
+ * at build time) and just define it. Once the kernel drops ia64 support, we can drop this too. */
+#define HAVE_CLONE 1
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_QUOTACTL_FD
+
+static inline int missing_quotactl_fd(int fd, int cmd, int id, void *addr) {
+#  ifdef __NR_quotactl_fd
+        return syscall(__NR_quotactl_fd, fd, cmd, id, addr);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define quotactl_fd missing_quotactl_fd
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_SETXATTRAT
+struct xattr_args {
+        _align_(8) uint64_t value;
+        uint32_t size;
+        uint32_t flags;
+};
+
+static inline int missing_setxattrat(int fd, const char *path, int at_flags, const char *name, const struct xattr_args *args, size_t size) {
+#  ifdef __NR_setxattrat
+        return syscall(__NR_setxattrat, fd, path, at_flags, name, args, size);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define setxattrat missing_setxattrat
+#endif
+
+#if !HAVE_REMOVEXATTRAT
+static inline int missing_removexattrat(int fd, const char *path, int at_flags, const char *name) {
+#  ifdef __NR_removexattrat
+        return syscall(__NR_removexattrat, fd, path, at_flags, name);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define removexattrat missing_removexattrat
 #endif

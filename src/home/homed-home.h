@@ -3,6 +3,7 @@
 
 typedef struct Home Home;
 
+#include "hashmap.h"
 #include "homed-manager.h"
 #include "homed-operation.h"
 #include "list.h"
@@ -88,6 +89,8 @@ static inline bool HOME_STATE_SHALL_PIN(HomeState state) {
                       HOME_AUTHENTICATING_FOR_ACQUIRE);
 }
 
+#define HOME_STATE_SHALL_REBALANCE(state) HOME_STATE_SHALL_PIN(state)
+
 static inline bool HOME_STATE_MAY_RETRY_DEACTIVATE(HomeState state) {
         /* Indicates when to leave the deactivate retry timer active */
         return IN_SET(state,
@@ -106,7 +109,12 @@ static inline bool HOME_STATE_MAY_RETRY_DEACTIVATE(HomeState state) {
 
 struct Home {
         Manager *manager;
+
+        /* The fields this record can be looked up by. This is kinda redundant, as the same information is
+         * available in the .record field, but we keep separate copies of these keys to make memory
+         * management for the hashmaps easier. */
         char *user_name;
+        char **aliases;
         uid_t uid;
 
         char *sysfs; /* When found via plugged in device, the sysfs path to it */
@@ -165,6 +173,12 @@ struct Home {
 
         /* An fd that locks the backing file of LUKS home dirs with a BSD lock. */
         int luks_lock_fd;
+
+        /* Space metrics during rebalancing */
+        uint64_t rebalance_size, rebalance_usage, rebalance_free, rebalance_min, rebalance_weight, rebalance_goal;
+
+        /* Whether a rebalance operation is pending */
+        bool rebalance_pending;
 };
 
 int home_new(Manager *m, UserRecord *hr, const char *sysfs, Home **ret);
@@ -177,21 +191,31 @@ int home_save_record(Home *h);
 int home_unlink_record(Home *h);
 
 int home_fixate(Home *h, UserRecord *secret, sd_bus_error *error);
-int home_activate(Home *h, UserRecord *secret, sd_bus_error *error);
+int home_activate(Home *h, bool if_referenced, UserRecord *secret, sd_bus_error *error);
 int home_authenticate(Home *h, UserRecord *secret, sd_bus_error *error);
 int home_deactivate(Home *h, bool force, sd_bus_error *error);
-int home_create(Home *h, UserRecord *secret, sd_bus_error *error);
+int home_create(Home *h, UserRecord *secret, Hashmap *blobs, uint64_t flags, sd_bus_error *error);
 int home_remove(Home *h, sd_bus_error *error);
-int home_update(Home *h, UserRecord *new_record, sd_bus_error *error);
+int home_update(Home *h, UserRecord *new_record, Hashmap *blobs, uint64_t flags, sd_bus_error *error);
 int home_resize(Home *h, uint64_t disk_size, UserRecord *secret, sd_bus_error *error);
 int home_passwd(Home *h, UserRecord *new_secret, UserRecord *old_secret, sd_bus_error *error);
 int home_unregister(Home *h, sd_bus_error *error);
 int home_lock(Home *h, sd_bus_error *error);
 int home_unlock(Home *h, UserRecord *secret, sd_bus_error *error);
 
+bool home_is_referenced(Home *h);
+bool home_shall_suspend(Home *h);
 HomeState home_get_state(Home *h);
 
-int home_get_disk_status(Home *h, uint64_t *ret_disk_size,uint64_t *ret_disk_usage, uint64_t *ret_disk_free, uint64_t *ret_disk_ceiling, uint64_t *ret_disk_floor, statfs_f_type_t *ret_fstype, mode_t *ret_access_mode);
+int home_get_disk_status(
+                Home *h,
+                uint64_t *ret_disk_size,
+                uint64_t *ret_disk_usage,
+                uint64_t *ret_disk_free,
+                uint64_t *ret_disk_ceiling,
+                uint64_t *ret_disk_floor,
+                statfs_f_type_t *ret_fstype,
+                mode_t *ret_access_mode);
 
 void home_process_notify(Home *h, char **l, int fd);
 
@@ -208,5 +232,9 @@ int home_set_current_message(Home *h, sd_bus_message *m);
 
 int home_wait_for_worker(Home *h);
 
-const char *home_state_to_string(HomeState state);
+bool home_shall_rebalance(Home *h);
+
+bool home_is_busy(Home *h);
+
+const char* home_state_to_string(HomeState state);
 HomeState home_state_from_string(const char *s);

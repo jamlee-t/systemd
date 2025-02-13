@@ -11,24 +11,31 @@
 #include <sys/types.h>
 
 #include "sd-daemon.h"
+#include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "bus-polkit.h"
+#include "clock-util.h"
+#include "common-signal.h"
 #include "dns-domain.h"
+#include "event-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "list.h"
 #include "log.h"
+#include "logarithm.h"
 #include "network-util.h"
 #include "ratelimit.h"
 #include "resolve-private.h"
+#include "random-util.h"
 #include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
 #include "timesyncd-conf.h"
 #include "timesyncd-manager.h"
-#include "util.h"
+#include "user-util.h"
 
 #ifndef ADJ_SETOFFSET
 #define ADJ_SETOFFSET                   0x0100  /* add 'time' to current time */
@@ -59,7 +66,7 @@ static int manager_arm_timer(Manager *m, usec_t next);
 static int manager_clock_watch_setup(Manager *m);
 static int manager_listen_setup(Manager *m);
 static void manager_listen_stop(Manager *m);
-static int manager_save_time_and_rearm(Manager *m);
+static int manager_save_time_and_rearm(Manager *m, usec_t t);
 
 static double ntp_ts_short_to_d(const struct ntp_ts_short *ts) {
         return be16toh(ts->sec) + (be16toh(ts->frac) / 65536.0);
@@ -73,18 +80,10 @@ static double ts_to_d(const struct timespec *ts) {
         return ts->tv_sec + (1.0e-9 * ts->tv_nsec);
 }
 
-static uint32_t graceful_add_offset_1900_1970(time_t t) {
-        /* Adds OFFSET_1900_1970 to t and returns it as 32bit value. This is handles overflows
-         * gracefully in a deterministic and well-defined way by cutting off the top bits. */
-        uint64_t a = (uint64_t) t + OFFSET_1900_1970;
-        return (uint32_t) (a & UINT64_C(0xFFFFFFFF));
-}
-
 static int manager_timeout(sd_event_source *source, usec_t usec, void *userdata) {
         _cleanup_free_ char *pretty = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
-        assert(m);
         assert(m->current_server_name);
         assert(m->current_server_address);
 
@@ -116,23 +115,27 @@ static int manager_send_request(Manager *m) {
         m->event_timeout = sd_event_source_unref(m->event_timeout);
 
         r = manager_listen_setup(m);
-        if (r < 0)
-                return log_warning_errno(r, "Failed to set up connection socket: %m");
+        if (r < 0) {
+                log_warning_errno(r, "Failed to set up connection socket: %m");
+                return manager_connect(m);
+        }
 
         /*
-         * Set transmit timestamp, remember it; the server will send that back
-         * as the origin timestamp and we have an indication that this is the
-         * matching answer to our request.
-         *
-         * The actual value does not matter, We do not care about the correct
-         * NTP UINT_MAX fraction; we just pass the plain nanosecond value.
+         * Generate a random number as transmit timestamp, to ensure we get
+         * a full 64 bits of entropy to make it hard for off-path attackers
+         * to inject random time to us.
          */
-        assert_se(clock_gettime(clock_boottime_or_monotonic(), &m->trans_time_mon) >= 0);
-        assert_se(clock_gettime(CLOCK_REALTIME, &m->trans_time) >= 0);
-        ntpmsg.trans_time.sec = htobe32(graceful_add_offset_1900_1970(m->trans_time.tv_sec));
-        ntpmsg.trans_time.frac = htobe32(m->trans_time.tv_nsec);
+        random_bytes(&m->request_nonce, sizeof(m->request_nonce));
+        ntpmsg.trans_time = m->request_nonce;
 
         server_address_pretty(m->current_server_address, &pretty);
+
+        /*
+         * Record the transmit timestamp. This should be as close as possible to
+         * the send-to to ensure the timestamp is reasonably accurate
+         */
+        assert_se(clock_gettime(CLOCK_BOOTTIME, &m->trans_time_mon) >= 0);
+        assert_se(clock_gettime(CLOCK_REALTIME, &m->trans_time) >= 0);
 
         len = sendto(m->server_socket, &ntpmsg, sizeof(ntpmsg), MSG_DONTWAIT, &m->current_server_address->sockaddr.sa, m->current_server_address->socklen);
         if (len == sizeof(ntpmsg)) {
@@ -158,8 +161,8 @@ static int manager_send_request(Manager *m) {
                 r = sd_event_add_time(
                                 m->event,
                                 &m->event_timeout,
-                                clock_boottime_or_monotonic(),
-                                now(clock_boottime_or_monotonic()) + TIMEOUT_USEC, 0,
+                                CLOCK_BOOTTIME,
+                                now(CLOCK_BOOTTIME) + TIMEOUT_USEC, 0,
                                 manager_timeout, m);
                 if (r < 0)
                         return log_error_errno(r, "Failed to arm timeout timer: %m");
@@ -169,9 +172,7 @@ static int manager_send_request(Manager *m) {
 }
 
 static int manager_timer(sd_event_source *source, usec_t usec, void *userdata) {
-        Manager *m = userdata;
-
-        assert(m);
+        Manager *m = ASSERT_PTR(userdata);
 
         return manager_send_request(m);
 }
@@ -197,15 +198,13 @@ static int manager_arm_timer(Manager *m, usec_t next) {
         return sd_event_add_time_relative(
                         m->event,
                         &m->event_timer,
-                        clock_boottime_or_monotonic(),
+                        CLOCK_BOOTTIME,
                         next, 0,
                         manager_timer, m);
 }
 
 static int manager_clock_watch(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
-
-        assert(m);
+        Manager *m = ASSERT_PTR(userdata);
 
         /* rearm timer */
         manager_clock_watch_setup(m);
@@ -229,14 +228,9 @@ static int manager_clock_watch_setup(Manager *m) {
 
         assert(m);
 
-        m->event_clock_watch = sd_event_source_unref(m->event_clock_watch);
-        safe_close(m->clock_watch_fd);
+        m->event_clock_watch = sd_event_source_disable_unref(m->event_clock_watch);
 
-        m->clock_watch_fd = time_change_fd();
-        if (m->clock_watch_fd < 0)
-                return log_error_errno(m->clock_watch_fd, "Failed to create timerfd: %m");
-
-        r = sd_event_add_io(m->event, &m->event_clock_watch, m->clock_watch_fd, EPOLLIN, manager_clock_watch, m);
+        r = event_add_time_change(m->event, &m->event_clock_watch, manager_clock_watch, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to create clock watch event source: %m");
 
@@ -244,31 +238,29 @@ static int manager_clock_watch_setup(Manager *m) {
 }
 
 static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
-        struct timex tmx = {};
-        int r;
+        struct timex tmx;
 
         assert(m);
 
-        /*
-         * For small deltas, tell the kernel to gradually adjust the system
-         * clock to the NTP time, larger deltas are just directly set.
-         */
+        /* For small deltas, tell the kernel to gradually adjust the system clock to the NTP time, larger
+         * deltas are just directly set. */
         if (fabs(offset) < NTP_MAX_ADJUST) {
-                tmx.modes = ADJ_STATUS | ADJ_NANO | ADJ_OFFSET | ADJ_TIMECONST | ADJ_MAXERROR | ADJ_ESTERROR;
-                tmx.status = STA_PLL;
-                tmx.offset = offset * NSEC_PER_SEC;
-                tmx.constant = log2i(m->poll_interval_usec / USEC_PER_SEC) - 4;
-                tmx.maxerror = 0;
-                tmx.esterror = 0;
+                tmx = (struct timex) {
+                        .modes = ADJ_STATUS | ADJ_NANO | ADJ_OFFSET | ADJ_TIMECONST | ADJ_MAXERROR | ADJ_ESTERROR,
+                        .status = STA_PLL,
+                        .offset = offset * NSEC_PER_SEC,
+                        .constant = log2i(m->poll_interval_usec / USEC_PER_SEC) - 4,
+                };
+
                 log_debug("  adjust (slew): %+.3f sec", offset);
         } else {
-                tmx.modes = ADJ_STATUS | ADJ_NANO | ADJ_SETOFFSET | ADJ_MAXERROR | ADJ_ESTERROR;
+                tmx = (struct timex) {
+                        .modes = ADJ_STATUS | ADJ_NANO | ADJ_SETOFFSET | ADJ_MAXERROR | ADJ_ESTERROR,
 
-                /* ADJ_NANO uses nanoseconds in the microseconds field */
-                tmx.time.tv_sec = (long)offset;
-                tmx.time.tv_usec = (offset - tmx.time.tv_sec) * NSEC_PER_SEC;
-                tmx.maxerror = 0;
-                tmx.esterror = 0;
+                        /* ADJ_NANO uses nanoseconds in the microseconds field */
+                        .time.tv_sec = (long)offset,
+                        .time.tv_usec = (offset - (double) (long) offset) * NSEC_PER_SEC,
+                };
 
                 /* the kernel expects -0.3s as {-1, 7000.000.000} */
                 if (tmx.time.tv_usec < 0) {
@@ -280,14 +272,11 @@ static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
                 log_debug("  adjust (jump): %+.3f sec", offset);
         }
 
-        /*
-         * An unset STA_UNSYNC will enable the kernel's 11-minute mode,
-         * which syncs the system time periodically to the RTC.
+        /* An unset STA_UNSYNC will enable the kernel's 11-minute mode, which syncs the system time
+         * periodically to the RTC.
          *
-         * In case the RTC runs in local time, never touch the RTC,
-         * we have no way to properly handle daylight saving changes and
-         * mobile devices moving between time zones.
-         */
+         * In case the RTC runs in local time, never touch the RTC, we have no way to properly handle
+         * daylight saving changes and mobile devices moving between time zones. */
         if (m->rtc_local_time)
                 tmx.status |= STA_UNSYNC;
 
@@ -300,16 +289,8 @@ static int manager_adjust_clock(Manager *m, double offset, int leap_sec) {
                 break;
         }
 
-        r = clock_adjtime(CLOCK_REALTIME, &tmx);
-        if (r < 0)
+        if (clock_adjtime(CLOCK_REALTIME, &tmx) < 0)
                 return -errno;
-
-        r = manager_save_time_and_rearm(m);
-        if (r < 0)
-                return r;
-
-        /* If touch fails, there isn't much we can do. Maybe it'll work next time. */
-        (void) touch("/run/systemd/timesync/synchronized");
 
         m->drift_freq = tmx.freq;
 
@@ -354,8 +335,8 @@ static bool manager_sample_spike_detection(Manager *m, double offset, double del
                         idx_min = i;
 
         j = 0;
-        for (i = 0; i < ELEMENTSOF(m->samples); i++)
-                j += pow(m->samples[i].offset - m->samples[idx_min].offset, 2);
+        FOREACH_ELEMENT(sample, m->samples)
+                j += pow(sample->offset - m->samples[idx_min].offset, 2);
         m->samples_jitter = sqrt(j / (ELEMENTSOF(m->samples) - 1));
 
         /* ignore samples when resyncing */
@@ -409,7 +390,7 @@ static void manager_adjust_poll(Manager *m, double offset, bool spike) {
 }
 
 static int manager_receive_response(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         struct ntp_msg ntpmsg;
 
         struct iovec iov = {
@@ -427,18 +408,14 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 .msg_name = &server_addr,
                 .msg_namelen = sizeof(server_addr),
         };
-        struct cmsghdr *cmsg;
-        struct timespec *recv_time = NULL;
+        struct timespec *recv_time;
+        triple_timestamp dts;
         ssize_t len;
-        double origin, receive, trans, dest;
-        double delay, offset;
-        double root_distance;
+        double origin, receive, trans, dest, delay, offset, root_distance;
         bool spike;
-        int leap_sec;
-        int r;
+        int leap_sec, r;
 
         assert(source);
-        assert(m);
 
         if (revents & (EPOLLHUP|EPOLLERR)) {
                 log_warning("Server connection returned error.");
@@ -446,15 +423,18 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
         }
 
         len = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT);
-        if (len == -EAGAIN)
+        if (ERRNO_IS_NEG_TRANSIENT(len))
                 return 0;
         if (len < 0) {
-                log_warning_errno(len, "Error receiving message, disconnecting: %m");
+                log_warning_errno(len, "Error receiving message, disconnecting: %s",
+                                  len == -ECHRNG ? "got truncated control data" :
+                                  len == -EXFULL ? "got truncated payload data" :
+                                  STRERROR((int) len));
                 return manager_connect(m);
         }
 
-        /* Too short or too long packet? */
-        if (iov.iov_len < sizeof(struct ntp_msg) || (msghdr.msg_flags & MSG_TRUNC)) {
+        /* Too short packet? */
+        if (iov.iov_len < sizeof(struct ntp_msg)) {
                 log_warning("Invalid response from server. Disconnecting.");
                 return manager_connect(m);
         }
@@ -466,21 +446,9 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 return 0;
         }
 
-        CMSG_FOREACH(cmsg, &msghdr) {
-                if (cmsg->cmsg_level != SOL_SOCKET)
-                        continue;
-
-                switch (cmsg->cmsg_type) {
-                case SCM_TIMESTAMPNS:
-                        assert(cmsg->cmsg_len == CMSG_LEN(sizeof(struct timespec)));
-
-                        recv_time = (struct timespec *) CMSG_DATA(cmsg);
-                        break;
-                }
-        }
+        recv_time = CMSG_FIND_AND_COPY_DATA(&msghdr, SOL_SOCKET, SCM_TIMESTAMPNS, struct timespec);
         if (!recv_time)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Invalid packet timestamp.");
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Packet timestamp missing.");
 
         if (!m->pending) {
                 log_debug("Unexpected reply. Ignoring.");
@@ -489,9 +457,8 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
 
         m->missed_replies = 0;
 
-        /* check our "time cookie" (we just stored nanoseconds in the fraction field) */
-        if (be32toh(ntpmsg.origin_time.sec) != graceful_add_offset_1900_1970(m->trans_time.tv_sec) ||
-            be32toh(ntpmsg.origin_time.frac) != (unsigned long) m->trans_time.tv_nsec) {
+        /* check the transmit request nonce was properly returned in the origin_time field */
+        if (ntpmsg.origin_time.sec != m->request_nonce.sec || ntpmsg.origin_time.frac != m->request_nonce.frac) {
                 log_debug("Invalid reply; not our transmit time. Ignoring.");
                 return 0;
         }
@@ -565,11 +532,11 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
         manager_adjust_poll(m, offset, spike);
 
         log_debug("NTP response:\n"
-                  "  leap         : %u\n"
-                  "  version      : %u\n"
-                  "  mode         : %u\n"
+                  "  leap         : %i\n"
+                  "  version      : %i\n"
+                  "  mode         : %i\n"
                   "  stratum      : %u\n"
-                  "  precision    : %.6f sec (%d)\n"
+                  "  precision    : %.6f sec (%i)\n"
                   "  root distance: %.6f sec\n"
                   "  reference    : %.4s\n"
                   "  origin       : %.3f\n"
@@ -597,10 +564,23 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                   m->samples_jitter, spike ? " spike" : "",
                   m->poll_interval_usec / USEC_PER_SEC);
 
+        /* Get current monotonic/realtime clocks immediately before adjusting the latter */
+        triple_timestamp_now(&dts);
+
         if (!spike) {
+                /* Fix up our idea of the time. */
+                dts.realtime = (usec_t) (dts.realtime + offset * USEC_PER_SEC);
+
                 r = manager_adjust_clock(m, offset, leap_sec);
                 if (r < 0)
                         log_error_errno(r, "Failed to call clock_adjtime(): %m");
+
+                (void) manager_save_time_and_rearm(m, dts.realtime);
+
+                /* If touch fails, there isn't much we can do. Maybe it'll work next time. */
+                r = touch("/run/systemd/timesync/synchronized");
+                if (r < 0)
+                        log_debug_errno(r, "Failed to touch /run/systemd/timesync/synchronized, ignoring: %m");
         }
 
         /* Save NTP response */
@@ -621,15 +601,27 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                                 "NTPMessage",
                                 NULL);
 
-        if (!m->good) {
+        if (!m->talking) {
                 _cleanup_free_ char *pretty = NULL;
 
-                m->good = true;
+                m->talking = true;
 
-                server_address_pretty(m->current_server_address, &pretty);
-                /* "Initial", as further successful syncs will not be logged. */
-                log_info("Initial synchronization to time server %s (%s).", strna(pretty), m->current_server_name->string);
-                sd_notifyf(false, "STATUS=Initial synchronization to time server %s (%s).", strna(pretty), m->current_server_name->string);
+                (void) server_address_pretty(m->current_server_address, &pretty);
+
+                log_info("Contacted time server %s (%s).", strna(pretty), m->current_server_name->string);
+                (void) sd_notifyf(false, "STATUS=Contacted time server %s (%s).", strna(pretty), m->current_server_name->string);
+        }
+
+        if (!spike && !m->synchronized) {
+                m->synchronized = true;
+
+                log_struct(LOG_INFO,
+                           LOG_MESSAGE("Initial clock synchronization to %s.",
+                                       FORMAT_TIMESTAMP_STYLE(dts.realtime, TIMESTAMP_US)),
+                           "MESSAGE_ID=" SD_MESSAGE_TIME_SYNC_STR,
+                           "MONOTONIC_USEC=" USEC_FMT, dts.monotonic,
+                           "REALTIME_USEC=" USEC_FMT, dts.realtime,
+                           "BOOTTIME_USEC=" USEC_FMT, dts.boottime);
         }
 
         r = manager_arm_timer(m, m->poll_interval_usec);
@@ -665,8 +657,7 @@ static int manager_listen_setup(Manager *m) {
         if (r < 0)
                 return r;
 
-        if (addr.sa.sa_family == AF_INET)
-                (void) setsockopt_int(m->server_socket, IPPROTO_IP, IP_TOS, IPTOS_LOWDELAY);
+        (void) socket_set_option(m->server_socket, addr.sa.sa_family, IP_TOS, IPV6_TCLASS, IPTOS_DSCP_EF);
 
         return sd_event_add_io(m->event, &m->event_receive, m->server_socket, EPOLLIN, manager_receive_response, m);
 }
@@ -686,14 +677,14 @@ static int manager_begin(Manager *m) {
         assert_return(m->current_server_name, -EHOSTUNREACH);
         assert_return(m->current_server_address, -EHOSTUNREACH);
 
-        m->good = false;
+        m->talking = false;
         m->missed_replies = NTP_MAX_MISSED_REPLIES;
         if (m->poll_interval_usec == 0)
                 m->poll_interval_usec = m->poll_interval_min_usec;
 
         server_address_pretty(m->current_server_address, &pretty);
         log_debug("Connecting to time server %s (%s).", strna(pretty), m->current_server_name->string);
-        sd_notifyf(false, "STATUS=Connecting to time server %s (%s).", strna(pretty), m->current_server_name->string);
+        (void) sd_notifyf(false, "STATUS=Connecting to time server %s (%s).", strna(pretty), m->current_server_name->string);
 
         r = manager_clock_watch_setup(m);
         if (r < 0)
@@ -762,7 +753,7 @@ static int manager_resolve_handler(sd_resolve_query *q, int ret, const struct ad
                 assert(ai->ai_addrlen >= offsetof(struct sockaddr, sa_data));
 
                 if (!IN_SET(ai->ai_addr->sa_family, AF_INET, AF_INET6)) {
-                        log_warning("Unsuitable address protocol for %s", m->current_server_name->string);
+                        log_debug("Ignoring unsuitable address protocol for %s.", m->current_server_name->string);
                         continue;
                 }
 
@@ -787,9 +778,7 @@ static int manager_resolve_handler(sd_resolve_query *q, int ret, const struct ad
 }
 
 static int manager_retry_connect(sd_event_source *source, usec_t usec, void *userdata) {
-        Manager *m = userdata;
-
-        assert(m);
+        Manager *m = ASSERT_PTR(userdata);
 
         return manager_connect(m);
 }
@@ -805,7 +794,7 @@ int manager_connect(Manager *m) {
         if (!ratelimit_below(&m->ratelimit)) {
                 log_debug("Delaying attempts to contact servers.");
 
-                r = sd_event_add_time_relative(m->event, &m->event_retry, clock_boottime_or_monotonic(), m->connection_retry_usec,
+                r = sd_event_add_time_relative(m->event, &m->event_retry, CLOCK_BOOTTIME, m->connection_retry_usec,
                                                0, manager_retry_connect, m);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create retry timer: %m");
@@ -818,11 +807,6 @@ int manager_connect(Manager *m) {
         if (m->current_server_address && m->current_server_address->addresses_next)
                 manager_set_server_address(m, m->current_server_address->addresses_next);
         else {
-                struct addrinfo hints = {
-                        .ai_flags = AI_NUMERICSERV|AI_ADDRCONFIG,
-                        .ai_socktype = SOCK_DGRAM,
-                };
-
                 /* Hmm, we are through all addresses, let's look for the next host instead */
                 if (m->current_server_name && m->current_server_name->names_next)
                         manager_set_server_name(m, m->current_server_name->names_next);
@@ -831,22 +815,25 @@ int manager_connect(Manager *m) {
                         bool restart = true;
 
                         /* Our current server name list is exhausted,
-                         * let's find the next one to iterate. First
-                         * we try the system list, then the link list.
-                         * After having processed the link list we
-                         * jump back to the system list. However, if
-                         * both lists are empty, we change to the
-                         * fallback list. */
+                         * let's find the next one to iterate. First we try the runtime list, then the system list,
+                         * then the link list. After having processed the link list we jump back to the system list
+                         * if no runtime server list.
+                         * However, if all lists are empty, we change to the fallback list. */
                         if (!m->current_server_name || m->current_server_name->type == SERVER_LINK) {
-                                f = m->system_servers;
+                                f = m->runtime_servers;
+                                if (!f)
+                                        f = m->system_servers;
                                 if (!f)
                                         f = m->link_servers;
                         } else {
                                 f = m->link_servers;
-                                if (!f)
-                                        f = m->system_servers;
-                                else
+                                if (f)
                                         restart = false;
+                                else {
+                                        f = m->runtime_servers;
+                                        if (!f)
+                                                f = m->system_servers;
+                                }
                         }
 
                         if (!f)
@@ -858,9 +845,9 @@ int manager_connect(Manager *m) {
                                 return 0;
                         }
 
-                        if (restart && !m->exhausted_servers && m->poll_interval_usec) {
+                        if (restart && !m->exhausted_servers && m->poll_interval_usec > 0) {
                                 log_debug("Waiting after exhausting servers.");
-                                r = sd_event_add_time_relative(m->event, &m->event_retry, clock_boottime_or_monotonic(), m->poll_interval_usec, 0, manager_retry_connect, m);
+                                r = sd_event_add_time_relative(m->event, &m->event_retry, CLOCK_BOOTTIME, m->poll_interval_usec, 0, manager_retry_connect, m);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to create retry timer: %m");
 
@@ -887,6 +874,12 @@ int manager_connect(Manager *m) {
 
                 log_debug("Resolving %s...", m->current_server_name->string);
 
+                struct addrinfo hints = {
+                        .ai_flags = AI_NUMERICSERV|AI_ADDRCONFIG,
+                        .ai_socktype = SOCK_DGRAM,
+                        .ai_family = socket_ipv6_is_supported() ? AF_UNSPEC : AF_INET,
+                };
+
                 r = resolve_getaddrinfo(m->resolve, &m->resolve_query, m->current_server_name->string, "123", &hints, manager_resolve_handler, NULL, m);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create resolver: %m");
@@ -910,12 +903,11 @@ void manager_disconnect(Manager *m) {
 
         manager_listen_stop(m);
 
-        m->event_clock_watch = sd_event_source_unref(m->event_clock_watch);
-        m->clock_watch_fd = safe_close(m->clock_watch_fd);
+        m->event_clock_watch = sd_event_source_disable_unref(m->event_clock_watch);
 
         m->event_timeout = sd_event_source_unref(m->event_timeout);
 
-        sd_notify(false, "STATUS=Idle.");
+        (void) sd_notify(false, "STATUS=Idle.");
 }
 
 void manager_flush_server_names(Manager  *m, ServerType t) {
@@ -932,6 +924,16 @@ void manager_flush_server_names(Manager  *m, ServerType t) {
         if (t == SERVER_FALLBACK)
                 while (m->fallback_servers)
                         server_name_free(m->fallback_servers);
+
+        if (t == SERVER_RUNTIME)
+                manager_flush_runtime_servers(m);
+}
+
+void manager_flush_runtime_servers(Manager *m) {
+        assert(m);
+
+        while (m->runtime_servers)
+                server_name_free(m->runtime_servers);
 }
 
 Manager* manager_free(Manager *m) {
@@ -941,6 +943,7 @@ Manager* manager_free(Manager *m) {
         manager_disconnect(m);
         manager_flush_server_names(m, SERVER_SYSTEM);
         manager_flush_server_names(m, SERVER_LINK);
+        manager_flush_server_names(m, SERVER_RUNTIME);
         manager_flush_server_names(m, SERVER_FALLBACK);
 
         sd_event_source_unref(m->event_retry);
@@ -950,25 +953,27 @@ Manager* manager_free(Manager *m) {
 
         sd_event_source_unref(m->event_save_time);
 
+        sd_event_source_unref(m->deferred_ntp_server_event_source);
+
         sd_resolve_unref(m->resolve);
         sd_event_unref(m->event);
 
         sd_bus_flush_close_unref(m->bus);
+
+        hashmap_free(m->polkit_registry);
 
         return mfree(m);
 }
 
 static int manager_network_read_link_servers(Manager *m) {
         _cleanup_strv_free_ char **ntp = NULL;
-        ServerName *n, *nx;
-        char **i;
         bool changed = false;
         int r;
 
         assert(m);
 
         r = sd_network_get_ntp(&ntp);
-        if (r < 0) {
+        if (r < 0 && r != -ENODATA) {
                 if (r == -ENOMEM)
                         log_oom();
                 else
@@ -1009,7 +1014,7 @@ static int manager_network_read_link_servers(Manager *m) {
                 }
         }
 
-        LIST_FOREACH_SAFE(names, n, nx, m->link_servers)
+        LIST_FOREACH(names, n, m->link_servers)
                 if (n->marked) {
                         server_name_free(n);
                         changed = true;
@@ -1023,17 +1028,17 @@ clear:
 }
 
 static bool manager_is_connected(Manager *m) {
+        assert(m);
+
         /* Return true when the manager is sending a request, resolving a server name, or
          * in a poll interval. */
         return m->server_socket >= 0 || m->resolve_query || m->event_timer;
 }
 
 static int manager_network_event_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         bool changed, connected, online;
         int r;
-
-        assert(m);
 
         sd_network_monitor_flush(m->network_monitor);
 
@@ -1047,11 +1052,15 @@ static int manager_network_event_handler(sd_event_source *s, int fd, uint32_t re
         connected = manager_is_connected(m);
 
         if (connected && !online) {
-                log_info("No network connectivity, watching for changes.");
+                /* When m->talking is false, we have not received any responses from the server,
+                 * and it is not necessary to log about disconnection. */
+                log_full(m->talking ? LOG_INFO : LOG_DEBUG,
+                         "No network connectivity, watching for changes.");
                 manager_disconnect(m);
 
         } else if ((!connected || changed) && online) {
-                log_info("Network configuration changed, trying to establish connection.");
+                log_full(connected ? LOG_DEBUG : LOG_INFO,
+                         "Network configuration changed, trying to establish connection.");
 
                 if (m->current_server_address)
                         r = manager_begin(m);
@@ -1098,30 +1107,52 @@ int manager_new(Manager **ret) {
 
         assert(ret);
 
-        m = new0(Manager, 1);
+        m = new(Manager, 1);
         if (!m)
                 return -ENOMEM;
 
-        m->root_distance_max_usec = NTP_ROOT_DISTANCE_MAX_USEC;
-        m->poll_interval_min_usec = NTP_POLL_INTERVAL_MIN_USEC;
-        m->poll_interval_max_usec = NTP_POLL_INTERVAL_MAX_USEC;
+        *m = (Manager) {
+                .root_distance_max_usec = NTP_ROOT_DISTANCE_MAX_USEC,
+                .poll_interval_min_usec = NTP_POLL_INTERVAL_MIN_USEC,
+                .poll_interval_max_usec = NTP_POLL_INTERVAL_MAX_USEC,
 
-        m->connection_retry_usec = DEFAULT_CONNECTION_RETRY_USEC;
+                .connection_retry_usec = DEFAULT_CONNECTION_RETRY_USEC,
 
-        m->server_socket = m->clock_watch_fd = -1;
+                .server_socket = -EBADF,
 
-        m->ratelimit = (RateLimit) { RATELIMIT_INTERVAL_USEC, RATELIMIT_BURST };
+                .ratelimit = (const RateLimit) {
+                        RATELIMIT_INTERVAL_USEC,
+                        RATELIMIT_BURST
+                },
 
-        m->save_time_interval_usec = DEFAULT_SAVE_TIME_INTERVAL_USEC;
+                .save_time_interval_usec = DEFAULT_SAVE_TIME_INTERVAL_USEC,
+        };
 
         r = sd_event_default(&m->event);
         if (r < 0)
                 return r;
 
-        (void) sd_event_add_signal(m->event, NULL, SIGTERM, NULL,  NULL);
-        (void) sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(m->event, true);
+        if (r < 0)
+                return r;
 
-        (void) sd_event_set_watchdog(m->event, true);
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
+        if (r < 0)
+                log_debug_errno(r, "Failed to install SIGRTMIN+18 signal handler, ignoring: %m");
+
+        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        if (r < 0)
+                log_debug_errno(r, "Failed allocate memory pressure event source, ignoring: %m");
+
+        r = sd_event_set_watchdog(m->event, true);
+        if (r < 0)
+                log_debug_errno(r, "Failed to enable watchdog handling, ignoring: %m");
+
+        /* Load previous synchronization state */
+        r = access("/run/systemd/timesync/synchronized", F_OK);
+        if (r < 0 && errno != ENOENT)
+                log_debug_errno(errno, "Failed to determine whether /run/systemd/timesync/synchronized exists, ignoring: %m");
+        m->synchronized = r >= 0;
 
         r = sd_resolve_default(&m->resolve);
         if (r < 0)
@@ -1143,11 +1174,9 @@ int manager_new(Manager **ret) {
 }
 
 static int manager_save_time_handler(sd_event_source *s, uint64_t usec, void *userdata) {
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
 
-        assert(m);
-
-        (void) manager_save_time_and_rearm(m);
+        (void) manager_save_time_and_rearm(m, USEC_INFINITY);
         return 0;
 }
 
@@ -1163,7 +1192,7 @@ int manager_setup_save_time_event(Manager *m) {
         /* NB: we'll accumulate scheduling latencies here, but this doesn't matter */
         r = sd_event_add_time_relative(
                         m->event, &m->event_save_time,
-                        clock_boottime_or_monotonic(),
+                        CLOCK_BOOTTIME,
                         m->save_time_interval_usec,
                         10 * USEC_PER_SEC,
                         manager_save_time_handler, m);
@@ -1175,14 +1204,18 @@ int manager_setup_save_time_event(Manager *m) {
         return 0;
 }
 
-static int manager_save_time_and_rearm(Manager *m) {
+static int manager_save_time_and_rearm(Manager *m, usec_t t) {
         int r;
 
         assert(m);
 
-        r = touch(CLOCK_FILE);
+        /* Updates the timestamp file to the specified time. If 't' is USEC_INFINITY uses the current system
+         * clock, but otherwise uses the specified timestamp. Note that whenever we acquire an NTP sync the
+         * specified timestamp value might be more accurate than the system clock, since the latter is
+         * subject to slow adjustments. */
+        r = touch_file(TIMESYNCD_CLOCK_FILE, false, t, UID_INVALID, GID_INVALID, MODE_INVALID);
         if (r < 0)
-                log_debug_errno(r, "Failed to update " CLOCK_FILE ", ignoring: %m");
+                log_debug_errno(r, "Failed to update "TIMESYNCD_CLOCK_FILE", ignoring: %m");
 
         m->save_on_exit = true;
 
@@ -1197,4 +1230,72 @@ static int manager_save_time_and_rearm(Manager *m) {
         }
 
         return 0;
+}
+
+static const char* ntp_server_property_name[_SERVER_TYPE_MAX] = {
+        [SERVER_SYSTEM]   = "SystemNTPServers",
+        [SERVER_FALLBACK] = "FallbackNTPServers",
+        [SERVER_LINK]     = "LinkNTPServers",
+        [SERVER_RUNTIME]  = "RuntimeNTPServers",
+};
+
+static int ntp_server_emit_changed_strv(Manager *manager, char **properties) {
+        assert(manager);
+        assert(properties);
+
+        if (sd_bus_is_ready(manager->bus) <= 0)
+                return 0;
+
+        return sd_bus_emit_properties_changed_strv(
+                        manager->bus,
+                        "/org/freedesktop/timesync1",
+                        "org.freedesktop.timesync1.Manager",
+                        properties);
+}
+
+static int on_deferred_ntp_server(sd_event_source *s, void *userdata) {
+        int r;
+        _cleanup_strv_free_ char **p = NULL;
+        Manager *m = ASSERT_PTR(userdata);
+
+        m->deferred_ntp_server_event_source = sd_event_source_disable_unref(m->deferred_ntp_server_event_source);
+
+        for (int type = SERVER_SYSTEM; type < _SERVER_TYPE_MAX; type++)
+                if (m->ntp_server_change_mask & (1U << type))
+                        if (strv_extend(&p, ntp_server_property_name[type]) < 0)
+                                log_oom();
+
+        m->ntp_server_change_mask = 0;
+
+        if (strv_isempty(p))
+                return log_error_errno(SYNTHETIC_ERRNO(ENOMEM), "Failed to build ntp server event strv!");
+
+        r = ntp_server_emit_changed_strv(m, p);
+        if (r < 0)
+                log_warning_errno(r, "Could not emit ntp server changed properties, ignoring: %m");
+
+        return 0;
+}
+
+int bus_manager_emit_ntp_server_changed(Manager *m) {
+        int r;
+
+        assert(m);
+
+        if (m->deferred_ntp_server_event_source)
+                return 0;
+
+        if (!m->event)
+                return 0;
+
+        if (IN_SET(sd_event_get_state(m->event), SD_EVENT_FINISHED, SD_EVENT_EXITING))
+                return 0;
+
+        r = sd_event_add_defer(m->event, &m->deferred_ntp_server_event_source, on_deferred_ntp_server, m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate ntp server event source: %m");
+
+        (void) sd_event_source_set_description(m->deferred_ntp_server_event_source, "deferred-ntp-server");
+
+        return 1;
 }

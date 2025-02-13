@@ -7,6 +7,8 @@
 
 #include "sd-id128.h"
 
+#include "capability-util.h"
+#include "set.h"
 #include "time-util.h"
 
 typedef struct ClientContext ClientContext;
@@ -26,7 +28,7 @@ struct ClientContext {
         char *comm;
         char *exe;
         char *cmdline;
-        char *capeff;
+        CapabilityQuintet capability_quintet;
 
         uint32_t auditid;
         uid_t loginuid;
@@ -55,6 +57,9 @@ struct ClientContext {
 
         usec_t log_ratelimit_interval;
         unsigned log_ratelimit_burst;
+
+        Set *log_filter_allowed_patterns;
+        Set *log_filter_denied_patterns;
 };
 
 int client_context_get(
@@ -85,6 +90,7 @@ void client_context_maybe_refresh(
 
 void client_context_acquire_default(Server *s);
 void client_context_flush_all(Server *s);
+void client_context_flush_regular(Server *s);
 
 static inline size_t client_context_extra_fields_n_iovec(const ClientContext *c) {
         return c ? c->extra_fields_n_iovec : 0;

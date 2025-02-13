@@ -13,6 +13,7 @@
 #include "errno-util.h"
 #include "exec-util.h"
 #include "exit-status.h"
+#include "fd-util.h"
 #include "format-util.h"
 #include "hexdecoct.h"
 #include "hostname-util.h"
@@ -23,6 +24,7 @@
 #include "locale-util.h"
 #include "memory-util.h"
 #include "numa-util.h"
+#include "open-file.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "pretty-print.h"
@@ -64,7 +66,7 @@ typedef struct ExecStatusInfo {
 
         ExecCommandFlags flags;
 
-        LIST_FIELDS(struct ExecStatusInfo, exec);
+        LIST_FIELDS(struct ExecStatusInfo, exec_status_info_list);
 } ExecStatusInfo;
 
 static void exec_status_info_free(ExecStatusInfo *i) {
@@ -192,16 +194,27 @@ typedef struct UnitStatusInfo {
         usec_t active_exit_timestamp;
         usec_t inactive_enter_timestamp;
 
+        uint64_t runtime_max_sec;
+
+        uint32_t job_id;
+
+        sd_id128_t invocation_id;
+
         bool need_daemon_reload;
         bool transient;
 
         /* Service */
+        bool running;
         pid_t main_pid;
         pid_t control_pid;
-        const char *status_text;
         const char *pid_file;
-        bool running:1;
+        const char *status_text;
+        const char *status_bus_error;
+        const char *status_varlink_error;
         int status_errno;
+
+        uint32_t fd_store_max;
+        uint32_t n_fd_store;
 
         usec_t start_timestamp;
         usec_t exit_timestamp;
@@ -243,11 +256,21 @@ typedef struct UnitStatusInfo {
 
         /* CGroup */
         uint64_t memory_current;
+        uint64_t memory_peak;
+        uint64_t memory_swap_current;
+        uint64_t memory_swap_peak;
+        uint64_t memory_zswap_current;
         uint64_t memory_min;
         uint64_t memory_low;
+        uint64_t startup_memory_low;
         uint64_t memory_high;
+        uint64_t startup_memory_high;
         uint64_t memory_max;
+        uint64_t startup_memory_max;
         uint64_t memory_swap_max;
+        uint64_t startup_memory_swap_max;
+        uint64_t memory_zswap_max;
+        uint64_t startup_memory_zswap_max;
         uint64_t memory_limit;
         uint64_t memory_available;
         uint64_t cpu_usage_nsec;
@@ -260,40 +283,45 @@ typedef struct UnitStatusInfo {
 
         uint64_t default_memory_min;
         uint64_t default_memory_low;
+        uint64_t default_startup_memory_low;
 
-        LIST_HEAD(ExecStatusInfo, exec);
+        LIST_HEAD(ExecStatusInfo, exec_status_info_list);
 } UnitStatusInfo;
 
-static void unit_status_info_free(UnitStatusInfo *info) {
-        ExecStatusInfo *p;
-        UnitCondition *c;
-
+static void unit_status_info_done(UnitStatusInfo *info) {
         strv_free(info->documentation);
         strv_free(info->dropin_paths);
         strv_free(info->triggered_by);
         strv_free(info->triggers);
         strv_free(info->listen);
 
-        while ((c = info->conditions)) {
-                LIST_REMOVE(conditions, info->conditions, c);
-                unit_condition_free(c);
-        }
-
-        while ((p = info->exec)) {
-                LIST_REMOVE(exec, info->exec, p);
-                exec_status_info_free(p);
-        }
+        LIST_CLEAR(conditions, info->conditions, unit_condition_free);
+        LIST_CLEAR(exec_status_info_list, info->exec_status_info_list, exec_status_info_free);
 }
 
 static void format_active_state(const char *active_state, const char **active_on, const char **active_off) {
         if (streq_ptr(active_state, "failed")) {
                 *active_on = ansi_highlight_red();
                 *active_off = ansi_normal();
-        } else if (STRPTR_IN_SET(active_state, "active", "reloading")) {
+        } else if (STRPTR_IN_SET(active_state, "active", "reloading", "refreshing")) {
                 *active_on = ansi_highlight_green();
                 *active_off = ansi_normal();
         } else
                 *active_on = *active_off = "";
+}
+
+static void format_enable_state(const char *enable_state, const char **enable_on, const char **enable_off) {
+        assert(enable_on);
+        assert(enable_off);
+
+        if (streq_ptr(enable_state, "disabled")) {
+                *enable_on = ansi_highlight_yellow();
+                *enable_off = ansi_normal();
+        } else if (streq_ptr(enable_state, "enabled")) {
+                *enable_on = ansi_highlight_green();
+                *enable_off = ansi_normal();
+        } else
+                *enable_on = *enable_off = "";
 }
 
 static void print_status_info(
@@ -302,11 +330,10 @@ static void print_status_info(
                 bool *ellipsized) {
 
         const char *active_on, *active_off, *on, *off, *ss, *fs;
+        const char *enable_on, *enable_off, *preset_on, *preset_off;
         _cleanup_free_ char *formatted_path = NULL;
-        ExecStatusInfo *p;
         usec_t timestamp;
         const char *path;
-        char **t, **t2;
         int r;
 
         assert(i);
@@ -315,6 +342,8 @@ static void print_status_info(
          * printer */
 
         format_active_state(i->active_state, &active_on, &active_off);
+        format_enable_state(i->unit_file_state, &enable_on, &enable_off);
+        format_enable_state(i->unit_file_preset, &preset_on, &preset_off);
 
         const SpecialGlyph glyph = unit_active_state_to_glyph(unit_active_state_from_string(i->active_state));
 
@@ -345,12 +374,12 @@ static void print_status_info(
                 bool show_preset = !isempty(i->unit_file_preset) &&
                         show_preset_for_state(unit_file_state_from_string(i->unit_file_state));
 
-                printf("     Loaded: %s%s%s (%s; %s%s%s)\n",
+                printf("     Loaded: %s%s%s (%s; %s%s%s%s%s%s%s)\n",
                        on, strna(i->load_state), off,
                        path,
-                       i->unit_file_state,
-                       show_preset ? "; vendor preset: " : "",
-                       show_preset ? i->unit_file_preset : "");
+                       enable_on, i->unit_file_state, enable_off,
+                       show_preset ? "; preset: " : "",
+                       preset_on, show_preset ? i->unit_file_preset : "", preset_off);
 
         } else if (path)
                 printf("     Loaded: %s%s%s (%s)\n",
@@ -365,7 +394,6 @@ static void print_status_info(
         if (!strv_isempty(i->dropin_paths)) {
                 _cleanup_free_ char *dir = NULL;
                 bool last = false;
-                char ** dropin;
 
                 STRV_FOREACH(dropin, i->dropin_paths) {
                         _cleanup_free_ char *dropin_formatted = NULL;
@@ -377,10 +405,10 @@ static void print_status_info(
 
                                 dir = mfree(dir);
 
-                                dir = dirname_malloc(*dropin);
-                                if (!dir) {
-                                        log_oom();
-                                        return;
+                                r = path_extract_directory(*dropin, &dir);
+                                if (r < 0) {
+                                        log_error_errno(r, "Failed to extract directory of '%s': %m", *dropin);
+                                        break;
                                 }
 
                                 printf("%s\n"
@@ -414,17 +442,43 @@ static void print_status_info(
         if (!isempty(i->result) && !streq(i->result, "success"))
                 printf(" (Result: %s)", i->result);
 
-        timestamp = STRPTR_IN_SET(i->active_state, "active", "reloading") ? i->active_enter_timestamp :
-                    STRPTR_IN_SET(i->active_state, "inactive", "failed")  ? i->inactive_enter_timestamp :
-                    STRPTR_IN_SET(i->active_state, "activating")          ? i->inactive_exit_timestamp :
-                                                                            i->active_exit_timestamp;
+        timestamp = STRPTR_IN_SET(i->active_state, "active", "reloading", "refreshing") ? i->active_enter_timestamp :
+                    STRPTR_IN_SET(i->active_state, "inactive", "failed")                ? i->inactive_enter_timestamp :
+                    STRPTR_IN_SET(i->active_state, "activating")                        ? i->inactive_exit_timestamp :
+                                                                                          i->active_exit_timestamp;
 
-        if (timestamp > 0 && timestamp < USEC_INFINITY)
+        if (timestamp_is_set(timestamp)) {
                 printf(" since %s; %s\n",
                        FORMAT_TIMESTAMP_STYLE(timestamp, arg_timestamp_style),
                        FORMAT_TIMESTAMP_RELATIVE(timestamp));
-        else
+                if (streq_ptr(i->active_state, "active") && i->runtime_max_sec < USEC_INFINITY) {
+                        usec_t until_timestamp;
+
+                        until_timestamp = usec_add(timestamp, i->runtime_max_sec);
+                        printf("      Until: %s; %s\n",
+                               FORMAT_TIMESTAMP_STYLE(until_timestamp, arg_timestamp_style),
+                               FORMAT_TIMESTAMP_RELATIVE(until_timestamp));
+                }
+
+                if (!endswith(i->id, ".target") &&
+                        STRPTR_IN_SET(i->active_state, "inactive", "failed") &&
+                        timestamp_is_set(i->active_enter_timestamp) &&
+                        timestamp_is_set(i->active_exit_timestamp) &&
+                        i->active_exit_timestamp >= i->active_enter_timestamp) {
+
+                        usec_t duration;
+
+                        duration = i->active_exit_timestamp - i->active_enter_timestamp;
+                        printf("   Duration: %s\n", FORMAT_TIMESPAN(duration, MSEC_PER_SEC));
+                }
+        } else
                 printf("\n");
+
+        if (i->job_id != 0)
+                printf("        Job: %" PRIu32 "\n", i->job_id);
+
+        if (!sd_id128_is_null(i->invocation_id))
+                printf(" Invocation: " SD_ID128_FORMAT_STR "\n", SD_ID128_FORMAT_VAL(i->invocation_id));
 
         STRV_FOREACH(t, i->triggered_by) {
                 UnitActiveState state = _UNIT_ACTIVE_STATE_INVALID;
@@ -442,10 +496,10 @@ static void print_status_info(
                 dual_timestamp nw, next = {i->next_elapse_real, i->next_elapse_monotonic};
                 usec_t next_elapse;
 
-                dual_timestamp_get(&nw);
+                dual_timestamp_now(&nw);
                 next_elapse = calc_next_elapse(&nw, &next);
 
-                if (next_elapse > 0 && next_elapse < USEC_INFINITY)
+                if (timestamp_is_set(next_elapse))
                         printf("    Trigger: %s; %s\n",
                                FORMAT_TIMESTAMP_STYLE(next_elapse, arg_timestamp_style),
                                FORMAT_TIMESTAMP_RELATIVE(next_elapse));
@@ -466,10 +520,9 @@ static void print_status_info(
         }
 
         if (!i->condition_result && i->condition_timestamp > 0) {
-                UnitCondition *c;
                 int n = 0;
 
-                printf("  Condition: start %scondition failed%s at %s; %s\n",
+                printf("  Condition: start %scondition unmet%s at %s; %s\n",
                        ansi_highlight_yellow(), ansi_normal(),
                        FORMAT_TIMESTAMP_STYLE(i->condition_timestamp, arg_timestamp_style),
                        FORMAT_TIMESTAMP_RELATIVE(i->condition_timestamp));
@@ -531,7 +584,7 @@ static void print_status_info(
                 printf("\n");
         }
 
-        LIST_FOREACH(exec, p, i->exec) {
+        LIST_FOREACH(exec_status_info_list, p, i->exec_status_info_list) {
                 _cleanup_free_ char *argv = NULL;
                 bool good;
 
@@ -549,7 +602,7 @@ static void print_status_info(
 
                 good = is_clean_exit(p->code, p->status, EXIT_CLEAN_DAEMON, NULL);
                 if (!good) {
-                        on = ansi_highlight_red();
+                        on = p->ignore ? ansi_highlight_yellow() : ansi_highlight_red();
                         off = ansi_normal();
                 } else
                         on = off = "";
@@ -589,7 +642,7 @@ static void print_status_info(
                                 if (arg_transport == BUS_TRANSPORT_LOCAL) {
                                         _cleanup_free_ char *comm = NULL;
 
-                                        (void) get_process_comm(i->main_pid, &comm);
+                                        (void) pid_get_comm(i->main_pid, &comm);
                                         if (comm)
                                                 printf(" (%s)", comm);
                                 }
@@ -619,12 +672,12 @@ static void print_status_info(
                         if (i->main_pid > 0)
                                 fputs("; Control PID: ", stdout);
                         else
-                                fputs("Cntrl PID: ", stdout); /* if first in column, abbreviated so it fits alignment */
+                                fputs("  Cntrl PID: ", stdout); /* if first in column, abbreviated so it fits alignment */
 
                         printf(PID_FMT, i->control_pid);
 
                         if (arg_transport == BUS_TRANSPORT_LOCAL) {
-                                (void) get_process_comm(i->control_pid, &c);
+                                (void) pid_get_comm(i->control_pid, &c);
                                 if (c)
                                         printf(" (%s)", c);
                         }
@@ -634,9 +687,28 @@ static void print_status_info(
         }
 
         if (i->status_text)
-                printf("     Status: \"%s\"\n", i->status_text);
-        if (i->status_errno > 0)
-                printf("      Error: %i (%s)\n", i->status_errno, strerror_safe(i->status_errno));
+                printf("     Status: \"%s%s%s\"\n", ansi_highlight_cyan(), i->status_text, ansi_normal());
+
+        if (i->status_errno > 0 || i->status_bus_error || i->status_varlink_error) {
+                const char *prefix = " ";
+
+                printf("      Error:");
+
+                if (i->status_errno > 0) {
+                        printf("%scode: %i (%s)", prefix, i->status_errno, STRERROR(i->status_errno));
+                        prefix = "; ";
+                }
+                if (i->status_bus_error) {
+                        printf("%sD-Bus: %s", prefix, i->status_bus_error);
+                        prefix = "; ";
+                }
+                if (i->status_varlink_error) {
+                        printf("%sVarlink: %s", prefix, i->status_varlink_error);
+                        prefix = "; ";
+                }
+
+                putchar('\n');
+        }
 
         if (i->ip_ingress_bytes != UINT64_MAX && i->ip_egress_bytes != UINT64_MAX)
                 printf("         IP: %s in, %s out\n",
@@ -652,53 +724,114 @@ static void print_status_info(
                 printf("      Tasks: %" PRIu64, i->tasks_current);
 
                 if (i->tasks_max != UINT64_MAX)
-                        printf(" (limit: %" PRIu64 ")\n", i->tasks_max);
+                        printf("%s (limit: %" PRIu64 ")%s\n", ansi_grey(), i->tasks_max, ansi_normal());
                 else
                         printf("\n");
         }
 
+        if (i->n_fd_store > 0 || i->fd_store_max > 0)
+                printf("   FD Store: %u%s (limit: %u)%s\n", i->n_fd_store, ansi_grey(), i->fd_store_max, ansi_normal());
+
+        bool show_memory_peak = i->memory_peak != CGROUP_LIMIT_MAX,
+             show_memory_swap_peak = !IN_SET(i->memory_swap_peak, 0, CGROUP_LIMIT_MAX);
+
         if (i->memory_current != UINT64_MAX) {
                 printf("     Memory: %s", FORMAT_BYTES(i->memory_current));
 
-                if (i->memory_min > 0 || i->memory_low > 0 ||
-                    i->memory_high != CGROUP_LIMIT_MAX || i->memory_max != CGROUP_LIMIT_MAX ||
-                    i->memory_swap_max != CGROUP_LIMIT_MAX ||
-                    i->memory_available != CGROUP_LIMIT_MAX ||
+                bool show_memory_zswap_current = !IN_SET(i->memory_zswap_current, 0, CGROUP_LIMIT_MAX),
+                     /* Only show the available memory if it was artificially limited. */
+                     show_memory_available = i->memory_available != CGROUP_LIMIT_MAX &&
+                                             (i->memory_high != CGROUP_LIMIT_MAX || i->memory_max != CGROUP_LIMIT_MAX);
+                if (show_memory_peak ||
+                    show_memory_swap_peak || /* We don't need to check memory_swap_current, as if peak is 0 that must also be 0 */
+                    show_memory_zswap_current ||
+                    show_memory_available ||
+                    i->memory_min > 0 ||
+                    i->memory_low > 0 || i->startup_memory_low > 0 ||
+                    i->memory_high != CGROUP_LIMIT_MAX || i->startup_memory_high != CGROUP_LIMIT_MAX ||
+                    i->memory_max != CGROUP_LIMIT_MAX || i->startup_memory_max != CGROUP_LIMIT_MAX ||
+                    i->memory_swap_max != CGROUP_LIMIT_MAX || i->startup_memory_swap_max != CGROUP_LIMIT_MAX ||
+                    i->memory_zswap_max != CGROUP_LIMIT_MAX || i->startup_memory_zswap_max != CGROUP_LIMIT_MAX ||
                     i->memory_limit != CGROUP_LIMIT_MAX) {
                         const char *prefix = "";
 
                         printf(" (");
                         if (i->memory_min > 0) {
                                 printf("%smin: %s", prefix, FORMAT_BYTES_CGROUP_PROTECTION(i->memory_min));
-                                prefix = " ";
+                                prefix = ", ";
                         }
                         if (i->memory_low > 0) {
                                 printf("%slow: %s", prefix, FORMAT_BYTES_CGROUP_PROTECTION(i->memory_low));
-                                prefix = " ";
+                                prefix = ", ";
+                        }
+                        if (i->startup_memory_low > 0) {
+                                printf("%slow (startup): %s", prefix, FORMAT_BYTES_CGROUP_PROTECTION(i->startup_memory_low));
+                                prefix = ", ";
                         }
                         if (i->memory_high != CGROUP_LIMIT_MAX) {
                                 printf("%shigh: %s", prefix, FORMAT_BYTES(i->memory_high));
-                                prefix = " ";
+                                prefix = ", ";
+                        }
+                        if (i->startup_memory_high != CGROUP_LIMIT_MAX) {
+                                printf("%shigh (startup): %s", prefix, FORMAT_BYTES(i->startup_memory_high));
+                                prefix = ", ";
                         }
                         if (i->memory_max != CGROUP_LIMIT_MAX) {
                                 printf("%smax: %s", prefix, FORMAT_BYTES(i->memory_max));
-                                prefix = " ";
+                                prefix = ", ";
+                        }
+                        if (i->startup_memory_max != CGROUP_LIMIT_MAX) {
+                                printf("%smax (startup): %s", prefix, FORMAT_BYTES(i->startup_memory_max));
+                                prefix = ", ";
                         }
                         if (i->memory_swap_max != CGROUP_LIMIT_MAX) {
                                 printf("%sswap max: %s", prefix, FORMAT_BYTES(i->memory_swap_max));
-                                prefix = " ";
+                                prefix = ", ";
+                        }
+                        if (i->startup_memory_swap_max != CGROUP_LIMIT_MAX) {
+                                printf("%sswap max (startup): %s", prefix, FORMAT_BYTES(i->startup_memory_swap_max));
+                                prefix = ", ";
+                        }
+                        if (i->memory_zswap_max != CGROUP_LIMIT_MAX) {
+                                printf("%szswap max: %s", prefix, FORMAT_BYTES(i->memory_zswap_max));
+                                prefix = ", ";
+                        }
+                        if (i->startup_memory_zswap_max != CGROUP_LIMIT_MAX) {
+                                printf("%szswap max (startup): %s", prefix, FORMAT_BYTES(i->startup_memory_zswap_max));
+                                prefix = ", ";
                         }
                         if (i->memory_limit != CGROUP_LIMIT_MAX) {
                                 printf("%slimit: %s", prefix, FORMAT_BYTES(i->memory_limit));
-                                prefix = " ";
+                                prefix = ", ";
                         }
-                        if (i->memory_available != CGROUP_LIMIT_MAX) {
+                        if (show_memory_available) {
                                 printf("%savailable: %s", prefix, FORMAT_BYTES(i->memory_available));
-                                prefix = " ";
+                                prefix = ", ";
+                        }
+                        if (show_memory_peak) {
+                                printf("%speak: %s", prefix, FORMAT_BYTES(i->memory_peak));
+                                prefix = ", ";
+                        }
+                        if (show_memory_swap_peak) {
+                                printf("%sswap: %s, swap peak: %s", prefix,
+                                       FORMAT_BYTES(i->memory_swap_current), FORMAT_BYTES(i->memory_swap_peak));
+                                prefix = ", ";
+                        }
+                        if (show_memory_zswap_current) {
+                                printf("%szswap: %s", prefix, FORMAT_BYTES(i->memory_zswap_current));
+                                prefix = ", ";
                         }
                         printf(")");
                 }
                 printf("\n");
+
+        } else if (show_memory_peak) {
+                printf("   Mem peak: %s", FORMAT_BYTES(i->memory_peak));
+
+                if (show_memory_swap_peak)
+                        printf(" (swap: %s)", FORMAT_BYTES(i->memory_swap_peak));
+
+                putchar('\n');
         }
 
         if (i->cpu_usage_nsec != UINT64_MAX)
@@ -738,13 +871,12 @@ static void print_status_info(
                                 i->id,
                                 i->log_namespace,
                                 arg_output,
-                                0,
+                                /* n_columns = */ 0,
                                 i->inactive_exit_timestamp_monotonic,
                                 arg_lines,
-                                getuid(),
                                 get_output_flags() | OUTPUT_BEGIN_NEWLINE,
                                 SD_JOURNAL_LOCAL_ONLY,
-                                arg_scope == UNIT_FILE_SYSTEM,
+                                arg_runtime_scope == RUNTIME_SCOPE_SYSTEM,
                                 ellipsized);
 
         if (i->need_daemon_reload)
@@ -752,7 +884,7 @@ static void print_status_info(
 }
 
 static void show_unit_help(UnitStatusInfo *i) {
-        char **p;
+        bool previous_man_page = false;
 
         assert(i);
 
@@ -761,11 +893,29 @@ static void show_unit_help(UnitStatusInfo *i) {
                 return;
         }
 
-        STRV_FOREACH(p, i->documentation)
-                if (startswith(*p, "man:"))
-                        show_man_page(*p + 4, false);
-                else
-                        log_info("Can't show: %s", *p);
+        STRV_FOREACH(doc, i->documentation) {
+                const char *p;
+
+                p = startswith(*doc, "man:");
+
+                if (p ? doc != i->documentation : previous_man_page) {
+                        puts("");
+                        fflush(stdout);
+                }
+
+                previous_man_page = p;
+
+                if (p)
+                        show_man_page(p, /* null_stdio= */ false);
+                else {
+                        _cleanup_free_ char *t = NULL;
+
+                        if ((p = startswith(*doc, "file://")))
+                                (void) terminal_urlify_path(p, NULL, &t);
+
+                        printf("Additional documentation: %s\n", t ?: p ?: *doc);
+                }
+        }
 }
 
 static int map_main_pid(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
@@ -808,11 +958,7 @@ static int map_listen(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus
 
         while ((r = sd_bus_message_read(m, "(ss)", &type, &path)) > 0) {
 
-                r = strv_extend(p, type);
-                if (r < 0)
-                        return r;
-
-                r = strv_extend(p, path);
+                r = strv_extend_many(p, type, path);
                 if (r < 0)
                         return r;
         }
@@ -911,7 +1057,7 @@ static int map_exec(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_e
         if (!info)
                 return -ENOMEM;
 
-        LIST_FIND_TAIL(exec, i->exec, last);
+        last = LIST_FIND_TAIL(exec_status_info_list, i->exec_status_info_list);
 
         while ((r = exec_status_info_deserialize(m, info, is_ex_prop)) > 0) {
 
@@ -919,7 +1065,7 @@ static int map_exec(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_e
                 if (!info->name)
                         return -ENOMEM;
 
-                LIST_INSERT_AFTER(exec, i->exec, last, info);
+                LIST_INSERT_AFTER(exec_status_info_list, i->exec_status_info_list, last, info);
                 last = info;
 
                 info = new0(ExecStatusInfo, 1);
@@ -974,6 +1120,20 @@ static int print_property(const char *name, const char *expected_value, sd_bus_m
                                 return r;
 
                         bus_print_property_valuef(name, expected_value, flags, "%s", strna(mpol_to_string(i)));
+
+                        return 1;
+                }
+                break;
+
+        case SD_BUS_TYPE_UINT64:
+                if (endswith(name, "Timestamp")) {
+                        uint64_t timestamp;
+
+                        r = sd_bus_message_read_basic(m, bus_type, &timestamp);
+                        if (r < 0)
+                                return r;
+
+                        bus_print_property_value(name, expected_value, flags, FORMAT_TIMESTAMP_STYLE(timestamp, arg_timestamp_style));
 
                         return 1;
                 }
@@ -1042,7 +1202,6 @@ static int print_property(const char *name, const char *expected_value, sd_bus_m
 
                         if (FLAGS_SET(flags, BUS_PRINT_PROPERTY_SHOW_EMPTY) || allow_list || !strv_isempty(l)) {
                                 bool first = true;
-                                char **i;
 
                                 if (!FLAGS_SET(flags, BUS_PRINT_PROPERTY_ONLY_VALUE)) {
                                         fputs(name, stdout);
@@ -1408,7 +1567,6 @@ static int print_property(const char *name, const char *expected_value, sd_bus_m
                                 return bus_log_parse_error(r);
 
                         for (;;) {
-                                _cleanup_free_ char *str = NULL;
                                 uint32_t prefixlen;
                                 int32_t family;
                                 const void *ap;
@@ -1445,10 +1603,8 @@ static int print_property(const char *name, const char *expected_value, sd_bus_m
                                 if (prefixlen > FAMILY_ADDRESS_SIZE(family) * 8)
                                         continue;
 
-                                if (in_addr_prefix_to_string(family, (const union in_addr_union*) ap, prefixlen, &str) < 0)
-                                        continue;
-
-                                if (!strextend_with_separator(&addresses, " ", str))
+                                if (!strextend_with_separator(&addresses, " ",
+                                                              IN_ADDR_PREFIX_TO_STRING(family, ap, prefixlen)))
                                         return log_oom();
                         }
 
@@ -1600,6 +1756,47 @@ static int print_property(const char *name, const char *expected_value, sd_bus_m
                         bus_print_property_value(name, expected_value, flags, affinity);
 
                         return 1;
+                } else if (streq(name, "LogFilterPatterns")) {
+                        int is_allowlist;
+                        const char *pattern;
+
+                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "(bs)");
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        while ((r = sd_bus_message_read(m, "(bs)", &is_allowlist, &pattern)) > 0)
+                                bus_print_property_valuef(name, expected_value, flags, "%s%s", is_allowlist ? "" : "~", pattern);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        r = sd_bus_message_exit_container(m);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        return 1;
+
+                } else if (streq(name, "RootImageOptions")) {
+                        const char *a, *p;
+
+                        /* In config files, the syntax allows the partition name to be omitted. Here, we
+                         * always print the partition name, also because we have no way of knowing if it was
+                         * originally omitted or not. We also print the partitions on separate lines. */
+
+                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "(ss)");
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        while ((r = sd_bus_message_read(m, "(ss)", &a, &p)) > 0)
+                                bus_print_property_valuef(name, expected_value, flags, "%s:%s", a, p);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        r = sd_bus_message_exit_container(m);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        return 1;
+
                 } else if (streq(name, "MountImages")) {
                         _cleanup_free_ char *paths = NULL;
 
@@ -1789,6 +1986,53 @@ static int print_property(const char *name, const char *expected_value, sd_bus_m
                                 return bus_log_parse_error(r);
 
                         return 1;
+                } else if (contents[0] == SD_BUS_TYPE_STRUCT_BEGIN && streq(name, "OpenFile")) {
+                        char *path, *fdname;
+                        uint64_t offlags;
+
+                        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, "(sst)");
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        while ((r = sd_bus_message_read(m, "(sst)", &path, &fdname, &offlags)) > 0) {
+                                _cleanup_free_ char *ofs = NULL;
+
+                                r = open_file_to_string(
+                                        &(OpenFile){
+                                                .path = path,
+                                                .fdname = fdname,
+                                                .flags = offlags,
+                                        },
+                                        &ofs);
+                                if (r < 0)
+                                        return log_error_errno(
+                                                        r, "Failed to convert OpenFile= value to string: %m");
+
+                                bus_print_property_value(name, expected_value, flags, ofs);
+                        }
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        r = sd_bus_message_exit_container(m);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        return 1;
+                } else if (streq(name, "ExtraFileDescriptorNames")) {
+                        _cleanup_strv_free_ char **extra_fd_names = NULL;
+                        _cleanup_free_ char *joined = NULL;
+
+                        r = sd_bus_message_read_strv(m, &extra_fd_names);
+                        if (r < 0)
+                                return bus_log_parse_error(r);
+
+                        joined = strv_join(extra_fd_names, " ");
+                        if (!joined)
+                                return log_oom();
+
+                        bus_print_property_value(name, expected_value, flags, joined);
+
+                        return 1;
                 }
 
                 break;
@@ -1807,8 +2051,8 @@ typedef enum SystemctlShowMode{
 
 static const char* const systemctl_show_mode_table[_SYSTEMCTL_SHOW_MODE_MAX] = {
         [SYSTEMCTL_SHOW_PROPERTIES] = "show",
-        [SYSTEMCTL_SHOW_STATUS] = "status",
-        [SYSTEMCTL_SHOW_HELP] = "help",
+        [SYSTEMCTL_SHOW_STATUS]     = "status",
+        [SYSTEMCTL_SHOW_HELP]       = "help",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(systemctl_show_mode, SystemctlShowMode);
@@ -1822,6 +2066,7 @@ static int show_one(
                 bool *ellipsized) {
 
         static const struct bus_properties_map property_map[] = {
+                { "Id",                             "s",               NULL,           offsetof(UnitStatusInfo, id)                                },
                 { "LoadState",                      "s",               NULL,           offsetof(UnitStatusInfo, load_state)                        },
                 { "ActiveState",                    "s",               NULL,           offsetof(UnitStatusInfo, active_state)                      },
                 { "FreezerState",                   "s",               NULL,           offsetof(UnitStatusInfo, freezer_state)                     },
@@ -1833,6 +2078,7 @@ static int show_one(
                 { "ActiveState",                    "s",               NULL,           offsetof(UnitStatusInfo, active_state)                      },
                 { "FreezerState",                   "s",               NULL,           offsetof(UnitStatusInfo, freezer_state)                     },
                 { "SubState",                       "s",               NULL,           offsetof(UnitStatusInfo, sub_state)                         },
+                { "Job",                            "(uo)",            bus_map_job_id, offsetof(UnitStatusInfo, job_id)                            },
                 { "UnitFileState",                  "s",               NULL,           offsetof(UnitStatusInfo, unit_file_state)                   },
                 { "UnitFilePreset",                 "s",               NULL,           offsetof(UnitStatusInfo, unit_file_preset)                  },
                 { "Description",                    "s",               NULL,           offsetof(UnitStatusInfo, description)                       },
@@ -1851,14 +2097,20 @@ static int show_one(
                 { "ActiveEnterTimestamp",           "t",               NULL,           offsetof(UnitStatusInfo, active_enter_timestamp)            },
                 { "ActiveExitTimestamp",            "t",               NULL,           offsetof(UnitStatusInfo, active_exit_timestamp)             },
                 { "InactiveEnterTimestamp",         "t",               NULL,           offsetof(UnitStatusInfo, inactive_enter_timestamp)          },
+                { "RuntimeMaxUSec",                 "t",               NULL,           offsetof(UnitStatusInfo, runtime_max_sec)                   },
+                { "InvocationID",                   "s",               bus_map_id128,  offsetof(UnitStatusInfo, invocation_id)                     },
                 { "NeedDaemonReload",               "b",               NULL,           offsetof(UnitStatusInfo, need_daemon_reload)                },
                 { "Transient",                      "b",               NULL,           offsetof(UnitStatusInfo, transient)                         },
                 { "ExecMainPID",                    "u",               NULL,           offsetof(UnitStatusInfo, main_pid)                          },
                 { "MainPID",                        "u",               map_main_pid,   0                                                           },
                 { "ControlPID",                     "u",               NULL,           offsetof(UnitStatusInfo, control_pid)                       },
-                { "StatusText",                     "s",               NULL,           offsetof(UnitStatusInfo, status_text)                       },
                 { "PIDFile",                        "s",               NULL,           offsetof(UnitStatusInfo, pid_file)                          },
+                { "StatusText",                     "s",               NULL,           offsetof(UnitStatusInfo, status_text)                       },
                 { "StatusErrno",                    "i",               NULL,           offsetof(UnitStatusInfo, status_errno)                      },
+                { "StatusBusError",                 "s",               NULL,           offsetof(UnitStatusInfo, status_bus_error)                  },
+                { "StatusVarlinkError",             "s",               NULL,           offsetof(UnitStatusInfo, status_varlink_error)              },
+                { "FileDescriptorStoreMax",         "u",               NULL,           offsetof(UnitStatusInfo, fd_store_max)                      },
+                { "NFileDescriptorStore",           "u",               NULL,           offsetof(UnitStatusInfo, n_fd_store)                        },
                 { "ExecMainStartTimestamp",         "t",               NULL,           offsetof(UnitStatusInfo, start_timestamp)                   },
                 { "ExecMainExitTimestamp",          "t",               NULL,           offsetof(UnitStatusInfo, exit_timestamp)                    },
                 { "ExecMainCode",                   "i",               NULL,           offsetof(UnitStatusInfo, exit_code)                         },
@@ -1881,14 +2133,25 @@ static int show_one(
                 { "Where",                          "s",               NULL,           offsetof(UnitStatusInfo, where)                             },
                 { "What",                           "s",               NULL,           offsetof(UnitStatusInfo, what)                              },
                 { "MemoryCurrent",                  "t",               NULL,           offsetof(UnitStatusInfo, memory_current)                    },
+                { "MemoryPeak",                     "t",               NULL,           offsetof(UnitStatusInfo, memory_peak)                       },
+                { "MemorySwapCurrent",              "t",               NULL,           offsetof(UnitStatusInfo, memory_swap_current)               },
+                { "MemorySwapPeak",                 "t",               NULL,           offsetof(UnitStatusInfo, memory_swap_peak)                  },
+                { "MemoryZSwapCurrent",             "t",               NULL,           offsetof(UnitStatusInfo, memory_zswap_current)              },
                 { "MemoryAvailable",                "t",               NULL,           offsetof(UnitStatusInfo, memory_available)                  },
                 { "DefaultMemoryMin",               "t",               NULL,           offsetof(UnitStatusInfo, default_memory_min)                },
                 { "DefaultMemoryLow",               "t",               NULL,           offsetof(UnitStatusInfo, default_memory_low)                },
+                { "DefaultStartupMemoryLow",        "t",               NULL,           offsetof(UnitStatusInfo, default_startup_memory_low)        },
                 { "MemoryMin",                      "t",               NULL,           offsetof(UnitStatusInfo, memory_min)                        },
                 { "MemoryLow",                      "t",               NULL,           offsetof(UnitStatusInfo, memory_low)                        },
+                { "StartupMemoryLow",               "t",               NULL,           offsetof(UnitStatusInfo, startup_memory_low)                },
                 { "MemoryHigh",                     "t",               NULL,           offsetof(UnitStatusInfo, memory_high)                       },
+                { "StartupMemoryHigh",              "t",               NULL,           offsetof(UnitStatusInfo, startup_memory_high)               },
                 { "MemoryMax",                      "t",               NULL,           offsetof(UnitStatusInfo, memory_max)                        },
+                { "StartupMemoryMax",               "t",               NULL,           offsetof(UnitStatusInfo, startup_memory_max)                },
                 { "MemorySwapMax",                  "t",               NULL,           offsetof(UnitStatusInfo, memory_swap_max)                   },
+                { "StartupMemorySwapMax",           "t",               NULL,           offsetof(UnitStatusInfo, startup_memory_swap_max)           },
+                { "MemoryZSwapMax",                 "t",               NULL,           offsetof(UnitStatusInfo, memory_zswap_max)                  },
+                { "StartupMemoryZSwapMax",          "t",               NULL,           offsetof(UnitStatusInfo, startup_memory_zswap_max)          },
                 { "MemoryLimit",                    "t",               NULL,           offsetof(UnitStatusInfo, memory_limit)                      },
                 { "CPUUsageNSec",                   "t",               NULL,           offsetof(UnitStatusInfo, cpu_usage_nsec)                    },
                 { "TasksCurrent",                   "t",               NULL,           offsetof(UnitStatusInfo, tasks_current)                     },
@@ -1918,12 +2181,22 @@ static int show_one(
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_set_free_ Set *found_properties = NULL;
-        _cleanup_(unit_status_info_free) UnitStatusInfo info = {
+        _cleanup_(unit_status_info_done) UnitStatusInfo info = {
+                .runtime_max_sec = USEC_INFINITY,
                 .memory_current = UINT64_MAX,
                 .memory_high = CGROUP_LIMIT_MAX,
+                .startup_memory_high = CGROUP_LIMIT_MAX,
                 .memory_max = CGROUP_LIMIT_MAX,
+                .startup_memory_max = CGROUP_LIMIT_MAX,
                 .memory_swap_max = CGROUP_LIMIT_MAX,
-                .memory_limit = UINT64_MAX,
+                .startup_memory_swap_max = CGROUP_LIMIT_MAX,
+                .memory_zswap_max = CGROUP_LIMIT_MAX,
+                .startup_memory_zswap_max = CGROUP_LIMIT_MAX,
+                .memory_limit = CGROUP_LIMIT_MAX,
+                .memory_peak = CGROUP_LIMIT_MAX,
+                .memory_swap_current = CGROUP_LIMIT_MAX,
+                .memory_swap_peak = CGROUP_LIMIT_MAX,
+                .memory_zswap_current = CGROUP_LIMIT_MAX,
                 .memory_available = CGROUP_LIMIT_MAX,
                 .cpu_usage_nsec = UINT64_MAX,
                 .tasks_current = UINT64_MAX,
@@ -1933,7 +2206,6 @@ static int show_one(
                 .io_read_bytes = UINT64_MAX,
                 .io_write_bytes = UINT64_MAX,
         };
-        char **pp;
         int r;
 
         assert(path);
@@ -1971,7 +2243,7 @@ static int show_one(
         if (show_mode == SYSTEMCTL_SHOW_STATUS) {
                 print_status_info(bus, &info, ellipsized);
 
-                if (info.active_state && !STR_IN_SET(info.active_state, "active", "reloading"))
+                if (info.active_state && !STR_IN_SET(info.active_state, "active", "reloading", "refreshing"))
                         return EXIT_PROGRAM_NOT_RUNNING;
 
                 return EXIT_PROGRAM_RUNNING_OR_SERVICE_OK;
@@ -1996,34 +2268,9 @@ static int show_one(
         return 0;
 }
 
-static int get_unit_dbus_path_by_pid(
-                sd_bus *bus,
-                uint32_t pid,
-                char **unit) {
-
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        char *u;
-        int r;
-
-        r = bus_call_method(bus, bus_systemd_mgr, "GetUnitByPID", &error, &reply, "u", pid);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get unit for PID %"PRIu32": %s", pid, bus_error_message(&error, r));
-
-        r = sd_bus_message_read(reply, "o", &u);
-        if (r < 0)
-                return bus_log_parse_error(r);
-
-        u = strdup(u);
-        if (!u)
-                return log_oom();
-
-        *unit = u;
-        return 0;
-}
-
 static int show_all(
                 sd_bus *bus,
+                SystemctlShowMode show_mode,
                 bool *new_line,
                 bool *ellipsized) {
 
@@ -2049,7 +2296,7 @@ static int show_all(
                 if (!p)
                         return log_oom();
 
-                r = show_one(bus, p, u->id, SYSTEMCTL_SHOW_STATUS, new_line, ellipsized);
+                r = show_one(bus, p, u->id, show_mode, new_line, ellipsized);
                 if (r < 0)
                         return r;
                 if (r > 0 && ret == 0)
@@ -2100,12 +2347,18 @@ static int show_system_status(sd_bus *bus) {
         printf("    State: %s%s%s\n",
                on, strna(mi.state), off);
 
+        printf("    Units: %" PRIu32 " loaded (incl. loaded aliases)\n", mi.n_names);
         printf("     Jobs: %" PRIu32 " queued\n", mi.n_jobs);
         printf("   Failed: %" PRIu32 " units\n", mi.n_failed_units);
 
         printf("    Since: %s; %s\n",
                FORMAT_TIMESTAMP_STYLE(mi.timestamp, arg_timestamp_style),
                FORMAT_TIMESTAMP_RELATIVE(mi.timestamp));
+
+        printf("  systemd: %s\n", mi.version);
+
+        if (!isempty(mi.tainted))
+                printf("  Tainted: %s%s%s\n", ansi_highlight_yellow(), mi.tainted, ansi_normal());
 
         printf("   CGroup: %s\n", empty_to_root(mi.control_group));
 
@@ -2121,7 +2374,7 @@ static int show_system_status(sd_bus *bus) {
         return 0;
 }
 
-int show(int argc, char *argv[], void *userdata) {
+int verb_show(int argc, char *argv[], void *userdata) {
         bool new_line = false, ellipsized = false;
         SystemctlShowMode show_mode;
         int r, ret = 0;
@@ -2131,7 +2384,7 @@ int show(int argc, char *argv[], void *userdata) {
 
         show_mode = systemctl_show_mode_from_string(argv[0]);
         if (show_mode < 0)
-                return log_error_errno(show_mode, "Invalid argument.");
+                return log_error_errno(show_mode, "Invalid argument '%s'.", argv[0]);
 
         if (show_mode == SYSTEMCTL_SHOW_HELP && argc <= 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -2144,20 +2397,31 @@ int show(int argc, char *argv[], void *userdata) {
 
         pager_open(arg_pager_flags);
 
-        /* If no argument is specified inspect the manager itself */
-        if (show_mode == SYSTEMCTL_SHOW_PROPERTIES && argc <= 1)
-                return show_one(bus, "/org/freedesktop/systemd1", NULL, show_mode, &new_line, &ellipsized);
+        if (argc <= 1) {
+                /* If no argument or filter is specified inspect the manager itself:
+                 * systemctl status → we show status of the manager
+                 * systemctl status --all → status of the manager + status of all units
+                 * systemctl status --state=… → status of units in listed states
+                 * systemctl status --type=… → status of units of listed types
+                 * systemctl status --failed → status of failed units, mirroring systemctl list-units --failed
+                 */
 
-        if (show_mode == SYSTEMCTL_SHOW_STATUS && argc <= 1) {
+                if (!arg_states && !arg_types) {
+                        if (show_mode == SYSTEMCTL_SHOW_PROPERTIES)
+                                /* systemctl show --all → show properties of the manager */
+                                return show_one(bus, "/org/freedesktop/systemd1", NULL, show_mode, &new_line, &ellipsized);
 
-                show_system_status(bus);
-                new_line = true;
+                        r = show_system_status(bus);
+                        if (r < 0)
+                                return r;
 
-                if (arg_all)
-                        ret = show_all(bus, &new_line, &ellipsized);
+                        new_line = true;
+                }
+
+                if (arg_all || arg_states || arg_types)
+                        ret = show_all(bus, show_mode, &new_line, &ellipsized);
         } else {
                 _cleanup_free_ char **patterns = NULL;
-                char **name;
 
                 STRV_FOREACH(name, strv_skip(argv, 1)) {
                         _cleanup_free_ char *path = NULL, *unit = NULL;
@@ -2175,15 +2439,11 @@ int show(int argc, char *argv[], void *userdata) {
 
                         } else {
                                 /* Interpret as PID */
-                                r = get_unit_dbus_path_by_pid(bus, id, &path);
+                                r = lookup_unit_by_pidref(bus, (pid_t) id, &unit, &path);
                                 if (r < 0) {
-                                        ret = r;
+                                        RET_GATHER(ret, r);
                                         continue;
                                 }
-
-                                r = unit_name_from_dbus_path(path, &unit);
-                                if (r < 0)
-                                        return log_oom();
                         }
 
                         r = show_one(bus, path, unit, show_mode, &new_line, &ellipsized);
